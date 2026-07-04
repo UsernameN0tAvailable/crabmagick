@@ -1,0 +1,16 @@
+[package]
+name = "fast-webp"
+version = "0.1.0"
+edition = "2021"
+description = "Optimized WebP decoder forked from image-webp 0.2.4, with parallel loop filter and i32 IDCT"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "fast_webp"
+path = "src/lib.rs"
+
+[dependencies]
+byteorder-lite = "0.1.0"
+quick-error = "2.0.1"
+rayon = "1.10"
+image = { version = "0.25.10", default-features = false }

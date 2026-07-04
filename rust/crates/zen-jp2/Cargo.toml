@@ -1,0 +1,21 @@
+[package]
+name = "zen-jp2"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust JPEG 2000 decoder (JP2/J2K) — forked from hayro-jpeg2000, optimized for parallel tile decode"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.89"
+
+[features]
+default = ["std", "simd", "parallel"]
+std = []
+simd = ["dep:fearless_simd", "std"]
+parallel = ["dep:rayon", "std"]
+logging = ["std"]
+
+[dependencies]
+fearless_simd = { version = "0.4.0", optional = true }
+rayon = { version = "1.10", optional = true }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

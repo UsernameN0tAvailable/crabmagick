@@ -1,0 +1,505 @@
+// Copyright (c) Imazen LLC and the JPEG XL Project Authors.
+// Algorithms and constants derived from libjxl (BSD-3-Clause).
+// Licensed under AGPL-3.0-or-later. Commercial licenses at https://www.imazen.io/pricing
+
+//! Chroma-from-Luma (CfL) computation.
+//!
+//! Determines per-tile linear models for the X and B channels from the Y channel.
+//! Ported from libjxl-tiny's `enc_chroma_from_luma.cc`.
+
+use super::ac_strategy::{AcStrategyMap, COVERED_X, COVERED_Y};
+use super::common::*;
+use super::dct::dct_8x8;
+use super::encoder::VarDctEncoder;
+use super::quant;
+
+/// Inverse of the color factor used in CfL ratio conversion.
+/// `ytox_ratio(x) = x * K_INV_COLOR_FACTOR`
+/// `ytob_ratio(b) = 1.0 + b * K_INV_COLOR_FACTOR`
+const K_INV_COLOR_FACTOR: f32 = 1.0 / 84.0;
+
+/// Regularization multiplier for AC coefficient fitting.
+/// libjxl uses 1e-9 (essentially no regularization). Matches libjxl.
+const K_DISTANCE_MULTIPLIER_AC: f32 = 1e-9;
+
+/// Convert a ytox i8 value to the ratio used for CfL subtraction.
+#[inline]
+pub fn ytox_ratio(x: i8) -> f32 {
+    x as f32 * K_INV_COLOR_FACTOR
+}
+
+/// Convert a ytob i8 value to the ratio used for CfL subtraction.
+#[inline]
+pub fn ytob_ratio(b: i8) -> f32 {
+    1.0 + b as f32 * K_INV_COLOR_FACTOR
+}
+
+/// Per-tile chroma-from-luma map.
+pub struct CflMap {
+    /// YtoX values per tile, row-major.
+    pub ytox: Vec<i8>,
+    /// YtoB values per tile, row-major.
+    pub ytob: Vec<i8>,
+    /// Number of tiles in x direction.
+    pub xsize_tiles: usize,
+    /// Number of tiles in y direction.
+    #[allow(dead_code)]
+    pub ysize_tiles: usize,
+    /// True when all CfL entries are zero.
+    pub is_zero: bool,
+}
+
+impl CflMap {
+    /// Create a CfL map with all zeros (no chroma decorrelation).
+    pub fn zeros(xsize_tiles: usize, ysize_tiles: usize) -> Self {
+        Self {
+            ytox: Vec::new(),
+            ytob: Vec::new(),
+            xsize_tiles,
+            ysize_tiles,
+            is_zero: true,
+        }
+    }
+
+    /// Get the ytox value for a tile at (tx, ty).
+    #[inline]
+    pub fn ytox_at(&self, tx: usize, ty: usize) -> i8 {
+        if self.is_zero {
+            0
+        } else {
+            self.ytox[ty * self.xsize_tiles + tx]
+        }
+    }
+
+    /// Get the ytob value for a tile at (tx, ty).
+    #[inline]
+    pub fn ytob_at(&self, tx: usize, ty: usize) -> i8 {
+        if self.is_zero {
+            0
+        } else {
+            self.ytob[ty * self.xsize_tiles + tx]
+        }
+    }
+}
+
+/// Find the best integer multiplier for a chroma-from-luma linear model.
+/// SIMD-accelerated via jxl_simd.
+///
+/// When `use_newton` is false (effort < 7):
+///   Minimizes `sum_i (base * values_m[i] - values_s[i] + x/84 * values_m[i])^2 + distance_mul * x^2`
+///   via least-squares with L2 regularization. Fast, single-pass.
+///
+/// When `use_newton` is true (effort >= 7):
+///   Minimizes `1/3 * sum((|ax+b|+1)^2 - 1) + distance_mul * x^2 * num`
+///   via Newton's method with perceptual cost. More robust to outliers.
+///   Matches libjxl enc_chroma_from_luma.cc at speed_tier <= kSquirrel.
+#[allow(clippy::too_many_arguments)]
+fn find_best_multiplier(
+    values_m: &[f32],
+    values_s: &[f32],
+    num: usize,
+    base: f32,
+    distance_mul: f32,
+    use_newton: bool,
+    newton_eps: f32,
+    newton_max_iters: usize,
+) -> i8 {
+    if use_newton {
+        jxl_simd::cfl_find_best_multiplier_newton(
+            values_m,
+            values_s,
+            num,
+            base,
+            distance_mul,
+            newton_eps,
+            newton_max_iters,
+        )
+    } else {
+        jxl_simd::cfl_find_best_multiplier(values_m, values_s, num, base, distance_mul)
+    }
+}
+
+/// Compute the CfL map for an entire image.
+///
+/// For each 64x64-pixel tile (8x8 blocks), computes optimal ytox and ytob
+/// values by DCT-transforming each block, weighting coefficients by inverse
+/// quantization matrices, and fitting a least-squares linear model.
+///
+/// `stride` is the row stride (padded width) of the XYB buffers.
+/// `buf_height` is the padded height. Both must be multiples of 8.
+///
+/// Ported from libjxl-tiny's `ComputeCmapTile`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_cfl_map(
+    xyb_x: &[f32],
+    xyb_y: &[f32],
+    xyb_b: &[f32],
+    stride: usize,
+    buf_height: usize,
+    xsize_blocks: usize,
+    ysize_blocks: usize,
+    use_newton: bool,
+    newton_eps: f32,
+    newton_max_iters: usize,
+) -> CflMap {
+    let _ = buf_height; // Used for documentation; buffer is padded to ysize_blocks * 8
+    let xsize_tiles = div_ceil(xsize_blocks, TILE_DIM_IN_BLOCKS);
+    let ysize_tiles = div_ceil(ysize_blocks, TILE_DIM_IN_BLOCKS);
+    let num_tiles = xsize_tiles * ysize_tiles;
+
+    // Pre-compute inverse quant weights once (avoid per-block division).
+    let qw_x = quant::quant_weights(0, 0); // DCT8, X channel
+    let qw_b = quant::quant_weights(0, 2); // DCT8, B channel
+    let mut inv_qm_x = [0.0f32; DCT_BLOCK_SIZE];
+    let mut inv_qm_b = [0.0f32; DCT_BLOCK_SIZE];
+    for i in 0..DCT_BLOCK_SIZE {
+        inv_qm_x[i] = 1.0 / qw_x[i];
+        inv_qm_b[i] = 1.0 / qw_b[i];
+    }
+
+    let compute_tile = |tile_idx: usize| {
+        let tx = tile_idx % xsize_tiles;
+        let ty = tile_idx / xsize_tiles;
+        let tile_bx0 = tx * TILE_DIM_IN_BLOCKS;
+        let tile_by0 = ty * TILE_DIM_IN_BLOCKS;
+        let tile_bx1 = (tile_bx0 + TILE_DIM_IN_BLOCKS).min(xsize_blocks);
+        let tile_by1 = (tile_by0 + TILE_DIM_IN_BLOCKS).min(ysize_blocks);
+
+        // Thread-local scratch buffers
+        let max_coeffs_per_tile = TILE_DIM_IN_BLOCKS * TILE_DIM_IN_BLOCKS * DCT_BLOCK_SIZE;
+        let mut coeffs_yx = vec![0.0f32; max_coeffs_per_tile];
+        let mut coeffs_x = vec![0.0f32; max_coeffs_per_tile];
+        let mut coeffs_yb = vec![0.0f32; max_coeffs_per_tile];
+        let mut coeffs_b = vec![0.0f32; max_coeffs_per_tile];
+
+        let mut num_ac = 0usize;
+
+        for by in tile_by0..tile_by1 {
+            for bx in tile_bx0..tile_bx1 {
+                let mut block_y = [0.0f32; DCT_BLOCK_SIZE];
+                let mut block_x = [0.0f32; DCT_BLOCK_SIZE];
+                let mut block_b = [0.0f32; DCT_BLOCK_SIZE];
+
+                let x0 = bx * BLOCK_DIM;
+                for dy in 0..BLOCK_DIM {
+                    let src = (by * BLOCK_DIM + dy) * stride + x0;
+                    let dst = dy * BLOCK_DIM;
+                    block_y[dst..dst + BLOCK_DIM].copy_from_slice(&xyb_y[src..src + BLOCK_DIM]);
+                    block_x[dst..dst + BLOCK_DIM].copy_from_slice(&xyb_x[src..src + BLOCK_DIM]);
+                    block_b[dst..dst + BLOCK_DIM].copy_from_slice(&xyb_b[src..src + BLOCK_DIM]);
+                }
+
+                let mut dct_y = [0.0f32; DCT_BLOCK_SIZE];
+                let mut dct_x = [0.0f32; DCT_BLOCK_SIZE];
+                let mut dct_b = [0.0f32; DCT_BLOCK_SIZE];
+                dct_8x8(&block_y, &mut dct_y);
+                dct_8x8(&block_x, &mut dct_x);
+                dct_8x8(&block_b, &mut dct_b);
+
+                // Zero out DC so it doesn't affect the AC-only fitting.
+                dct_y[0] = 0.0;
+                dct_x[0] = 0.0;
+                dct_b[0] = 0.0;
+
+                for i in 0..DCT_BLOCK_SIZE {
+                    coeffs_yx[num_ac + i] = dct_y[i] * inv_qm_x[i];
+                    coeffs_x[num_ac + i] = dct_x[i] * inv_qm_x[i];
+                    coeffs_yb[num_ac + i] = dct_y[i] * inv_qm_b[i];
+                    coeffs_b[num_ac + i] = dct_b[i] * inv_qm_b[i];
+                }
+                num_ac += DCT_BLOCK_SIZE;
+            }
+        }
+
+        let tx_val = find_best_multiplier(
+            &coeffs_yx,
+            &coeffs_x,
+            num_ac,
+            0.0,
+            K_DISTANCE_MULTIPLIER_AC,
+            use_newton,
+            newton_eps,
+            newton_max_iters,
+        );
+        let tb_val = find_best_multiplier(
+            &coeffs_yb,
+            &coeffs_b,
+            num_ac,
+            1.0,
+            K_DISTANCE_MULTIPLIER_AC,
+            use_newton,
+            newton_eps,
+            newton_max_iters,
+        );
+
+        (tx_val, tb_val)
+    };
+
+    let mut ytox = vec![0i8; num_tiles];
+    let mut ytob = vec![0i8; num_tiles];
+    if crate::parallel::sequential_maps_forced() {
+        for tile_idx in 0..num_tiles {
+            let (tx_val, tb_val) = compute_tile(tile_idx);
+            ytox[tile_idx] = tx_val;
+            ytob[tile_idx] = tb_val;
+        }
+    } else {
+        let tile_results = crate::parallel::parallel_map(num_tiles, compute_tile);
+        for (tile_idx, &(tx_val, tb_val)) in tile_results.iter().enumerate() {
+            ytox[tile_idx] = tx_val;
+            ytob[tile_idx] = tb_val;
+        }
+    }
+
+    CflMap {
+        is_zero: ytox.iter().all(|&v| v == 0) && ytob.iter().all(|&v| v == 0),
+        ytox,
+        ytob,
+        xsize_tiles,
+        ysize_tiles,
+    }
+}
+
+/// CfL pass 2: recompute CfL map using actual AC strategies and per-block
+/// quantization weighting.
+///
+/// Unlike pass 1 (`compute_cfl_map`) which forces DCT8 and q=1, pass 2 uses
+/// the actual AC strategy per block and weights coefficients by the per-block
+/// quantization factor and strategy-specific inverse quant matrices. This
+/// produces better CfL values because the fitting accounts for how the encoder
+/// will actually encode each block.
+///
+/// Matches libjxl `ComputeTile` with `use_dct8=false` in enc_chroma_from_luma.cc.
+///
+/// Called after AC strategy selection and quant field computation.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_cfl_map(
+    cfl_map: &mut CflMap,
+    xyb_x: &[f32],
+    xyb_y: &[f32],
+    xyb_b: &[f32],
+    stride: usize,
+    xsize_blocks: usize,
+    ysize_blocks: usize,
+    ac_strategy: &AcStrategyMap,
+    quant_field: &[u8],
+    quant_scale: f32,
+    use_newton: bool,
+    newton_eps: f32,
+    newton_max_iters: usize,
+) {
+    let xsize_tiles = cfl_map.xsize_tiles;
+    let ysize_tiles = cfl_map.ysize_tiles;
+    let num_tiles = xsize_tiles * ysize_tiles;
+
+    let compute_tile = |tile_idx: usize| {
+        let tx = tile_idx % xsize_tiles;
+        let ty = tile_idx / xsize_tiles;
+        let tile_bx0 = tx * TILE_DIM_IN_BLOCKS;
+        let tile_by0 = ty * TILE_DIM_IN_BLOCKS;
+        let tile_bx1 = (tile_bx0 + TILE_DIM_IN_BLOCKS).min(xsize_blocks);
+        let tile_by1 = (tile_by0 + TILE_DIM_IN_BLOCKS).min(ysize_blocks);
+
+        // Thread-local scratch buffers
+        let max_coeffs_per_tile = TILE_DIM_IN_BLOCKS * TILE_DIM_IN_BLOCKS * DCT_BLOCK_SIZE;
+        let mut coeffs_yx = vec![0.0f32; max_coeffs_per_tile];
+        let mut coeffs_x = vec![0.0f32; max_coeffs_per_tile];
+        let mut coeffs_yb = vec![0.0f32; max_coeffs_per_tile];
+        let mut coeffs_b = vec![0.0f32; max_coeffs_per_tile];
+
+        const MAX_COEFF_AREA: usize = 4096;
+        let mut dct_y = vec![0.0f32; MAX_COEFF_AREA];
+        let mut dct_x = vec![0.0f32; MAX_COEFF_AREA];
+        let mut dct_b = vec![0.0f32; MAX_COEFF_AREA];
+
+        let mut num_ac = 0usize;
+
+        for by in tile_by0..tile_by1 {
+            for bx in tile_bx0..tile_bx1 {
+                if !ac_strategy.is_first(bx, by) {
+                    continue;
+                }
+
+                let raw_strategy = ac_strategy.raw_strategy(bx, by);
+                let covered_x = COVERED_X[raw_strategy as usize];
+                let covered_y = COVERED_Y[raw_strategy as usize];
+
+                if covered_x + tile_bx0 > tile_bx1 || covered_y + tile_by0 > tile_by1 {
+                    continue;
+                }
+
+                VarDctEncoder::apply_dct(xyb_y, stride, bx, by, raw_strategy, &mut dct_y);
+                VarDctEncoder::apply_dct(xyb_x, stride, bx, by, raw_strategy, &mut dct_x);
+                VarDctEncoder::apply_dct(xyb_b, stride, bx, by, raw_strategy, &mut dct_b);
+
+                let (cx, cy) = if covered_x >= covered_y {
+                    (covered_x, covered_y)
+                } else {
+                    (covered_y, covered_x)
+                };
+
+                for iy in 0..cy {
+                    for ix in 0..cx {
+                        let pos = cx * BLOCK_DIM * iy + ix;
+                        dct_y[pos] = 0.0;
+                        dct_x[pos] = 0.0;
+                        dct_b[pos] = 0.0;
+                    }
+                }
+
+                let qq = quant_field[by * xsize_blocks + bx] as f32;
+                let q = quant_scale * 128.0 * qq;
+
+                let qw_x = quant::quant_weights(raw_strategy as usize, 0);
+                let qw_b = quant::quant_weights(raw_strategy as usize, 2);
+
+                let num_coeffs = cx * cy * DCT_BLOCK_SIZE;
+                for i in 0..num_coeffs {
+                    let qqm_x = q / qw_x[i];
+                    let qqm_b = q / qw_b[i];
+                    coeffs_yx[num_ac + i] = dct_y[i] * qqm_x;
+                    coeffs_x[num_ac + i] = dct_x[i] * qqm_x;
+                    coeffs_yb[num_ac + i] = dct_y[i] * qqm_b;
+                    coeffs_b[num_ac + i] = dct_b[i] * qqm_b;
+                }
+                num_ac += num_coeffs;
+            }
+        }
+
+        let tx_val = find_best_multiplier(
+            &coeffs_yx,
+            &coeffs_x,
+            num_ac,
+            0.0,
+            K_DISTANCE_MULTIPLIER_AC,
+            use_newton,
+            newton_eps,
+            newton_max_iters,
+        );
+        let tb_val = find_best_multiplier(
+            &coeffs_yb,
+            &coeffs_b,
+            num_ac,
+            1.0,
+            K_DISTANCE_MULTIPLIER_AC,
+            use_newton,
+            newton_eps,
+            newton_max_iters,
+        );
+
+        (tx_val, tb_val)
+    };
+
+    if crate::parallel::sequential_maps_forced() {
+        for tile_idx in 0..num_tiles {
+            let (tx_val, tb_val) = compute_tile(tile_idx);
+            cfl_map.ytox[tile_idx] = tx_val;
+            cfl_map.ytob[tile_idx] = tb_val;
+        }
+    } else {
+        let tile_results = crate::parallel::parallel_map(num_tiles, compute_tile);
+        for (tile_idx, &(tx_val, tb_val)) in tile_results.iter().enumerate() {
+            cfl_map.ytox[tile_idx] = tx_val;
+            cfl_map.ytob[tile_idx] = tb_val;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ytox_ratio() {
+        assert_eq!(ytox_ratio(0), 0.0);
+        assert!((ytox_ratio(84) - 1.0).abs() < 1e-6);
+        assert!((ytox_ratio(-84) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_ytob_ratio() {
+        assert_eq!(ytob_ratio(0), 1.0);
+        assert!((ytob_ratio(84) - 2.0).abs() < 1e-6);
+        assert!((ytob_ratio(-84) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_find_best_multiplier_zero_input() {
+        assert_eq!(
+            find_best_multiplier(&[], &[], 0, 0.0, 1e-3, false, 1.0, 10),
+            0
+        );
+    }
+
+    #[test]
+    fn test_find_best_multiplier_uncorrelated() {
+        // When values_m and values_s are uncorrelated, the multiplier should be near 0
+        let m = [1.0, 0.0, -1.0, 0.0];
+        let s = [0.0, 1.0, 0.0, -1.0];
+        let result = find_best_multiplier(&m, &s, 4, 0.0, 1e-3, false, 1.0, 10);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_find_best_multiplier_correlated() {
+        // When s = base*m + factor/84*m, the multiplier should recover factor
+        // (with regularization pulling toward 0).
+        // Use large values to make regularization negligible.
+        // The towards_zero bias (2.6) shifts the result towards 0.
+        let factor = 42.0;
+        let base = 0.0;
+        let m: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 10.0).collect();
+        let s: Vec<f32> = m.iter().map(|&v| base * v + factor / 84.0 * v).collect();
+        let result = find_best_multiplier(&m, &s, 64, base, 1e-3, false, 1.0, 10);
+        // Optimization yields ~42.0, towards_zero bias subtracts 2.6 → ~39
+        let expected = (factor - 2.6).round();
+        assert!(
+            (result as f32 - expected).abs() < 2.0,
+            "Expected ~{} (factor {} - 2.6 bias), got {}",
+            expected,
+            factor,
+            result
+        );
+    }
+
+    #[test]
+    fn test_cfl_map_uniform_gray() {
+        // Uniform gray image: all channels identical after XYB transform
+        // means X≈0, B≈Y, so CfL should produce ytox≈0, ytob≈0
+        use crate::color::xyb::linear_rgb_to_xyb;
+
+        let width = 16;
+        let height = 16;
+        let n = width * height;
+        let mut xyb_x = vec![0.0f32; n];
+        let mut xyb_y = vec![0.0f32; n];
+        let mut xyb_b = vec![0.0f32; n];
+
+        for i in 0..n {
+            let (x, y, b) = linear_rgb_to_xyb(0.5, 0.5, 0.5);
+            xyb_x[i] = x;
+            xyb_y[i] = y;
+            xyb_b[i] = b;
+        }
+
+        let xsize_blocks = div_ceil(width, BLOCK_DIM);
+        let ysize_blocks = div_ceil(height, BLOCK_DIM);
+        let cfl = compute_cfl_map(
+            &xyb_x,
+            &xyb_y,
+            &xyb_b,
+            width,
+            height,
+            xsize_blocks,
+            ysize_blocks,
+            false, // use_newton
+            1.0,
+            10,
+        );
+
+        // Uniform image: all AC coefficients are 0 except DC,
+        // and DC is zeroed out before fitting. So all values should be 0.
+        assert_eq!(cfl.ytox_at(0, 0), 0);
+        assert_eq!(cfl.ytob_at(0, 0), 0);
+    }
+}

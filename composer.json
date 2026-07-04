@@ -1,0 +1,21 @@
+{
+    "name": "usernamn0tavailable/oxipix",
+    "description": "Pure-Rust libvips replacement as a PHP native extension. Zero C dependencies, optimized for cached JXL-backed image requests.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["image", "rust", "vips", "webp", "jxl", "jpeg", "iiif", "extension"],
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "Oxipix\\": "src/"
+        }
+    },
+    "extra": {
+        "oxipix": {
+            "extension-name": "oxipix",
+            "github-repo": "UsernameN0tAvailable/oxipix"
+        }
+    }
+}

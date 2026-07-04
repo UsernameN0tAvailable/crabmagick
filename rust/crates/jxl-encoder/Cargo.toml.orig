@@ -1,0 +1,151 @@
+[package]
+name = "jxl-encoder"
+description = "JPEG XL encoder in pure Rust"
+readme = "README.md"
+documentation = "https://docs.rs/jxl-encoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["jpeg-xl", "encoder", "image"]
+categories = ["multimedia::images", "multimedia::encoding"]
+include = ["/src/**", "/examples/*.rs", "/tests/*.rs", "/tests/*.txt", "/README.md", "/LICENSE*"]
+# Disable example auto-discovery so internal-only tools (e.g. picker oracle
+# calibration harnesses with sibling-repo path deps) don't break out-of-tree
+# CI builds. Examples must be listed explicitly via [[example]] below.
+autoexamples = false
+
+[dependencies]
+enough = "0.4.3"
+once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
+whereat = { version = "0.1.5"}
+bytemuck = { version = "1.25", features = ["derive"] }
+thiserror = { version = "2.0", default-features = false }
+jxl_simd = { package = "jxl-encoder-simd", version = "0.3.0", path = "../jxl-encoder-simd", default-features = false }
+archmage = { version = "0.9.15", default-features = false, features = ["macros"] }
+rayon = { version = "1.10", optional = true }
+zenjpeg = { version = "0.7.1", default-features = false, features = ["decoder"], optional = true }
+brotli = { version = "8.0", default-features = false, features = ["std"], optional = true }
+# Optional dependencies for butteraugli-loop and rate-control features
+jxl-oxide = { version = "0.12.5", default-features = false, optional = true }
+butteraugli = { version = "0.9", optional = true }
+imgref = { version = "1.12", optional = true }
+rgb = { version = "0.8", optional = true }
+fast-ssim2 = { version = "0.7.1", features = ["imgref"], optional = true }
+zensim = { version = "0.2", optional = true }
+
+[features]
+std = ["thiserror/std", "archmage/std", "jxl_simd/std"]
+trace-bitstream = []
+# Verbose debug output for token encoding (DC, AC, entropy codes)
+debug-tokens = []
+# Debug DC extraction for DCT16x16/32x32
+debug-dc = []
+# Print AC strategy selection histogram
+debug-ac-strategy = []
+# Spatial decision logging — writes sidecar CSV with per-rect decisions
+debug-rect = []
+# Iterative rate control for improved distance targeting.
+# Requires jxl-oxide for decoding and butteraugli for quality measurement.
+rate-control = ["dep:jxl-oxide", "dep:butteraugli", "dep:imgref", "dep:rgb"]
+# Butteraugli quantization loop: iteratively refines quant field using butteraugli distmap.
+butteraugli-loop = ["dep:butteraugli", "dep:imgref", "dep:rgb"]
+ssim2-loop = ["dep:fast-ssim2", "dep:imgref"]
+zensim-loop = ["dep:zensim"]
+# Convenience encode functions that accept imgref::ImgRef with typed pixel formats.
+convenience = ["dep:imgref", "dep:rgb"]
+jpeg-reencoding = ["dep:zenjpeg", "dep:brotli"]
+parallel = ["std", "dep:rayon"]
+# Use MaybeUninit for hot-path temporary buffers instead of zero-initialization.
+# Eliminates ~584M memset writes (24.7% of total data writes) at the cost of
+# requiring `unsafe` in a few carefully audited locations. The crate-level lint
+# is downgraded from `forbid(unsafe_code)` to `deny(unsafe_code)` so that
+# individual functions can `#[allow(unsafe_code)]`.
+unsafe-performance = ["jxl_simd/unsafe-performance"]
+# Picker training / sweep escape hatch: exposes the segmented
+# LossyInternalParams / LosslessInternalParams structs and the
+# LossyConfig::with_internal_params / LosslessConfig::with_internal_params
+# setters. The split mirrors the encoder's mode boundary so the type system
+# enforces mode-correctness (lossy-only knobs cannot be passed to the
+# lossless setter, and vice versa). Not stable; field sets may grow
+# additively between minor versions.
+__expert = []
+default = ["std", "butteraugli-loop"]
+
+[dev-dependencies]
+image = "0.25"
+# jxl-rs (github.com/lilith/jxl-rs) is the PRIMARY decoder for roundtrip tests
+jxl = "0.4.0"
+jxl_transforms = "0.4.0"
+# jxl-oxide is secondary — always test jxl-rs first
+jxl-oxide = "0.12.5"
+jxl-jbr = "0.2.1"
+# SSIMULACRA2 for perceptual quality metrics
+fast-ssim2 = { version = "0.7.1", features = ["imgref"] }
+yuvxyb = "0.5.0"
+# Butteraugli perceptual quality metric
+butteraugli = "0.9"
+imgref = "1.12"
+rgb = "0.8"
+walkdir = "2.5"
+sha2 = "0.11.0"
+
+# codec-corpus uses fd-lock which doesn't compile on WASM
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+codec-corpus = "1.0.1"
+rayon = "1.10"
+# Deterministic RNG for picker oracle scalar sampling.
+fastrand = "2.4.1"
+
+# Standard examples (autoexamples is disabled above; list each explicitly).
+[[example]]
+name = "distance_sweep"
+path = "examples/distance_sweep.rs"
+
+[[example]]
+name = "fresh_encode"
+path = "examples/fresh_encode.rs"
+
+[[example]]
+name = "multigroup_gallery"
+path = "examples/multigroup_gallery.rs"
+
+[[example]]
+name = "test_300_debug"
+path = "examples/test_300_debug.rs"
+
+[[example]]
+name = "test_multi_group"
+path = "examples/test_multi_group.rs"
+
+[[example]]
+name = "test_ssim2"
+path = "examples/test_ssim2.rs"
+
+[[example]]
+name = "test_ssim2_300"
+path = "examples/test_ssim2_300.rs"
+
+[[example]]
+name = "test_ssim2_exact"
+path = "examples/test_ssim2_exact.rs"
+
+[[example]]
+name = "wasm_bench"
+path = "examples/wasm_bench.rs"
+
+# Picker oracle calibration harnesses (lossless_pareto_calibrate /
+# lossy_pareto_calibrate) live under examples/ but are NOT registered as
+# cargo examples — they depend on a sibling-repo `zenanalyze` path that
+# isn't present on CI. Run them locally with:
+#   cargo run --release --manifest-path jxl-encoder/Cargo.toml \
+#       --example lossless_pareto_calibrate --features __expert
+# after editing this file to add a [[example]] entry plus the path dep
+# (see git history pre-2026-05-02 for the previous wiring).
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/fast-webp",
+    "crates/jxl-encoder",
+    "crates/zenjpeg",
+    "crates/zen-jp2",
+    "crates/oxipix-core",
+    "crates/oxipix-php",
+]
+resolver = "2"
+
+[patch.crates-io]
+zenjpeg = { path = "crates/zenjpeg" }
