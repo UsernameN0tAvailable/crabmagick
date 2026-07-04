@@ -4,7 +4,7 @@ use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
 
 use crate::cache::{DecodedImage, OutputCache, TileCache};
-use crate::pipeline::{apply_region, decode_jxl, decode_jxl_info, encode, resize_rgb};
+use crate::pipeline::{apply_region, decode_jxl, decode_jxl_info, encode, resize_rgb, rotate_rgb, square_crop};
 
 static RT: OnceCell<Runtime> = OnceCell::new();
 static TILE_CACHE: OnceCell<TileCache> = OnceCell::new();
@@ -28,6 +28,10 @@ pub struct ProcessRequest {
     pub out_h: u32,
     pub format: OutputFormat,
     pub quality: u8,
+    /// Clockwise rotation in degrees: 0, 90, 180, 270.
+    pub rotation: u16,
+    /// If true, crop the largest centred square before resizing.
+    pub square_region: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,7 +103,9 @@ pub fn process_image(jxl_path: &str, req: ProcessRequest) -> Result<Vec<u8>, Oxi
         arc
     };
 
-    let cropped = if req.region_w > 0 && req.region_h > 0 {
+    let cropped = if req.square_region {
+        square_crop(&decoded)
+    } else if req.region_w > 0 && req.region_h > 0 {
         apply_region(&decoded, req.region_x, req.region_y, req.region_w, req.region_h)
     } else {
         DecodedImage {
@@ -115,7 +121,13 @@ pub fn process_image(jxl_path: &str, req: ProcessRequest) -> Result<Vec<u8>, Oxi
         cropped
     };
 
-    let encoded = encode(&resized, req.format, req.quality)?;
+    let rotated = if req.rotation != 0 {
+        rotate_rgb(&resized, req.rotation)
+    } else {
+        resized
+    };
+
+    let encoded = encode(&rotated, req.format, req.quality)?;
     output_cache.insert(cache_key, Arc::new(encoded.clone()));
     Ok(encoded)
 }

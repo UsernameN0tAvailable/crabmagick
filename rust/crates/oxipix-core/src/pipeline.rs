@@ -2,8 +2,8 @@ use std::fs;
 use std::io::Cursor;
 
 use fast_image_resize as fir;
-use image::{ColorType, ImageEncoder, RgbImage, codecs::png::PngEncoder};
-use jxl_encoder::{LossyConfig, PixelLayout as JxlLayout};
+use image::{codecs::png::PngEncoder, ColorType, ImageEncoder, RgbImage};
+use jxl_encoder::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
 use jxl_oxide::{JxlImage, PixelFormat};
 use zenjpeg::encoder::{ChromaSubsampling, EncoderConfig, PixelLayout as ZenLayout, Unstoppable};
 
@@ -12,6 +12,10 @@ use crate::processor::{ImageInfo, OutputFormat, OxipixError};
 
 pub fn decode_jxl(path: &str) -> Result<DecodedImage, OxipixError> {
     let bytes = fs::read(path)?;
+    decode_jxl_from_bytes(&bytes)
+}
+
+pub fn decode_jxl_from_bytes(bytes: &[u8]) -> Result<DecodedImage, OxipixError> {
     let image = JxlImage::builder()
         .read(Cursor::new(bytes))
         .map_err(|e| OxipixError::Decode(e.to_string()))?;
@@ -64,6 +68,10 @@ pub fn decode_jxl(path: &str) -> Result<DecodedImage, OxipixError> {
 
 pub fn decode_jxl_info(path: &str) -> Result<ImageInfo, OxipixError> {
     let bytes = fs::read(path)?;
+    decode_jxl_info_from_bytes(&bytes)
+}
+
+pub fn decode_jxl_info_from_bytes(bytes: &[u8]) -> Result<ImageInfo, OxipixError> {
     let image = JxlImage::builder()
         .read(Cursor::new(bytes))
         .map_err(|e| OxipixError::Decode(e.to_string()))?;
@@ -170,6 +178,119 @@ pub fn resize_rgb(img: &DecodedImage, out_w: u32, out_h: u32) -> DecodedImage {
     }
 }
 
+/// Crop the largest centred square from the image (IIIF "square" region).
+pub fn square_crop(img: &DecodedImage) -> DecodedImage {
+    let side = img.width.min(img.height);
+    let x = (img.width - side) / 2;
+    let y = (img.height - side) / 2;
+    apply_region(img, x, y, side, side)
+}
+
+/// Rotate an RGB image clockwise by 0 / 90 / 180 / 270 degrees.
+pub fn rotate_rgb(img: &DecodedImage, degrees: u16) -> DecodedImage {
+    match degrees % 360 {
+        0 => DecodedImage { pixels: img.pixels.clone(), width: img.width, height: img.height },
+        180 => {
+            let mut pixels = vec![0u8; img.pixels.len()];
+            let stride = img.width as usize * 3;
+            for row in 0..img.height as usize {
+                let src = &img.pixels[(img.height as usize - 1 - row) * stride..][..stride];
+                let dst = &mut pixels[row * stride..][..stride];
+                for col in 0..img.width as usize {
+                    dst[col * 3..col * 3 + 3].copy_from_slice(&src[(img.width as usize - 1 - col) * 3..][..3]);
+                }
+            }
+            DecodedImage { pixels, width: img.width, height: img.height }
+        }
+        90 => {
+            // 90° clockwise: new_w = old_h, new_h = old_w
+            let (ow, oh) = (img.width as usize, img.height as usize);
+            let mut pixels = vec![0u8; img.pixels.len()];
+            for row in 0..oh {
+                for col in 0..ow {
+                    let src = &img.pixels[(row * ow + col) * 3..][..3];
+                    let dst_row = col;
+                    let dst_col = oh - 1 - row;
+                    pixels[(dst_row * oh + dst_col) * 3..][..3].copy_from_slice(src);
+                }
+            }
+            DecodedImage { pixels, width: img.height, height: img.width }
+        }
+        270 => {
+            // 270° clockwise (= 90° CCW): new_w = old_h, new_h = old_w
+            let (ow, oh) = (img.width as usize, img.height as usize);
+            let mut pixels = vec![0u8; img.pixels.len()];
+            for row in 0..oh {
+                for col in 0..ow {
+                    let src = &img.pixels[(row * ow + col) * 3..][..3];
+                    let dst_row = ow - 1 - col;
+                    let dst_col = row;
+                    pixels[(dst_row * oh + dst_col) * 3..][..3].copy_from_slice(src);
+                }
+            }
+            DecodedImage { pixels, width: img.height, height: img.width }
+        }
+        _ => DecodedImage { pixels: img.pixels.clone(), width: img.width, height: img.height },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct JxlEncodeOptions {
+    pub lossless: bool,
+    pub distance: Option<f32>,
+    pub effort: u8,
+    pub threads: usize,
+    pub mode: EncoderMode,
+    pub max_strategy_size: Option<u8>,
+    pub force_strategy: Option<u8>,
+    pub custom_orders: Option<bool>,
+    pub adaptive_block_contexts: Option<bool>,
+    pub patches: Option<bool>,
+    pub lossless_tree_learning: Option<bool>,
+    pub lossless_lz77: Option<bool>,
+    pub lossless_squeeze: Option<bool>,
+    pub gaborish: Option<bool>,
+    pub pixel_domain_loss: Option<bool>,
+    pub adaptive_quant: Option<bool>,
+    pub adjust_quant_ac: Option<bool>,
+    pub chromacity_adjustment: Option<bool>,
+    pub cfl: Option<bool>,
+    pub cfl_two_pass: Option<bool>,
+    pub epf: Option<bool>,
+    pub epf_dynamic_sharpness: Option<bool>,
+    pub optimize_codes: Option<bool>,
+}
+
+impl Default for JxlEncodeOptions {
+    fn default() -> Self {
+        Self {
+            lossless: false,
+            distance: Some(1.0),
+            effort: 5,
+            threads: 0,
+            mode: EncoderMode::Experimental,
+            max_strategy_size: None,
+            force_strategy: None,
+            custom_orders: None,
+            adaptive_block_contexts: None,
+            patches: None,
+            lossless_tree_learning: None,
+            lossless_lz77: None,
+            lossless_squeeze: None,
+            gaborish: None,
+            pixel_domain_loss: None,
+            adaptive_quant: None,
+            adjust_quant_ac: None,
+            chromacity_adjustment: None,
+            cfl: None,
+            cfl_two_pass: None,
+            epf: None,
+            epf_dynamic_sharpness: None,
+            optimize_codes: None,
+        }
+    }
+}
+
 pub fn encode(
     img: &DecodedImage,
     format: OutputFormat,
@@ -186,8 +307,7 @@ pub fn encode(
                 .map_err(|e| OxipixError::Encode(e.to_string()))?;
             enc.push_packed(rgb.as_raw(), Unstoppable)
                 .map_err(|e| OxipixError::Encode(e.to_string()))?;
-            enc.finish()
-                .map_err(|e| OxipixError::Encode(e.to_string()))
+            enc.finish().map_err(|e| OxipixError::Encode(e.to_string()))
         }
         OutputFormat::Webp => fast_webp::encode_lossy_webp(&rgb, quality.min(100))
             .map_err(|e| OxipixError::Encode(e.to_string())),
@@ -195,14 +315,106 @@ pub fn encode(
             let mut out = Vec::new();
             let encoder = PngEncoder::new(&mut out);
             encoder
-                .write_image(rgb.as_raw(), rgb.width(), rgb.height(), ColorType::Rgb8.into())
+                .write_image(
+                    rgb.as_raw(),
+                    rgb.width(),
+                    rgb.height(),
+                    ColorType::Rgb8.into(),
+                )
                 .map_err(|e| OxipixError::Encode(e.to_string()))?;
             Ok(out)
         }
-        OutputFormat::Jxl => LossyConfig::new(distance_from_quality(quality))
-            .with_effort(5)
-            .encode(rgb.as_raw(), rgb.width(), rgb.height(), JxlLayout::Rgb8)
-            .map_err(|e| OxipixError::Encode(e.to_string())),
+        OutputFormat::Jxl => encode_jxl_rgb(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            &JxlEncodeOptions {
+                distance: Some(distance_from_quality(quality)),
+                ..JxlEncodeOptions::default()
+            },
+        ),
+    }
+}
+
+pub fn encode_jxl_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &JxlEncodeOptions,
+) -> Result<Vec<u8>, OxipixError> {
+    if options.lossless {
+        let mut config = LosslessConfig::new()
+            .with_effort(options.effort)
+            .with_mode(options.mode)
+            .with_threads(options.threads);
+        if let Some(patches) = options.patches {
+            config = config.with_patches(patches);
+        }
+        if let Some(tree_learning) = options.lossless_tree_learning {
+            config = config.with_tree_learning(tree_learning);
+        }
+        if let Some(lz77) = options.lossless_lz77 {
+            config = config.with_lz77(lz77);
+        }
+        if let Some(squeeze) = options.lossless_squeeze {
+            config = config.with_squeeze(squeeze);
+        }
+        config
+            .encode(pixels, width, height, JxlLayout::Rgb8)
+            .map_err(|e| OxipixError::Encode(e.to_string()))
+    } else {
+        let mut config = LossyConfig::new(options.distance.unwrap_or(1.0))
+            .with_effort(options.effort)
+            .with_mode(options.mode)
+            .with_threads(options.threads);
+        if let Some(max_strategy_size) = options.max_strategy_size {
+            config = config.with_max_strategy_size(Some(max_strategy_size));
+        }
+        if let Some(force_strategy) = options.force_strategy {
+            config = config.with_force_strategy(Some(force_strategy));
+        }
+        if let Some(custom_orders) = options.custom_orders {
+            config = config.with_custom_orders(custom_orders);
+        }
+        if let Some(adaptive_block_contexts) = options.adaptive_block_contexts {
+            config = config.with_adaptive_block_contexts(adaptive_block_contexts);
+        }
+        if let Some(patches) = options.patches {
+            config = config.with_patches(patches);
+        }
+        if let Some(gaborish) = options.gaborish {
+            config = config.with_gaborish(gaborish);
+        }
+        if let Some(pixel_domain_loss) = options.pixel_domain_loss {
+            config = config.with_pixel_domain_loss(pixel_domain_loss);
+        }
+        if let Some(adaptive_quant) = options.adaptive_quant {
+            config = config.with_adaptive_quant(adaptive_quant);
+        }
+        if let Some(adjust_quant_ac) = options.adjust_quant_ac {
+            config = config.with_adjust_quant_ac(adjust_quant_ac);
+        }
+        if let Some(chromacity_adjustment) = options.chromacity_adjustment {
+            config = config.with_chromacity_adjustment(chromacity_adjustment);
+        }
+        if let Some(cfl) = options.cfl {
+            config = config.with_cfl(cfl);
+        }
+        if let Some(cfl_two_pass) = options.cfl_two_pass {
+            config = config.with_cfl_two_pass(cfl_two_pass);
+        }
+        if let Some(epf) = options.epf {
+            config = config.with_epf(epf);
+        }
+        if let Some(epf_dynamic_sharpness) = options.epf_dynamic_sharpness {
+            config = config.with_epf_dynamic_sharpness(epf_dynamic_sharpness);
+        }
+        if let Some(optimize_codes) = options.optimize_codes {
+            config = config.with_optimize_codes(optimize_codes);
+        }
+        config
+            .encode(pixels, width, height, JxlLayout::Rgb8)
+            .map_err(|e| OxipixError::Encode(e.to_string()))
     }
 }
 

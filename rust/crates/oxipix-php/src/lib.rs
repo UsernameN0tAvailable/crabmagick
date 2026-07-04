@@ -16,6 +16,8 @@ pub struct OxipixImage {
     region_h: u32,
     out_w: u32,
     out_h: u32,
+    rotation: u16,
+    square_region: bool,
 }
 
 #[php_impl]
@@ -30,6 +32,8 @@ impl OxipixImage {
             region_h: 0,
             out_w: 0,
             out_h: 0,
+            rotation: 0,
+            square_region: false,
         })
     }
 
@@ -57,6 +61,21 @@ impl OxipixImage {
         self_
     }
 
+    pub fn rotate<'a>(
+        self_: &'a mut ZendClassObject<OxipixImage>,
+        degrees: u16,
+    ) -> &'a mut ZendClassObject<OxipixImage> {
+        self_.rotation = degrees;
+        self_
+    }
+
+    pub fn square<'a>(
+        self_: &'a mut ZendClassObject<OxipixImage>,
+    ) -> &'a mut ZendClassObject<OxipixImage> {
+        self_.square_region = true;
+        self_
+    }
+
     pub fn encode(&self, format: String, quality: u8) -> PhpResult<Binary<u8>> {
         let req = ProcessRequest {
             region_x: self.region_x,
@@ -67,6 +86,8 @@ impl OxipixImage {
             out_h: self.out_h,
             format: parse_format(&format)?,
             quality,
+            rotation: self.rotation,
+            square_region: self.square_region,
         };
 
         process_image(&self.path, req)
@@ -104,6 +125,8 @@ pub fn oxipix_process(
         out_h: oh,
         format: parse_format(&format)?,
         quality,
+        rotation: 0,
+        square_region: false,
     };
 
     process_image(&path, req)
