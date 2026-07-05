@@ -4,7 +4,7 @@ use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
 
 use crate::cache::{DecodedImage, OutputCache, TileCache};
-use crate::pipeline::{apply_region, decode_jxl, decode_jxl_info, encode, resize_rgb, rotate_rgb, square_crop};
+use crate::pipeline::{apply_region, decode_jxl, decode_jxl_info, decode_jxl_region, encode, resize_rgb, rotate_rgb, square_crop};
 
 static RT: OnceCell<Runtime> = OnceCell::new();
 static TILE_CACHE: OnceCell<TileCache> = OnceCell::new();
@@ -84,7 +84,11 @@ pub fn init(tile_cache_mb: u64, output_cache_mb: u64) {
     });
 }
 
-/// Process an image file: output cache -> decoded cache -> crop -> resize -> encode.
+/// Process an image file: output cache -> tile cache -> crop-during-decode -> resize -> encode.
+///
+/// For region requests, jxl-oxide is asked to decode only the requested crop window,
+/// skipping groups outside it. This makes first-request tile latency proportional to
+/// the tile area, not the full image area.
 pub fn process_image(jxl_path: &str, req: ProcessRequest) -> Result<Vec<u8>, OxipixError> {
     let tile_cache = TILE_CACHE.get_or_init(|| TileCache::new(512));
     let output_cache = OUTPUT_CACHE.get_or_init(|| OutputCache::new(512));
@@ -94,16 +98,72 @@ pub fn process_image(jxl_path: &str, req: ProcessRequest) -> Result<Vec<u8>, Oxi
         return Ok((*cached).clone());
     }
 
-    let decoded = if let Some(cached) = tile_cache.get(jxl_path) {
-        cached
+    // Build a tile-cache key that includes the crop region so partial decodes are
+    // cached separately from the full image. Full-image key = jxl_path.
+    let tile_key: String = if req.region_w > 0 && req.region_h > 0 {
+        format!("{}#r{},{},{},{}", jxl_path, req.region_x, req.region_y, req.region_w, req.region_h)
+    } else if req.square_region {
+        format!("{}#sq", jxl_path)
     } else {
+        jxl_path.to_string()
+    };
+
+    let decoded = if let Some(cached) = tile_cache.get(&tile_key) {
+        // Cache hit: already have the (potentially pre-cropped) pixels.
+        cached
+    } else if req.region_w > 0 && req.region_h > 0 {
+        // Region request + cache miss → decode only the crop window (fast path).
+        let img = decode_jxl_region(
+            jxl_path,
+            req.region_x,
+            req.region_y,
+            req.region_w,
+            req.region_h,
+        )?;
+        let arc = Arc::new(img);
+        tile_cache.insert(tile_key, Arc::clone(&arc));
+        arc
+    } else if req.square_region {
+        // Square region: compute the crop from image dimensions, then decode with crop.
+        // First try to get dimensions cheaply from the full-image tile cache or the header.
+        let (img_w, img_h) = if let Some(full) = tile_cache.get(jxl_path) {
+            (full.width, full.height)
+        } else {
+            let info = decode_jxl_info(jxl_path)?;
+            (info.width, info.height)
+        };
+        let side = img_w.min(img_h);
+        let cx = (img_w - side) / 2;
+        let cy = (img_h - side) / 2;
+        let img = decode_jxl_region(jxl_path, cx, cy, side, side)?;
+        let arc = Arc::new(img);
+        tile_cache.insert(tile_key, Arc::clone(&arc));
+        arc
+    } else {
+        // Full image request → decode everything and cache it.
         let img = decode_jxl(jxl_path)?;
         let arc = Arc::new(img);
-        tile_cache.insert(jxl_path.to_string(), Arc::clone(&arc));
+        tile_cache.insert(tile_key, Arc::clone(&arc));
         arc
     };
 
-    let cropped = if req.square_region {
+    // If we decoded a pre-cropped tile, the region is already applied.
+    // Only apply in-memory region crop when we have a full-image tile cache hit.
+    let cropped = if req.region_w > 0 && req.region_h > 0 && decoded.width == req.region_w && decoded.height == req.region_h {
+        // Already the exact crop — skip in-memory apply_region.
+        DecodedImage {
+            pixels: decoded.pixels.clone(),
+            width: decoded.width,
+            height: decoded.height,
+        }
+    } else if req.square_region && decoded.width == decoded.height {
+        // Already square-cropped.
+        DecodedImage {
+            pixels: decoded.pixels.clone(),
+            width: decoded.width,
+            height: decoded.height,
+        }
+    } else if req.square_region {
         square_crop(&decoded)
     } else if req.region_w > 0 && req.region_h > 0 {
         apply_region(&decoded, req.region_x, req.region_y, req.region_w, req.region_h)

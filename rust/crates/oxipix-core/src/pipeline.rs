@@ -4,7 +4,7 @@ use std::io::Cursor;
 use fast_image_resize as fir;
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder, RgbImage};
 use jxl_encoder::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
-use jxl_oxide::{JxlImage, PixelFormat};
+use jxl_oxide::{CropInfo, JxlImage, PixelFormat};
 use zenjpeg::encoder::{ChromaSubsampling, EncoderConfig, PixelLayout as ZenLayout, Unstoppable};
 
 use crate::cache::DecodedImage;
@@ -63,6 +63,81 @@ pub fn decode_jxl_from_bytes(bytes: &[u8]) -> Result<DecodedImage, OxipixError> 
         pixels,
         width,
         height,
+    })
+}
+
+/// Decode only the specified region of a JXL file. jxl-oxide skips groups
+/// outside the crop window, making this much faster for small tile requests.
+pub fn decode_jxl_region(
+    path: &str,
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, OxipixError> {
+    let bytes = fs::read(path)?;
+    decode_jxl_region_from_bytes(&bytes, left, top, width, height)
+}
+
+pub fn decode_jxl_region_from_bytes(
+    bytes: &[u8],
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, OxipixError> {
+    let mut image = JxlImage::builder()
+        .read(Cursor::new(bytes))
+        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+
+    image.set_image_region(CropInfo { left, top, width, height });
+
+    let frame = image
+        .render_frame(0)
+        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+
+    let planes = frame.image_planar();
+    if planes.is_empty() {
+        return Err(OxipixError::Decode("no planes decoded".to_string()));
+    }
+    let actual_w = planes[0].width() as u32;
+    let actual_h = planes[0].height() as u32;
+    let pixel_count = (actual_w * actual_h) as usize;
+
+    #[inline(always)]
+    fn f32_to_u8(v: f32) -> u8 {
+        (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+    }
+
+    let mut pixels = vec![0u8; pixel_count * 3];
+    match image.pixel_format() {
+        PixelFormat::Gray | PixelFormat::Graya => {
+            for (chunk, &value) in pixels.chunks_exact_mut(3).zip(planes[0].buf().iter()) {
+                let gray = f32_to_u8(value);
+                chunk[0] = gray;
+                chunk[1] = gray;
+                chunk[2] = gray;
+            }
+        }
+        PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Cmyk | PixelFormat::Cmyka => {
+            let r = planes[0].buf();
+            let g = planes[1].buf();
+            let b = planes[2].buf();
+            for (chunk, ((rv, gv), bv)) in pixels
+                .chunks_exact_mut(3)
+                .zip(r.iter().zip(g.iter()).zip(b.iter()))
+            {
+                chunk[0] = f32_to_u8(*rv);
+                chunk[1] = f32_to_u8(*gv);
+                chunk[2] = f32_to_u8(*bv);
+            }
+        }
+    }
+
+    Ok(DecodedImage {
+        pixels,
+        width: actual_w,
+        height: actual_h,
     })
 }
 
