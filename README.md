@@ -31,6 +31,23 @@ sudo ln -s $(pwd)/vendor/usernamn0tavailable/crabmagick/crabmagick.ini \
 
 `crabmagick.ini` is generated automatically by `composer install` with the correct absolute path.
 
+### Variant selection
+
+`composer install` auto-detects the best binary for your CPU:
+
+| CPU | Selected binary |
+|---|---|
+| x86_64 with AVX2 (Intel Haswell+, AMD Ryzen+) | `crabmagick-php8.4-x86_64-avx2-linux.so` |
+| x86_64 generic | `crabmagick-php8.4-x86_64-linux.so` |
+| aarch64 | `crabmagick-php8.4-aarch64-linux.so` |
+
+**Override** in your project's `composer.json`:
+```json
+"extra": {
+    "crabmagick": { "variant": "x86_64-avx2" }
+}
+```
+
 ## PHP API
 
 ```php
