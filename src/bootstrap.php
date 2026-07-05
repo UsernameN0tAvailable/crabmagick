@@ -9,7 +9,7 @@ declare(strict_types=1);
  * `require vendor/autoload.php`. No-op if already loaded.
  *
  * Variant selection (same logic as Installer.php):
- *   1. Auto-detect CPU features (avx2 on x86_64)
+ *   1. Auto-detect CPU features (AVX-512 / AVX2 / SVE)
  *   2. Fall back to generic arch binary
  *
  * If dl() is available and enable_dl=On, loads directly.
@@ -26,7 +26,7 @@ declare(strict_types=1);
 
     $so = self_crabmagick_resolve($extDir, $phpVer, $arch);
     if ($so === null) {
-        return; // no binary for this platform — silent
+        return;
     }
 
     if (function_exists('dl') && ini_get('enable_dl')) {
@@ -45,7 +45,7 @@ declare(strict_types=1);
 
 function self_crabmagick_resolve(string $extDir, string $phpVer, string $arch): ?string
 {
-    $variant   = self_crabmagick_detect_variant($arch);
+    $variant = self_crabmagick_detect_variant($arch);
     $candidates = array_unique(array_filter([$variant, $arch]));
     foreach ($candidates as $v) {
         $path = $extDir . "/crabmagick-php{$phpVer}-{$v}-linux.so";
@@ -58,12 +58,24 @@ function self_crabmagick_resolve(string $extDir, string $phpVer, string $arch): 
 
 function self_crabmagick_detect_variant(string $arch): ?string
 {
-    if ($arch !== 'x86_64') {
+    if ($arch === 'x86_64') {
+        $cpuinfo = @file_get_contents('/proc/cpuinfo') ?: '';
+        if (preg_match('/\bflags\b.*\bavx512f\b/m', $cpuinfo)) {
+            return 'x86_64-avx512';
+        }
+        if (preg_match('/\bflags\b.*\bavx2\b/m', $cpuinfo)) {
+            return 'x86_64-avx2';
+        }
         return null;
     }
-    $cpuinfo = @file_get_contents('/proc/cpuinfo') ?: '';
-    if (preg_match('/\bflags\b.*\bavx2\b/m', $cpuinfo)) {
-        return 'x86_64-avx2';
+
+    if ($arch === 'aarch64' || $arch === 'arm64') {
+        $cpuinfo = @file_get_contents('/proc/cpuinfo') ?: '';
+        if (preg_match('/\bFeatures\b.*\bsve\b/mi', $cpuinfo)) {
+            return 'aarch64-sve';
+        }
+        return null;
     }
+
     return null;
 }

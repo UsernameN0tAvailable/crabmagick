@@ -1,0 +1,77 @@
+name: Build PHP extension binaries
+
+on:
+  push:
+    paths:
+      - 'rust/crates/**/*.rs'
+      - 'rust/crates/**/*.toml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            variant: x86_64
+            rustflags: ""
+          - runner: ubuntu-24.04
+            variant: x86_64-avx2
+            rustflags: "-C target-cpu=haswell"
+          - runner: ubuntu-24.04
+            variant: x86_64-avx512
+            rustflags: "-C target-cpu=skylake-avx512"
+          - runner: ubuntu-24.04-arm
+            variant: aarch64
+            rustflags: ""
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PHP dev headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y php8.4-dev || sudo apt-get install -y php-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "rust -> target"
+
+      - name: Build PHP extension
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          cd rust
+          PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+          cargo build -p crabmagick-php --release
+          cp target/release/libcrabmagick.so \
+             ../ext/crabmagick-php${PHP_VER}-${{ matrix.variant }}-linux.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crabmagick-${{ matrix.variant }}
+          path: ext/*.so
+
+  commit:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: ext
+          merge-multiple: true
+      - name: Commit binaries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ext/*.so
+          git diff --cached --quiet || git commit -m "ci: update pre-built extension binaries"
+          git push

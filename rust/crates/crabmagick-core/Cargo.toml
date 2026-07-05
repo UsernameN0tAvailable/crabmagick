@@ -1,0 +1,30 @@
+[package]
+name = "crabmagick-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust image processing pipeline for PHP — multi-format decode and JXL/JPEG/WebP/PNG/AVIF encode"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/UsernameN0tAvailable/crabmagick"
+keywords = ["image", "jxl", "jpeg", "webp", "iiif"]
+categories = ["multimedia::images"]
+
+[dependencies]
+fast-webp = { path = "../fast-webp" }
+jxl-encoder = { path = "../jxl-encoder", default-features = false, features = ["std", "parallel", "unsafe-performance"] }
+jxl-oxide = { version = "0.12.6", default-features = false, features = ["rayon"] }
+zenjpeg = { path = "../zenjpeg", features = ["parallel"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "gif", "pnm"] }
+fast_image_resize = { version = "5", features = ["rayon"] }
+resvg = "0.44"
+ravif = { version = "0.11", default-features = false, features = ["threading"], optional = true }
+pdfium-render = { version = "0.8", features = ["static"], optional = true }
+tiff = "0.9"
+zen-jp2 = { path = "../zen-jp2", optional = true }
+rayon = "1.10"
+thiserror = "2"
+
+[features]
+default = []
+avif = ["dep:ravif", "image/avif"]
+pdf = ["dep:pdfium-render"]
+jp2 = ["dep:zen-jp2"]

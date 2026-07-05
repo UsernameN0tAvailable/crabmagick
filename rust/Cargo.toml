@@ -4,11 +4,11 @@ members = [
     "crates/jxl-encoder",
     "crates/zenjpeg",
     "crates/zen-jp2",
-    "crates/oxipix-core",
-    "crates/oxipix-php",
+    "crates/crabmagick-core",
+    "crates/crabmagick-php",
 ]
 resolver = "2"
 
 [patch.crates-io]
 zenjpeg = { path = "crates/zenjpeg" }
-crabmagick-core = { path = "crates/oxipix-core" }
+crabmagick-core = { path = "crates/crabmagick-core" }
