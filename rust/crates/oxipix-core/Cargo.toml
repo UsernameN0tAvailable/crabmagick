@@ -2,6 +2,11 @@
 name = "crabmagick-core"
 version = "0.1.0"
 edition = "2021"
+description = "Pure-Rust image processing pipeline for PHP — JXL crop-during-decode, JPEG/WebP/PNG/JXL encode, two-level in-process cache"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/UsernameN0tAvailable/crabmagick"
+keywords = ["image", "jxl", "jpeg", "webp", "iiif"]
+categories = ["multimedia::images"]
 
 [dependencies]
 fast-webp = { path = "../fast-webp" }

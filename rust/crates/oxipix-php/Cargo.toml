@@ -2,6 +2,11 @@
 name = "crabmagick-php"
 version = "0.1.0"
 edition = "2021"
+description = "PHP native extension for crabmagick — exposes \\Crabmagick\\Image via ext-php-rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/UsernameN0tAvailable/crabmagick"
+keywords = ["php", "image", "extension", "jxl", "webp"]
+categories = ["multimedia::images"]
 
 [lib]
 name = "crabmagick"
