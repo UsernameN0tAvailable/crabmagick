@@ -24,6 +24,9 @@ jobs:
           - runner: ubuntu-24.04-arm
             variant: aarch64
             rustflags: ""
+          - runner: ubuntu-24.04-arm
+            variant: aarch64-sve
+            rustflags: "-C target-feature=+sve"
 
     runs-on: ${{ matrix.runner }}
 
