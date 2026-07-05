@@ -1,12 +1,12 @@
 [package]
-name = "oxipix-php"
+name = "crabmagick-php"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "oxipix"
+name = "crabmagick"
 crate-type = ["cdylib"]
 
 [dependencies]
 ext-php-rs = { version = "0.15.15", features = ["closure"] }
-oxipix-core = { path = "../oxipix-core" }
+crabmagick-core = { path = "../oxipix-core" }

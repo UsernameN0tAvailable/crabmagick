@@ -809,6 +809,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabmagick-core"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "fast-webp",
+ "fast_image_resize",
+ "image",
+ "jxl-encoder",
+ "jxl-oxide",
+ "once_cell",
+ "parking_lot",
+ "rayon",
+ "thiserror",
+ "tokio",
+ "zen-jp2",
+ "zenjpeg",
+]
+
+[[package]]
+name = "crabmagick-php"
+version = "0.1.0"
+dependencies = [
+ "crabmagick-core",
+ "ext-php-rs",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2442,33 +2469,6 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
-name = "oxipix-core"
-version = "0.1.0"
-dependencies = [
- "dashmap",
- "fast-webp",
- "fast_image_resize",
- "image",
- "jxl-encoder",
- "jxl-oxide",
- "once_cell",
- "parking_lot",
- "rayon",
- "thiserror",
- "tokio",
- "zen-jp2",
- "zenjpeg",
-]
-
-[[package]]
-name = "oxipix-php"
-version = "0.1.0"
-dependencies = [
- "ext-php-rs",
- "oxipix-core",
-]
 
 [[package]]
 name = "page_size"

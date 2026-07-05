@@ -11,3 +11,4 @@ resolver = "2"
 
 [patch.crates-io]
 zenjpeg = { path = "crates/zenjpeg" }
+crabmagick-core = { path = "crates/oxipix-core" }

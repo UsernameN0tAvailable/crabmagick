@@ -4,11 +4,11 @@ use ext_php_rs::binary::Binary;
 use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::ZendClassObject;
-use oxipix_core::processor::{OutputFormat, ProcessRequest, get_info, init, process_image};
+use crabmagick_core::processor::{OutputFormat, ProcessRequest, get_info, init, process_image};
 
 #[php_class]
-#[php(name = "Oxipix\\Image")]
-pub struct OxipixImage {
+#[php(name = "Crabmagick\\Image")]
+pub struct CrabmagickImage {
     path: String,
     region_x: u32,
     region_y: u32,
@@ -22,7 +22,7 @@ pub struct OxipixImage {
 
 #[php_impl]
 #[php(change_method_case = "none")]
-impl OxipixImage {
+impl CrabmagickImage {
     pub fn __construct(path: String) -> PhpResult<Self> {
         Ok(Self {
             path,
@@ -38,12 +38,12 @@ impl OxipixImage {
     }
 
     pub fn region<'a>(
-        self_: &'a mut ZendClassObject<OxipixImage>,
+        self_: &'a mut ZendClassObject<CrabmagickImage>,
         x: u32,
         y: u32,
         w: u32,
         h: u32,
-    ) -> &'a mut ZendClassObject<OxipixImage> {
+    ) -> &'a mut ZendClassObject<CrabmagickImage> {
         self_.region_x = x;
         self_.region_y = y;
         self_.region_w = w;
@@ -52,26 +52,26 @@ impl OxipixImage {
     }
 
     pub fn resize<'a>(
-        self_: &'a mut ZendClassObject<OxipixImage>,
+        self_: &'a mut ZendClassObject<CrabmagickImage>,
         w: u32,
         h: u32,
-    ) -> &'a mut ZendClassObject<OxipixImage> {
+    ) -> &'a mut ZendClassObject<CrabmagickImage> {
         self_.out_w = w;
         self_.out_h = h;
         self_
     }
 
     pub fn rotate<'a>(
-        self_: &'a mut ZendClassObject<OxipixImage>,
+        self_: &'a mut ZendClassObject<CrabmagickImage>,
         degrees: u16,
-    ) -> &'a mut ZendClassObject<OxipixImage> {
+    ) -> &'a mut ZendClassObject<CrabmagickImage> {
         self_.rotation = degrees;
         self_
     }
 
     pub fn square<'a>(
-        self_: &'a mut ZendClassObject<OxipixImage>,
-    ) -> &'a mut ZendClassObject<OxipixImage> {
+        self_: &'a mut ZendClassObject<CrabmagickImage>,
+    ) -> &'a mut ZendClassObject<CrabmagickImage> {
         self_.square_region = true;
         self_
     }
@@ -110,8 +110,8 @@ impl OxipixImage {
 }
 
 #[php_function]
-#[php(name = "Oxipix\\process")]
-pub fn oxipix_process(
+#[php(name = "Crabmagick\\process")]
+pub fn crabmagick_process(
     path: String,
     rx: u32,
     ry: u32,
@@ -141,8 +141,8 @@ pub fn oxipix_process(
 }
 
 #[php_function]
-#[php(name = "Oxipix\\info")]
-pub fn oxipix_info(path: String) -> PhpResult<HashMap<String, u32>> {
+#[php(name = "Crabmagick\\info")]
+pub fn crabmagick_info(path: String) -> PhpResult<HashMap<String, u32>> {
     get_info(&path)
         .map(|i| HashMap::from([("width".to_string(), i.width), ("height".to_string(), i.height)]))
         .map_err(|e| PhpException::default(e.to_string()))
@@ -152,9 +152,9 @@ pub fn oxipix_info(path: String) -> PhpResult<HashMap<String, u32>> {
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     init(512, 512);
     module
-        .class::<OxipixImage>()
-        .function(wrap_function!(oxipix_process))
-        .function(wrap_function!(oxipix_info))
+        .class::<CrabmagickImage>()
+        .function(wrap_function!(crabmagick_process))
+        .function(wrap_function!(crabmagick_info))
 }
 
 fn parse_format(s: &str) -> PhpResult<OutputFormat> {
