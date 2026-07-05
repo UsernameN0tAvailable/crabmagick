@@ -101,6 +101,12 @@ impl OxipixImage {
             .map(|i| HashMap::from([("width".to_string(), i.width), ("height".to_string(), i.height)]))
             .map_err(|e| PhpException::default(e.to_string()))
     }
+
+    /// Static method: returns true if the extension is loaded (it always is if this runs).
+    #[php(name = "isAvailable")]
+    pub fn is_available() -> bool {
+        true
+    }
 }
 
 #[php_function]
