@@ -1,0 +1,16 @@
+[package]
+name = "jxl-encoder-simd"
+version = "0.3.0"
+edition = "2021"
+description = "SIMD-accelerated primitives for jxl-encoder"
+license = "AGPL-3.0-only OR LicenseRef-Imazen-Commercial"
+repository = "https://github.com/imazen/jxl-encoder"
+
+[features]
+default = ["std"]
+std = ["archmage/std", "magetypes/std"]
+unsafe-performance = []
+
+[dependencies]
+archmage = { version = "0.9.15", default-features = false, features = ["macros"] }
+magetypes = { version = "0.9.15", default-features = false }

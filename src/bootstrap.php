@@ -17,6 +17,16 @@ declare(strict_types=1);
         return;
     }
 
+    // ── Extension fast-path ───────────────────────────────────────────────────
+    // If the crabmagick PHP extension is loaded it exposes crabmagick_process()
+    // and \Crabmagick\Image natively (in-process, zero socket overhead).
+    // Skip daemon spawn entirely — the autoloader will resolve \Crabmagick\Image
+    // to the native class and never load our PHP shim.
+    if (function_exists('crabmagick_process')) {
+        \Crabmagick\Runtime::setUsingExtension();
+        return;
+    }
+
     // ── Pre-flight checks ─────────────────────────────────────────────────────
 
     // Unix sockets + pre-built Linux binaries: Linux only.

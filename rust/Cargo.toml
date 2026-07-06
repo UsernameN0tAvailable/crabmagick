@@ -2,6 +2,7 @@
 members = [
     "crates/fast-webp",
     "crates/jxl-encoder",
+    "crates/jxl-encoder-simd",
     "crates/zenjpeg",
     "crates/zen-jp2",
     "crates/crabmagick-core",
@@ -12,6 +13,7 @@ resolver = "2"
 [patch.crates-io]
 zenjpeg = { path = "crates/zenjpeg" }
 crabmagick-core = { path = "crates/crabmagick-core" }
+jxl-encoder-simd = { path = "crates/jxl-encoder-simd" }
 
 [profile.release]
 panic = "abort"

@@ -1599,8 +1599,6 @@ dependencies = [
 [[package]]
 name = "jxl-encoder-simd"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f88c8baa7c73e9a4f7fdd58b9d996f2fef793416b4ea099f16adbe9b454e39f6"
 dependencies = [
  "archmage 0.9.27",
  "magetypes",

@@ -1,0 +1,27 @@
+[package]
+name = "jxl-encoder-simd"
+description = "SIMD-accelerated primitives for jxl-encoder"
+readme = "README.md"
+documentation = "https://docs.rs/jxl-encoder-simd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["jpeg-xl", "simd", "dct"]
+categories = ["multimedia::images", "algorithms"]
+include = ["/src/**", "/README.md", "/LICENSE*"]
+
+[features]
+default = ["std"]
+std = ["archmage/std", "magetypes/std"]
+unsafe-performance = []
+
+[dependencies]
+archmage = { version = "0.9.15", default-features = false, features = ["macros"] }
+magetypes = { version = "0.9.15", default-features = false }
+
+[lints]
+workspace = true
