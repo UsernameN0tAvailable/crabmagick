@@ -1,131 +1,207 @@
 # crabmagick
 
-Pure-Rust image processing for PHP with a bundled C-ABI shared library loaded at runtime through PHP FFI. No PHP headers at build time, no `extension=` line in `php.ini`, and the same Linux `.so` works across PHP 8.1–8.x.
+Pure-Rust image processing for PHP. A daemon binary is bundled inside the
+Composer package and spawned automatically on first use.
 
-## What's inside
-
-| Path | Role |
-|---|---|
-| `rust/crates/crabmagick-core` | Decode / crop / resize / encode pipeline |
-| `rust/crates/crabmagick-ffi` | Plain C-ABI `cdylib` loaded by PHP FFI |
-| `rust/crates/crabmagick-php` | Legacy Zend extension crate, kept for optional extension-based builds |
-| `ffi/oxipix.h` | Stable C header for the native ABI |
-| `src/Runtime.php` | Loads the bundled shared library via `FFI::cdef()` |
-| `src/Image.php` | Fluent PHP API |
-| `src/bootstrap.php` | Composer autoload bootstrap that resolves and loads the native library |
-| `src/Installer.php` | Composer post-install hook that generates `crabmagick.ini` |
-
-## Why FFI
-
-- No PHP-version coupling in the native binary
-- No PHP headers or `php-dev` package needed in CI
-- No `extension=` activation step
-- Minimal runtime dependencies: the release build is configured for `panic = "abort"` and uses static `libgcc` / `libm` link args to avoid `libgcc_s.so.1` and `libm.so.6`
-
-## Installation
+**Zero configuration. No php.ini changes. No sudo. Just:**
 
 ```bash
 composer require usernamn0tavailable/crabmagick
 ```
 
-Requirements:
+> **Looking for the PHP extension variant?** See
+> [crabmagick-ext](https://github.com/UsernameN0tAvailable/crabmagick-ext) —
+> same API, loaded as a native PHP extension via `PHP_INI_SCAN_DIR`.
 
-- PHP 8.1+
-- `ext-ffi`
-- Linux x86_64 or aarch64
+---
 
-## Activation
+## How it works
 
-`composer install` or `composer update` writes `crabmagick.ini` with:
-
-```ini
-ffi.enable = true
+```
+require vendor/autoload.php
+        │
+        ▼  bootstrap.php (autoload.files)
+        │  • finds the right daemon binary for your CPU arch
+        │  • checks /tmp/crabmagick-<uid>.sock
+        │  • spawns daemon in background if not running
+        │  • registers socket path with Runtime
+        ▼
+\Crabmagick\Image  →  Unix socket  →  crabmagick-daemon
+                                       (pure Rust, statically linked)
+                                       decode / crop / resize / encode
 ```
 
-Then activate with one of these options:
+One daemon process is shared across all PHP-FPM workers for the same user.
+The socket is at `/tmp/crabmagick-<uid>.sock` and is created automatically.
 
-```bash
-# Option 1 — PHP_INI_SCAN_DIR (no sudo)
-PHP_INI_SCAN_DIR=:/path/to/vendor/usernamn0tavailable/crabmagick php ...
+---
 
-# Option 2 — symlink the generated ini
-sudo ln -s /path/to/vendor/usernamn0tavailable/crabmagick/crabmagick.ini \
-           /etc/php/cli/conf.d/30-crabmagick.ini
-```
+## Requirements
 
-No `extension=` line is required. `src/bootstrap.php` finds the bundled `ext/crabmagick-*-linux.so` for the current CPU and loads it through FFI.
+- PHP ≥ 8.1, Linux x86_64 or aarch64
+- No libvips, no libjxl, no C compiler, no Rust toolchain
 
-## Binary selection
-
-At runtime and during install, crabmagick picks the best bundled binary for the host:
-
-| CPU | Selected binary |
-|---|---|
-| x86_64 with AVX-512 | `crabmagick-x86_64-avx512-linux.so` |
-| x86_64 with AVX2 | `crabmagick-x86_64-avx2-linux.so` |
-| generic x86_64 | `crabmagick-x86_64-linux.so` |
-| aarch64 with SVE | `crabmagick-aarch64-sve-linux.so` |
-| generic aarch64 | `crabmagick-aarch64-linux.so` |
+---
 
 ## PHP API
 
 ```php
+// Fluent builder
 $bytes = (new \Crabmagick\Image('/path/to/file.jxl'))
-    ->region(100, 200, 512, 512)
-    ->resize(256, 256)
-    ->page(0)
-    ->rotate(90)
-    ->square()
-    ->encode('webp', 82);
+    ->region(0, 0, 512, 512)   // crop region (x, y, w, h)
+    ->resize(256, 256)          // output dimensions (0 = proportional)
+    ->rotate(90)                // clockwise: 90 | 180 | 270
+    ->encode('jpeg', 85);       // 'jpeg' | 'webp' | 'png' | 'jxl' | 'avif'
 
+// Square crop (IIIF "square" region — largest centred square)
+$bytes = (new \Crabmagick\Image('/path/to/file.jxl'))
+    ->square()
+    ->resize(512)
+    ->encode('webp', 80);
+
+// Select page/frame (multi-page TIFF, animated WebP, PDF)
+$bytes = (new \Crabmagick\Image('/path/to/document.tiff'))
+    ->page(2)
+    ->resize(1024)
+    ->encode('jpeg', 90);
+
+// One-shot helper
 $bytes = \Crabmagick\process($path, $rx, $ry, $rw, $rh, $outW, $outH, 'jpeg', 85);
 
-$info = \Crabmagick\info($path); // ['width' => 3360, 'height' => 4892]
+// Dimensions only (reads file header, no full decode for JXL)
+$info = \Crabmagick\info($path);          // ['width' => 3360, 'height' => 4892]
+$info = (new \Crabmagick\Image($path))->getInfo();
 
-\Crabmagick\Image::isAvailable(); // bool
+// Check daemon is up
+\Crabmagick\Image::isAvailable();         // bool
 ```
 
-Supported output formats: `jpeg`, `webp`, `png`, `jxl`, `avif`.
+---
+
+## Supported formats
+
+| Format | Decode | Encode |
+|--------|--------|--------|
+| JPEG   | ✅ | ✅ |
+| PNG    | ✅ | ✅ |
+| WebP   | ✅ | ✅ |
+| JXL    | ✅ | ✅ |
+| AVIF   | ✅ | ✅ |
+| TIFF   | ✅ | — |
+| GIF    | ✅ | — |
+| BMP    | ✅ | — |
+| SVG    | ✅ | — |
+| JP2/J2K | ✅ | — |
+| PDF    | ✅ (optional build) | — |
+
+All decoders and encoders are pure Rust — zero C dependencies.
+
+---
 
 ## Performance
 
-Benchmarked on a 3360×4892 JXL source with 512×512 output tiles:
+Benchmarked on a 3360×4892 JXL source image, 512×512 output tile:
 
-| Request type | Time |
-|---|---|
+| Operation | Time |
+|-----------|------|
 | Cold tile (crop-during-decode) | ~29 ms |
-| Full image 800px | ~570 ms |
+| Full image decode, 800px output | ~570 ms |
 
-libvips takes ~540 ms for the same cold tile. The speedup comes from JXL group-level crop-during-decode.
+The daemon adds ~0.3 ms of Unix socket overhead per request.
+JXL crop-during-decode (`jxl-oxide` group-level region decode) avoids
+decoding the full image for tile requests — the main source of the speedup
+vs. libvips (~540 ms for the same cold tile).
 
-## Build
+---
+
+## Bundled binaries
+
+| Binary | Target | Use |
+|--------|--------|-----|
+| `crabmagick-x86_64-linux` | x86_64 baseline (SSE2) | Max compatibility |
+| `crabmagick-x86_64-avx2-linux` | x86_64 with AVX2 (Haswell 2013+, Ryzen 2017+) | Recommended for most servers |
+| `crabmagick-x86_64-avx512-linux` | x86_64 with AVX-512 (Skylake-X+, Zen 4+) | Highest throughput |
+| `crabmagick-aarch64-linux` | aarch64 generic (AWS Graviton, RPi 4+) | |
+| `crabmagick-aarch64-sve-linux` | aarch64 with SVE (Graviton 3+, Neoverse N2) | |
+
+The right binary is selected automatically at runtime by reading `/proc/cpuinfo`.
+Override via `CRABMAGICK_BINARY` env var if needed.
+
+All binaries are statically linked (musl libc) — no dynamic dependencies beyond
+the Linux kernel ABI (`linux-vdso`, `ld-musl`).
+
+---
+
+## Daemon lifecycle
+
+The daemon runs as a background process owned by the user that first spawned it.
+Multiple PHP-FPM workers (same user) all connect to the same daemon.
+
+- **Socket path:** `/tmp/crabmagick-<uid>.sock`
+- **Auto-spawn:** happens in `bootstrap.php` on every `require vendor/autoload.php`
+  if the socket is not yet present
+- **Restart:** if the daemon crashes, the next PHP request that finds the socket
+  missing will re-spawn it automatically
+- **Shutdown:** the daemon exits when the socket is deleted or on SIGTERM
+
+To stop the daemon manually:
+```bash
+kill $(cat /tmp/crabmagick-<uid>.pid 2>/dev/null) 2>/dev/null || true
+rm -f /tmp/crabmagick-<uid>.sock
+```
+
+---
+
+## Build from source
+
+Requires Rust stable and musl toolchain for static binaries:
 
 ```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install musl-tools    # Ubuntu/Debian
+
 cd rust
-RUSTFLAGS='-C link-arg=-static-libgcc -C link-arg=-static-libm' \
-cargo build -p crabmagick-ffi --release
-cp target/release/libcrabmagick.so ../ext/crabmagick-x86_64-linux.so
-ldd ../ext/crabmagick-x86_64-linux.so
+
+# x86_64 variants
+RUSTFLAGS="-C target-cpu=x86-64          -C link-arg=-static-libgcc" \
+  cargo build -p crabmagick-daemon --release --target x86_64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/release/crabmagick-daemon ../bin/crabmagick-x86_64-linux
+
+RUSTFLAGS="-C target-cpu=haswell         -C link-arg=-static-libgcc" \
+  cargo build -p crabmagick-daemon --release --target x86_64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/release/crabmagick-daemon ../bin/crabmagick-x86_64-avx2-linux
+
+RUSTFLAGS="-C target-cpu=skylake-avx512  -C link-arg=-static-libgcc" \
+  cargo build -p crabmagick-daemon --release --target x86_64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/release/crabmagick-daemon ../bin/crabmagick-x86_64-avx512-linux
+
+# aarch64 (cross-compile)
+rustup target add aarch64-unknown-linux-musl
+sudo apt-get install gcc-aarch64-linux-gnu
+
+RUSTFLAGS="-C target-cpu=generic         -C link-arg=-static-libgcc" \
+  cargo build -p crabmagick-daemon --release --target aarch64-unknown-linux-musl
+cp target/aarch64-unknown-linux-musl/release/crabmagick-daemon ../bin/crabmagick-aarch64-linux
+
+RUSTFLAGS="-C target-cpu=generic -C target-feature=+sve -C link-arg=-static-libgcc" \
+  cargo build -p crabmagick-daemon --release --target aarch64-unknown-linux-musl
+cp target/aarch64-unknown-linux-musl/release/crabmagick-daemon ../bin/crabmagick-aarch64-sve-linux
 ```
 
-Target-specific builds used by CI:
+---
 
-```bash
-# AVX2
-RUSTFLAGS='-C target-cpu=haswell -C link-arg=-static-libgcc -C link-arg=-static-libm' \
-cargo build -p crabmagick-ffi --release
+## Bundled Rust crates
 
-# AVX-512
-RUSTFLAGS='-C target-cpu=skylake-avx512 -C link-arg=-static-libgcc -C link-arg=-static-libm' \
-cargo build -p crabmagick-ffi --release
-```
+All pure Rust, zero C dependencies:
 
-## Supported platforms
-
-- `x86_64`
-- `x86_64-avx2`
-- `x86_64-avx512`
-- `aarch64`
-- `aarch64-sve`
-
-The native ABI is defined in `ffi/oxipix.h`. Other language runtimes can reuse the same shared library without any PHP-specific build step.
+| Crate | Role |
+|-------|------|
+| `crabmagick-core` | Decode / crop / resize / encode pipeline |
+| `crabmagick-daemon` | Unix socket server binary |
+| `zenjpeg` | JPEG encode + decode |
+| `fast-webp` | WebP encode + decode |
+| `jxl-encoder` | JXL encode |
+| `jxl-oxide` | JXL decode (crop-during-decode) |
+| `zen-jp2` | JP2/J2K decode |
+| `fast_image_resize` | SIMD resize |
+| `resvg` | SVG rasterise |

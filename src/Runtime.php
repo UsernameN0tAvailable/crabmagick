@@ -5,162 +5,124 @@ declare(strict_types=1);
 namespace Crabmagick;
 
 /**
- * Holds the FFI instance and exposes static helpers used by Image and the
- * top-level \Crabmagick\process() / \Crabmagick\info() functions.
+ * Low-level socket client for the crabmagick Unix socket daemon.
  *
- * Populated by bootstrap.php at autoload time.
+ * Wire protocol (little-endian):
+ *   Request  PHP → daemon : [u32 json_len][json_bytes]
+ *   Response daemon → PHP : [u8 status][u32 payload_len][payload_bytes]
+ *   status 0 = success; 1 = error (payload = UTF-8 error string)
+ *
+ * For "process" success the payload is raw encoded image bytes.
+ * For "info"    success the payload is JSON: {"width":N,"height":N}
  */
 final class Runtime
 {
-    private static ?\FFI $ffi = null;
+    private static ?string $socketPath = null;
 
-    /** C declarations passed to FFI::cdef(). Must match ffi/oxipix.h exactly. */
-    private const DECLS = <<<'C'
-        typedef struct {
-            uint32_t region_x;
-            uint32_t region_y;
-            uint32_t region_w;
-            uint32_t region_h;
-            uint32_t out_w;
-            uint32_t out_h;
-            uint8_t  quality;
-            int      format;
-            uint32_t page;
-            uint16_t rotation;
-            uint8_t  square_region;
-        } oxipix_request;
-
-        typedef struct {
-            uint32_t width;
-            uint32_t height;
-        } oxipix_image_info;
-
-        int   oxipix_get_info(const char *path, oxipix_image_info *info, char **error_message);
-        int   oxipix_process(const char *path, const oxipix_request *request, uint8_t **out_data, size_t *out_len, char **error_message);
-        void  oxipix_free(void *ptr);
-    C;
-
-    private const FORMAT_MAP = [
-        'jpg' => 0,
-        'jpeg' => 0,
-        'webp' => 1,
-        'png' => 2,
-        'jxl' => 3,
-        'avif' => 4,
-    ];
-
-    public static function load(string $soPath): void
+    public static function setSocketPath(string $path): void
     {
-        if (self::$ffi !== null) {
-            return;
-        }
-
-        $ffi = \FFI::cdef(self::DECLS, $soPath);
-        self::$ffi = $ffi;
+        self::$socketPath = $path;
     }
 
-    public static function isLoaded(): bool
+    public static function isReady(): bool
     {
-        return self::$ffi !== null;
+        return self::$socketPath !== null && file_exists(self::$socketPath);
     }
 
-    /** @return array{width:int, height:int} */
-    public static function info(string $path): array
-    {
-        $ffi = self::require();
-        $info = $ffi->new('oxipix_image_info');
-        $err = $ffi->new('char*');
-
-        $rc = $ffi->oxipix_get_info($path, \FFI::addr($info), \FFI::addr($err));
-        if ($rc !== 0) {
-            throw new \RuntimeException('[crabmagick] ' . self::takeError($ffi, $err));
-        }
-
-        return ['width' => (int) $info->width, 'height' => (int) $info->height];
-    }
-
+    /**
+     * Decode → crop/resize/rotate → encode.
+     *
+     * @return string Raw encoded image bytes
+     * @throws \RuntimeException on daemon error or connection failure
+     */
     public static function process(
         string $path,
-        int $regionX,
-        int $regionY,
-        int $regionW,
-        int $regionH,
-        int $outW,
-        int $outH,
-        string $format,
-        int $quality,
-        int $page = 0,
-        int $rotation = 0,
-        bool $squareRegion = false,
+        int $regionX = 0, int $regionY = 0, int $regionW = 0, int $regionH = 0,
+        int $outW = 0, int $outH = 0,
+        string $format = 'jpeg', int $quality = 85,
+        int $page = 0, int $rotation = 0, bool $square = false,
     ): string {
-        $ffi = self::require();
-
-        $req = $ffi->new('oxipix_request');
-        $req->region_x = $regionX;
-        $req->region_y = $regionY;
-        $req->region_w = $regionW;
-        $req->region_h = $regionH;
-        $req->out_w = $outW;
-        $req->out_h = $outH;
-        $req->quality = $quality;
-        $req->format = self::formatCode($format);
-        $req->page = $page;
-        $req->rotation = $rotation;
-        $req->square_region = $squareRegion ? 1 : 0;
-
-        $outPtr = $ffi->new('uint8_t*');
-        $outLen = $ffi->new('size_t');
-        $err = $ffi->new('char*');
-
-        $rc = $ffi->oxipix_process(
-            $path,
-            \FFI::addr($req),
-            \FFI::addr($outPtr),
-            \FFI::addr($outLen),
-            \FFI::addr($err),
-        );
-
-        if ($rc !== 0) {
-            throw new \RuntimeException('[crabmagick] ' . self::takeError($ffi, $err));
-        }
-
-        $bytes = \FFI::string(\FFI::cast('char*', $outPtr), (int) $outLen->cdata);
-        $ffi->oxipix_free(\FFI::cast('void*', $outPtr));
-
-        return $bytes;
+        $payload = self::send([
+            'cmd'      => 'process',
+            'path'     => $path,
+            'region_x' => $regionX,
+            'region_y' => $regionY,
+            'region_w' => $regionW,
+            'region_h' => $regionH,
+            'out_w'    => $outW,
+            'out_h'    => $outH,
+            'format'   => $format,
+            'quality'  => $quality,
+            'page'     => $page,
+            'rotation' => $rotation,
+            'square'   => $square,
+        ]);
+        return $payload;
     }
 
-    private static function require(): \FFI
+    /**
+     * Read image dimensions from the file header (fast — no full decode for JXL).
+     *
+     * @return array{width:int, height:int}
+     * @throws \RuntimeException on daemon error or connection failure
+     */
+    public static function info(string $path, int $page = 0): array
     {
-        if (self::$ffi === null) {
-            throw new \RuntimeException(
-                '[crabmagick] Native library not loaded. '
-                . 'Ensure ffi.enable=true and that PHP_INI_SCAN_DIR includes the crabmagick package directory.'
-            );
+        $payload = self::send(['cmd' => 'info', 'path' => $path, 'page' => $page]);
+        $data    = json_decode($payload, true);
+        if (!is_array($data) || !isset($data['width'], $data['height'])) {
+            throw new \RuntimeException('[crabmagick] Malformed info response: ' . $payload);
         }
-
-        return self::$ffi;
+        return ['width' => (int)$data['width'], 'height' => (int)$data['height']];
     }
 
-    private static function formatCode(string $format): int
+    // ── Private ───────────────────────────────────────────────────────────────
+
+    private static function send(array $request): string
     {
-        $key = strtolower($format);
-        if (!isset(self::FORMAT_MAP[$key])) {
-            throw new \InvalidArgumentException("[crabmagick] Unknown format: {$format}");
+        if (self::$socketPath === null) {
+            throw new \RuntimeException('[crabmagick] Daemon socket not initialised. Did you require vendor/autoload.php?');
         }
 
-        return self::FORMAT_MAP[$key];
+        $json = json_encode($request, JSON_THROW_ON_ERROR);
+        $frame = pack('V', strlen($json)) . $json;   // u32 LE length-prefix
+
+        $sock = @stream_socket_client('unix://' . self::$socketPath, $errno, $errstr, 2.0);
+        if ($sock === false) {
+            throw new \RuntimeException("[crabmagick] Cannot connect to daemon socket: {$errstr} ({$errno})");
+        }
+        stream_set_timeout($sock, 30);
+
+        fwrite($sock, $frame);
+
+        // Read response header: u8 status + u32 payload_len = 5 bytes
+        $header = self::readExact($sock, 5);
+        $parts  = unpack('Cstatus/Vlen', $header);
+
+        $payloadLen = (int)$parts['len'];
+        $payload    = $payloadLen > 0 ? self::readExact($sock, $payloadLen) : '';
+        fclose($sock);
+
+        if ((int)$parts['status'] !== 0) {
+            throw new \RuntimeException('[crabmagick] Daemon error: ' . $payload);
+        }
+
+        return $payload;
     }
 
-    private static function takeError(\FFI $ffi, \FFI\CData $err): string
+    /** Read exactly $n bytes from $sock, or throw on EOF/timeout. */
+    private static function readExact($sock, int $n): string
     {
-        if (\FFI::isNull($err)) {
-            return 'unknown error';
+        $buf = '';
+        $remaining = $n;
+        while ($remaining > 0) {
+            $chunk = fread($sock, $remaining);
+            if ($chunk === false || $chunk === '') {
+                throw new \RuntimeException('[crabmagick] Daemon connection closed unexpectedly');
+            }
+            $buf       .= $chunk;
+            $remaining -= strlen($chunk);
         }
-
-        $msg = \FFI::string($err);
-        $ffi->oxipix_free(\FFI::cast('void*', $err));
-
-        return $msg;
+        return $buf;
     }
 }

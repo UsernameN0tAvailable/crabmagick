@@ -49,6 +49,8 @@ pub enum OxipixError {
 pub struct OxipixProcessor;
 
 impl OxipixProcessor {
+    pub fn init(_tile_cache_mb: u64, _output_cache_mb: u64) {}
+
     pub fn process_image(source_path: &str, req: ProcessRequest) -> Result<Vec<u8>, OxipixError> {
         process_image(source_path, req)
     }
@@ -57,6 +59,8 @@ impl OxipixProcessor {
         get_info(source_path)
     }
 }
+
+pub fn init(_tile_cache_mb: u64, _output_cache_mb: u64) {}
 
 pub fn process_image(source_path: &str, req: ProcessRequest) -> Result<Vec<u8>, OxipixError> {
     let is_full_image = req.region_w == 0 && req.region_h == 0 && !req.square_region;

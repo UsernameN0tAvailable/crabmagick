@@ -1,12 +1,11 @@
 {
     "name": "usernamn0tavailable/crabmagick",
-    "description": "Pure-Rust image processing for PHP — bundled native library loaded via PHP FFI. Zero C dependencies, no php.ini extension= line needed.",
+    "description": "Pure-Rust image processing for PHP — zero config. A daemon is spawned automatically on first use. No php.ini changes, no sudo, just composer require.",
     "type": "library",
     "license": "MIT",
-    "keywords": ["image", "rust", "vips", "webp", "jxl", "jpeg", "iiif", "ffi"],
+    "keywords": ["image", "rust", "vips", "webp", "jxl", "jpeg", "iiif", "daemon"],
     "require": {
-        "php": ">=8.1",
-        "ext-ffi": "*"
+        "php": ">=8.1"
     },
     "autoload": {
         "psr-4": {
@@ -18,7 +17,7 @@
         ]
     },
     "scripts": {
-        "post-install-cmd": ["Crabmagick\\CrabmagickInstaller::postInstall"],
-        "post-update-cmd": ["Crabmagick\\CrabmagickInstaller::postInstall"]
+        "post-install-cmd": ["Crabmagick\\Installer::postInstall"],
+        "post-update-cmd":  ["Crabmagick\\Installer::postInstall"]
     }
 }

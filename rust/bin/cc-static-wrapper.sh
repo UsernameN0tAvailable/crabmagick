@@ -7,9 +7,6 @@ for arg in "$@"; do
         -lgcc_s)
             args+=("-Wl,--push-state,-Bstatic" "-lgcc_eh" "-lgcc" "-Wl,--pop-state")
             ;;
-        -lm)
-            args+=("-Wl,--push-state,-Bstatic" "-lm" "-Wl,--pop-state")
-            ;;
         -static-libm)
             ;;
         *)

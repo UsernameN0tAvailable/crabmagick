@@ -5,8 +5,7 @@ members = [
     "crates/zenjpeg",
     "crates/zen-jp2",
     "crates/crabmagick-core",
-    "crates/crabmagick-php",
-    "crates/crabmagick-ffi",
+    "crates/crabmagick-daemon",
 ]
 resolver = "2"
 

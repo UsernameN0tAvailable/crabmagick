@@ -6,41 +6,41 @@ namespace Crabmagick;
 
 use Composer\Script\Event;
 
-class CrabmagickInstaller
+class Installer
 {
     public static function postInstall(Event $event): void
     {
-        $io = $event->getIO();
+        $io         = $event->getIO();
         $packageDir = realpath(__DIR__ . '/..') ?: (__DIR__ . '/..');
+        $arch       = php_uname('m');
+        $bin        = self::findBinary($packageDir, $arch);
 
-        $soPath = self::resolveSo($packageDir);
-        if ($soPath === null) {
-            $io->writeError('<warning>[crabmagick] No pre-built binary found for this platform. '
-                . 'See https://github.com/UsernameN0tAvailable/crabmagick for supported platforms.</warning>');
+        if ($bin === null) {
+            $io->writeError(
+                '<warning>[crabmagick] No pre-built daemon binary found for arch ' . $arch . '. '
+                . 'See https://github.com/UsernameN0tAvailable/crabmagick for supported platforms.</warning>'
+            );
             return;
         }
 
-        file_put_contents("{$packageDir}/crabmagick.ini", "ffi.enable = true\n");
+        // Ensure the binary is executable (git may have dropped the bit).
+        if (!is_executable($bin)) {
+            chmod($bin, 0755);
+        }
 
-        $io->write("<info>[crabmagick] Selected binary: {$soPath}</info>");
-        $io->write('<info>[crabmagick] Activation — pick one option:</info>');
-        $io->write("<info>  1. PHP_INI_SCAN_DIR (no sudo): PHP_INI_SCAN_DIR=:{$packageDir} php ...</info>");
-        $io->write("<info>  2. Symlink into conf.d:       sudo ln -s {$packageDir}/crabmagick.ini /etc/php/cli/conf.d/30-crabmagick.ini</info>");
-        $io->write('<info>     (crabmagick.ini only sets ffi.enable=true — the binary is bundled and found automatically)</info>');
+        $io->write("<info>[crabmagick] Daemon binary ready: {$bin}</info>");
+        $io->write('<info>[crabmagick] No php.ini changes needed — the daemon starts automatically.</info>');
     }
 
-    private static function resolveSo(string $packageDir): ?string
+    private static function findBinary(string $packageDir, string $arch): ?string
     {
-        $arch = php_uname('m');
         $variant = self::detectVariant($arch);
-
-        foreach (array_unique(array_filter([$variant, $arch])) as $v) {
-            $path = realpath("{$packageDir}/ext/crabmagick-{$v}-linux.so");
-            if ($path !== false) {
+        foreach (array_unique(array_filter([$variant, "{$arch}-linux"])) as $suffix) {
+            $path = "{$packageDir}/bin/crabmagick-{$suffix}";
+            if (file_exists($path)) {
                 return $path;
             }
         }
-
         return null;
     }
 
@@ -49,22 +49,20 @@ class CrabmagickInstaller
         if ($arch === 'x86_64') {
             $cpuinfo = @file_get_contents('/proc/cpuinfo') ?: '';
             if (preg_match('/\bflags\b.*\bavx512f\b/m', $cpuinfo)) {
-                return 'x86_64-avx512';
+                return 'x86_64-avx512-linux';
             }
             if (preg_match('/\bflags\b.*\bavx2\b/m', $cpuinfo)) {
-                return 'x86_64-avx2';
+                return 'x86_64-avx2-linux';
             }
-            return null;
+            return 'x86_64-linux';
         }
-
         if ($arch === 'aarch64' || $arch === 'arm64') {
             $cpuinfo = @file_get_contents('/proc/cpuinfo') ?: '';
             if (preg_match('/\bFeatures\b.*\bsve\b/mi', $cpuinfo)) {
-                return 'aarch64-sve';
+                return 'aarch64-sve-linux';
             }
-            return null;
+            return 'aarch64-linux';
         }
-
         return null;
     }
 }
