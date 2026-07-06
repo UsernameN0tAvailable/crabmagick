@@ -23,17 +23,17 @@ enum Request {
     Process {
         path: String,
         #[serde(default)]
-        rx: u32,
+        region_x: u32,
         #[serde(default)]
-        ry: u32,
+        region_y: u32,
         #[serde(default)]
-        rw: u32,
+        region_w: u32,
         #[serde(default)]
-        rh: u32,
+        region_h: u32,
         #[serde(default)]
-        ow: u32,
+        out_w: u32,
         #[serde(default)]
-        oh: u32,
+        out_h: u32,
         #[serde(default = "default_format")]
         format: String,
         #[serde(default = "default_quality")]
@@ -123,8 +123,8 @@ fn dispatch(json: &[u8]) -> (u8, Vec<u8>) {
     match req {
         Request::Process {
             path,
-            rx, ry, rw, rh,
-            ow, oh,
+            region_x, region_y, region_w, region_h,
+            out_w, out_h,
             format,
             quality,
             page,
@@ -136,12 +136,12 @@ fn dispatch(json: &[u8]) -> (u8, Vec<u8>) {
                 Err(e) => return (1, e.into_bytes()),
             };
             let req = ProcessRequest {
-                region_x: rx,
-                region_y: ry,
-                region_w: rw,
-                region_h: rh,
-                out_w: ow,
-                out_h: oh,
+                region_x,
+                region_y,
+                region_w,
+                region_h,
+                out_w,
+                out_h,
                 format: fmt,
                 quality,
                 page,
