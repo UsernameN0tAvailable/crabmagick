@@ -17,21 +17,61 @@ declare(strict_types=1);
         return;
     }
 
+    // ── Pre-flight checks ─────────────────────────────────────────────────────
+
+    // Unix sockets + pre-built Linux binaries: Linux only.
+    if (PHP_OS_FAMILY !== 'Linux') {
+        trigger_error(
+            '[crabmagick] Unsupported OS "' . PHP_OS_FAMILY . '". '
+            . 'Pre-built daemon binaries are Linux-only. '
+            . 'See https://github.com/UsernameN0tAvailable/crabmagick for build instructions.',
+            E_USER_WARNING,
+        );
+        return;
+    }
+
+    // proc_open is required to spawn the daemon. It is sometimes listed in
+    // disable_functions on shared hosting or hardened FPM pools.
+    if (!function_exists('proc_open') || self_crabmagick_is_disabled('proc_open')) {
+        trigger_error(
+            '[crabmagick] proc_open() is disabled (disable_functions). '
+            . 'The daemon cannot be spawned automatically. '
+            . 'Start it manually: bin/crabmagick-<arch>-linux --socket /tmp/crabmagick.sock',
+            E_USER_WARNING,
+        );
+        return;
+    }
+
+    // A writable temp dir is needed for the Unix socket file.
+    $tmpDir = sys_get_temp_dir();
+    if (!is_writable($tmpDir)) {
+        trigger_error(
+            '[crabmagick] Temp directory "' . $tmpDir . '" is not writable. '
+            . 'Set TMPDIR to a writable path or start the daemon manually.',
+            E_USER_WARNING,
+        );
+        return;
+    }
+
+    // ── Find binary ───────────────────────────────────────────────────────────
+
     $arch   = php_uname('m');
     $binDir = __DIR__ . '/../bin';
 
     $bin = self_crabmagick_find_binary($binDir, $arch);
     if ($bin === null) {
         trigger_error(
-            '[crabmagick] No pre-built daemon binary found for arch ' . $arch . '. '
+            '[crabmagick] No pre-built daemon binary found for arch "' . $arch . '". '
             . 'See https://github.com/UsernameN0tAvailable/crabmagick for supported platforms.',
             E_USER_WARNING,
         );
         return;
     }
 
+    // ── Spawn (or attach to existing) daemon ──────────────────────────────────
+
     $uid        = function_exists('posix_getuid') ? posix_getuid() : getmypid();
-    $socketPath = sys_get_temp_dir() . '/crabmagick-' . $uid . '.sock';
+    $socketPath = $tmpDir . '/crabmagick-' . $uid . '.sock';
 
     // If socket already exists, register and trust it (another worker started it).
     if (file_exists($socketPath)) {
@@ -40,15 +80,21 @@ declare(strict_types=1);
     }
 
     // Spawn daemon detached from the current process.
-    $cmd = escapeshellarg($bin) . ' --socket ' . escapeshellarg($socketPath);
     $descriptors = [
         0 => ['file', '/dev/null', 'r'],
         1 => ['file', '/dev/null', 'w'],
         2 => ['file', '/dev/null', 'w'],
     ];
-    $proc = @proc_open($cmd, $descriptors, $pipes, null, null, ['bypass_shell' => true]);
+    $proc = @proc_open(
+        [$bin, '--socket', $socketPath],
+        $descriptors,
+        $pipes,
+        null,
+        null,
+        ['bypass_shell' => true],
+    );
     if ($proc === false) {
-        trigger_error('[crabmagick] Failed to spawn daemon: ' . $cmd, E_USER_WARNING);
+        trigger_error('[crabmagick] Failed to spawn daemon binary: ' . $bin, E_USER_WARNING);
         return;
     }
     // Don't wait — let it run in the background.
@@ -61,7 +107,11 @@ declare(strict_types=1);
     }
 
     if (!file_exists($socketPath)) {
-        trigger_error('[crabmagick] Daemon did not create socket in time: ' . $socketPath, E_USER_WARNING);
+        trigger_error(
+            '[crabmagick] Daemon did not create socket at "' . $socketPath . '" within 2 s. '
+            . 'Run the binary manually to see its error output: ' . $bin,
+            E_USER_WARNING,
+        );
         return;
     }
 
@@ -69,6 +119,12 @@ declare(strict_types=1);
 })();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+function self_crabmagick_is_disabled(string $fn): bool
+{
+    $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
+    return in_array($fn, $disabled, true);
+}
 
 function self_crabmagick_find_binary(string $binDir, string $arch): ?string
 {
