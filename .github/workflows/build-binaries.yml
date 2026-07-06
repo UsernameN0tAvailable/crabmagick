@@ -15,19 +15,19 @@ jobs:
         include:
           - runner: ubuntu-24.04
             variant: x86_64
-            rustflags: "-C link-arg=-static-libgcc -C link-arg=-static-libm"
+            rustflags: "-C link-arg=-static-libgcc"
           - runner: ubuntu-24.04
             variant: x86_64-avx2
-            rustflags: "-C target-cpu=haswell -C link-arg=-static-libgcc -C link-arg=-static-libm"
+            rustflags: "-C target-cpu=haswell -C link-arg=-static-libgcc"
           - runner: ubuntu-24.04
             variant: x86_64-avx512
-            rustflags: "-C target-cpu=skylake-avx512 -C link-arg=-static-libgcc -C link-arg=-static-libm"
+            rustflags: "-C target-cpu=skylake-avx512 -C link-arg=-static-libgcc"
           - runner: ubuntu-24.04-arm
             variant: aarch64
-            rustflags: "-C link-arg=-static-libgcc -C link-arg=-static-libm"
+            rustflags: "-C link-arg=-static-libgcc"
           - runner: ubuntu-24.04-arm
             variant: aarch64-sve
-            rustflags: "-C target-feature=+sve -C link-arg=-static-libgcc -C link-arg=-static-libm"
+            rustflags: "-C target-feature=+sve -C link-arg=-static-libgcc"
 
     runs-on: ${{ matrix.runner }}
 
@@ -81,5 +81,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add ext/
-          git diff --cached --quiet || git commit -m "ci: update pre-built FFI binaries (no PHP version, no libgcc_s/libm)"
+          git diff --cached --quiet || git commit -m "ci: update pre-built FFI binaries (no libgcc_s)"
           git push
