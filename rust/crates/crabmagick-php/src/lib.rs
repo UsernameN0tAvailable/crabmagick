@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crabmagick_core::processor::{get_info, init, process_image, OutputFormat, ProcessRequest};
+use crabmagick_core::processor::{get_info, process_image, OutputFormat, ProcessRequest};
 use ext_php_rs::binary::Binary;
 use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::*;
@@ -171,7 +171,6 @@ pub fn crabmagick_info(path: String) -> PhpResult<HashMap<String, u32>> {
 
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
-    init(512, 512);
     module
         .class::<CrabmagickImage>()
         .function(wrap_function!(crabmagick_process))

@@ -1,10 +1,11 @@
-name: Build PHP extension binaries
+name: Build crabmagick FFI binaries
 
 on:
   push:
     paths:
       - 'rust/crates/**/*.rs'
       - 'rust/crates/**/*.toml'
+      - 'rust/Cargo.toml'
   workflow_dispatch:
 
 jobs:
@@ -14,29 +15,24 @@ jobs:
         include:
           - runner: ubuntu-24.04
             variant: x86_64
-            rustflags: ""
+            rustflags: "-C link-arg=-static-libgcc -C link-arg=-static-libm"
           - runner: ubuntu-24.04
             variant: x86_64-avx2
-            rustflags: "-C target-cpu=haswell"
+            rustflags: "-C target-cpu=haswell -C link-arg=-static-libgcc -C link-arg=-static-libm"
           - runner: ubuntu-24.04
             variant: x86_64-avx512
-            rustflags: "-C target-cpu=skylake-avx512"
+            rustflags: "-C target-cpu=skylake-avx512 -C link-arg=-static-libgcc -C link-arg=-static-libm"
           - runner: ubuntu-24.04-arm
             variant: aarch64
-            rustflags: ""
+            rustflags: "-C link-arg=-static-libgcc -C link-arg=-static-libm"
           - runner: ubuntu-24.04-arm
             variant: aarch64-sve
-            rustflags: "-C target-feature=+sve"
+            rustflags: "-C target-feature=+sve -C link-arg=-static-libgcc -C link-arg=-static-libm"
 
     runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install PHP dev headers
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y php8.4-dev || sudo apt-get install -y php-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,35 +42,44 @@ jobs:
         with:
           workspaces: "rust -> target"
 
-      - name: Build PHP extension
+      - name: Build crabmagick FFI library
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           cd rust
-          PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
-          cargo build -p crabmagick-php --release
+          cargo build -p crabmagick-ffi --release
           cp target/release/libcrabmagick.so \
-             ../ext/crabmagick-php${PHP_VER}-${{ matrix.variant }}-linux.so
+             ../ext/crabmagick-${{ matrix.variant }}-linux.so
+
+      - name: Verify dynamic deps
+        run: |
+          echo "=== ldd output ==="
+          ldd ext/crabmagick-${{ matrix.variant }}-linux.so || true
+          echo "=== Expected: only libc + vdso + ld-linux ==="
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: crabmagick-${{ matrix.variant }}
-          path: ext/*.so
+          path: ext/crabmagick-${{ matrix.variant }}-linux.so
 
   commit:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: ext
           merge-multiple: true
+      - name: Remove old PHP-versioned binaries
+        run: rm -f ext/crabmagick-php*.so
       - name: Commit binaries
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ext/*.so
-          git diff --cached --quiet || git commit -m "ci: update pre-built extension binaries"
+          git add ext/
+          git diff --cached --quiet || git commit -m "ci: update pre-built FFI binaries (no PHP version, no libgcc_s/libm)"
           git push

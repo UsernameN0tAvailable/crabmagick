@@ -2,61 +2,46 @@
 
 declare(strict_types=1);
 
+namespace Crabmagick;
+
 use Composer\Script\Event;
 
 class CrabmagickInstaller
 {
     public static function postInstall(Event $event): void
     {
-        $io         = $event->getIO();
+        $io = $event->getIO();
         $packageDir = realpath(__DIR__ . '/..') ?: (__DIR__ . '/..');
-        $phpVer     = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
 
-        $soPath = self::resolveSo($event, $packageDir, $phpVer, $io);
+        $soPath = self::resolveSo($packageDir);
         if ($soPath === null) {
+            $io->writeError('<warning>[crabmagick] No pre-built binary found for this platform. '
+                . 'See https://github.com/UsernameN0tAvailable/crabmagick for supported platforms.</warning>');
             return;
         }
 
-        file_put_contents("{$packageDir}/crabmagick.ini", "extension={$soPath}\n");
+        file_put_contents("{$packageDir}/crabmagick.ini", "ffi.enable = true\n");
 
         $io->write("<info>[crabmagick] Selected binary: {$soPath}</info>");
-        $io->write('<info>[crabmagick] To activate — pick one option:</info>');
-        $io->write("<info>  1. Scan dir (no sudo): PHP_INI_SCAN_DIR=:{$packageDir} php ...</info>");
-        $io->write("<info>  2. Symlink:            sudo ln -s {$packageDir}/crabmagick.ini /etc/php/{$phpVer}/cli/conf.d/30-crabmagick.ini</info>");
+        $io->write('<info>[crabmagick] Activation — pick one option:</info>');
+        $io->write("<info>  1. PHP_INI_SCAN_DIR (no sudo): PHP_INI_SCAN_DIR=:{$packageDir} php ...</info>");
+        $io->write("<info>  2. Symlink into conf.d:       sudo ln -s {$packageDir}/crabmagick.ini /etc/php/cli/conf.d/30-crabmagick.ini</info>");
+        $io->write('<info>     (crabmagick.ini only sets ffi.enable=true — the binary is bundled and found automatically)</info>');
     }
 
-    private static function resolveSo(Event $event, string $packageDir, string $phpVer, $io): ?string
+    private static function resolveSo(string $packageDir): ?string
     {
-        $arch    = php_uname('m');
-        $variant = self::resolveVariant($event, $arch, $io);
+        $arch = php_uname('m');
+        $variant = self::detectVariant($arch);
 
-        $candidates = array_unique(array_filter([$variant, $arch]));
-        foreach ($candidates as $v) {
-            $name = "crabmagick-php{$phpVer}-{$v}-linux.so";
-            $path = realpath("{$packageDir}/ext/{$name}");
+        foreach (array_unique(array_filter([$variant, $arch])) as $v) {
+            $path = realpath("{$packageDir}/ext/crabmagick-{$v}-linux.so");
             if ($path !== false) {
                 return $path;
             }
         }
 
-        $tried = implode(', ', array_map(
-            fn($v) => "ext/crabmagick-php{$phpVer}-{$v}-linux.so",
-            $candidates
-        ));
-        $io->writeError("<warning>[crabmagick] No pre-built binary found. Tried: {$tried}</warning>");
         return null;
-    }
-
-    private static function resolveVariant(Event $event, string $arch, $io): ?string
-    {
-        $extra = $event->getComposer()->getPackage()->getExtra();
-        $override = $extra['crabmagick']['variant'] ?? null;
-        if (is_string($override) && $override !== '') {
-            $io->write("<info>[crabmagick] Using variant override: {$override}</info>");
-            return $override;
-        }
-
-        return self::detectVariant($arch);
     }
 
     private static function detectVariant(string $arch): ?string

@@ -881,6 +881,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabmagick-ffi"
+version = "0.1.0"
+dependencies = [
+ "crabmagick-core",
+ "libc",
+]
+
+[[package]]
 name = "crabmagick-php"
 version = "0.1.0"
 dependencies = [

@@ -1,16 +1,26 @@
 # crabmagick
 
-Pure-Rust libvips replacement for PHP — self-contained Composer package with a bundled native extension. Zero C dependencies, optimized for cached JXL-backed image requests.
+Pure-Rust image processing for PHP with a bundled C-ABI shared library loaded at runtime through PHP FFI. No PHP headers at build time, no `extension=` line in `php.ini`, and the same Linux `.so` works across PHP 8.1–8.x.
 
 ## What's inside
 
-| Crate | Role |
+| Path | Role |
 |---|---|
-| `crates/crabmagick-core` | Decode / crop / resize / encode pipeline + two-level in-process cache |
-| `crates/crabmagick-php` | `ext-php-rs` PHP extension exposing `\Crabmagick\Image` |
-| `ext/` | Pre-built `.so` binaries per PHP version + arch |
-| `src/bootstrap.php` | Auto-loaded by Composer — tries `dl()`, otherwise hints `PHP_INI_SCAN_DIR` |
-| `src/Installer.php` | Composer post-install hook — generates `crabmagick.ini` with absolute path |
+| `rust/crates/crabmagick-core` | Decode / crop / resize / encode pipeline |
+| `rust/crates/crabmagick-ffi` | Plain C-ABI `cdylib` loaded by PHP FFI |
+| `rust/crates/crabmagick-php` | Legacy Zend extension crate, kept for optional extension-based builds |
+| `ffi/oxipix.h` | Stable C header for the native ABI |
+| `src/Runtime.php` | Loads the bundled shared library via `FFI::cdef()` |
+| `src/Image.php` | Fluent PHP API |
+| `src/bootstrap.php` | Composer autoload bootstrap that resolves and loads the native library |
+| `src/Installer.php` | Composer post-install hook that generates `crabmagick.ini` |
+
+## Why FFI
+
+- No PHP-version coupling in the native binary
+- No PHP headers or `php-dev` package needed in CI
+- No `extension=` activation step
+- Minimal runtime dependencies: the release build is configured for `panic = "abort"` and uses static `libgcc` / `libm` link args to avoid `libgcc_s.so.1` and `libm.so.6`
 
 ## Installation
 
@@ -18,101 +28,104 @@ Pure-Rust libvips replacement for PHP — self-contained Composer package with a
 composer require usernamn0tavailable/crabmagick
 ```
 
-After install, activate the extension **without touching system php.ini**:
+Requirements:
+
+- PHP 8.1+
+- `ext-ffi`
+- Linux x86_64 or aarch64
+
+## Activation
+
+`composer install` or `composer update` writes `crabmagick.ini` with:
+
+```ini
+ffi.enable = true
+```
+
+Then activate with one of these options:
 
 ```bash
 # Option 1 — PHP_INI_SCAN_DIR (no sudo)
-PHP_INI_SCAN_DIR=:/path/to/vendor/usernamn0tavailable/crabmagick php -S 0.0.0.0:8088 -t public/
+PHP_INI_SCAN_DIR=:/path/to/vendor/usernamn0tavailable/crabmagick php ...
 
-# Option 2 — symlink into conf.d
-sudo ln -s $(pwd)/vendor/usernamn0tavailable/crabmagick/crabmagick.ini \
-           /etc/php/8.4/cli/conf.d/30-crabmagick.ini
+# Option 2 — symlink the generated ini
+sudo ln -s /path/to/vendor/usernamn0tavailable/crabmagick/crabmagick.ini \
+           /etc/php/cli/conf.d/30-crabmagick.ini
 ```
 
-`crabmagick.ini` is generated automatically by `composer install` with the correct absolute path.
+No `extension=` line is required. `src/bootstrap.php` finds the bundled `ext/crabmagick-*-linux.so` for the current CPU and loads it through FFI.
 
-### Variant selection
+## Binary selection
 
-`composer install` auto-detects the best binary for your CPU:
+At runtime and during install, crabmagick picks the best bundled binary for the host:
 
 | CPU | Selected binary |
 |---|---|
-| x86_64 with AVX2 (Intel Haswell+, AMD Ryzen+) | `crabmagick-php8.4-x86_64-avx2-linux.so` |
-| x86_64 generic | `crabmagick-php8.4-x86_64-linux.so` |
-| aarch64 | `crabmagick-php8.4-aarch64-linux.so` |
-
-**Override** in your project's `composer.json`:
-```json
-"extra": {
-    "crabmagick": { "variant": "x86_64-avx2" }
-}
-```
+| x86_64 with AVX-512 | `crabmagick-x86_64-avx512-linux.so` |
+| x86_64 with AVX2 | `crabmagick-x86_64-avx2-linux.so` |
+| generic x86_64 | `crabmagick-x86_64-linux.so` |
+| aarch64 with SVE | `crabmagick-aarch64-sve-linux.so` |
+| generic aarch64 | `crabmagick-aarch64-linux.so` |
 
 ## PHP API
 
 ```php
-// Fluent builder
 $bytes = (new \Crabmagick\Image('/path/to/file.jxl'))
-    ->region(100, 200, 512, 512)   // crop (triggers crop-during-decode)
+    ->region(100, 200, 512, 512)
     ->resize(256, 256)
+    ->page(0)
     ->rotate(90)
-    ->encode('webp', 82);          // 'jpeg' | 'webp' | 'png' | 'jxl'
+    ->square()
+    ->encode('webp', 82);
 
-// One-shot
 $bytes = \Crabmagick\process($path, $rx, $ry, $rw, $rh, $outW, $outH, 'jpeg', 85);
 
-// Dimensions (reads JXL header only, no full decode)
 $info = \Crabmagick\info($path); // ['width' => 3360, 'height' => 4892]
 
-// Extension check
 \Crabmagick\Image::isAvailable(); // bool
 ```
 
+Supported output formats: `jpeg`, `webp`, `png`, `jxl`, `avif`.
+
 ## Performance
 
-Benchmarked on 3360×4892 JXL source, 512×512 output tile:
+Benchmarked on a 3360×4892 JXL source with 512×512 output tiles:
 
 | Request type | Time |
 |---|---|
-| Cold tile (crop-during-decode) | **~29 ms** |
-| Tile cache hit (same crop, different size) | **~2 ms** |
-| Output cache hit (exact repeat) | **< 0.01 ms** |
-| Full image 800px (unavoidable full decode) | **~570 ms** |
+| Cold tile (crop-during-decode) | ~29 ms |
+| Full image 800px | ~570 ms |
 
-libvips takes ~540 ms for the same cold tile. The 19× speedup comes from JXL group-level crop-during-decode via `jxl-oxide`'s `set_image_region`.
+libvips takes ~540 ms for the same cold tile. The speedup comes from JXL group-level crop-during-decode.
 
 ## Build
 
-Requires PHP 8.x headers (`php-dev` package) on the build machine.
-
 ```bash
 cd rust
-cargo build -p crabmagick-php --release
-# → target/release/libcrabmagick.so
-cp target/release/libcrabmagick.so \
-   ../ext/crabmagick-php8.4-x86_64-linux.so
+RUSTFLAGS='-C link-arg=-static-libgcc -C link-arg=-static-libm' \
+cargo build -p crabmagick-ffi --release
+cp target/release/libcrabmagick.so ../ext/crabmagick-x86_64-linux.so
+ldd ../ext/crabmagick-x86_64-linux.so
 ```
 
-### Adding a new architecture
-
-Build on the target machine (or cross-compile), then commit the binary:
+Target-specific builds used by CI:
 
 ```bash
-cp target/release/libcrabmagick.so \
-   ../ext/crabmagick-php8.4-aarch64-linux.so
-git add ext/crabmagick-php8.4-aarch64-linux.so
+# AVX2
+RUSTFLAGS='-C target-cpu=haswell -C link-arg=-static-libgcc -C link-arg=-static-libm' \
+cargo build -p crabmagick-ffi --release
+
+# AVX-512
+RUSTFLAGS='-C target-cpu=skylake-avx512 -C link-arg=-static-libgcc -C link-arg=-static-libm' \
+cargo build -p crabmagick-ffi --release
 ```
 
-`bootstrap.php` and `Installer.php` detect arch via `php_uname('m')` and select the correct file automatically.
+## Supported platforms
 
-## Bundled decoders / encoders
+- `x86_64`
+- `x86_64-avx2`
+- `x86_64-avx512`
+- `aarch64`
+- `aarch64-sve`
 
-All pure Rust, zero C dependencies:
-
-- JXL encode/decode — `jxl-encoder` + `jxl-oxide`
-- JPEG encode/decode — `zenjpeg`
-- WebP encode/decode — `fast-webp`
-- PNG — via `image` crate
-- JP2/J2K — `zen-jp2` (optional feature `jp2`)
-- Resize — `fast_image_resize` (SIMD)
-
+The native ABI is defined in `ffi/oxipix.h`. Other language runtimes can reuse the same shared library without any PHP-specific build step.
