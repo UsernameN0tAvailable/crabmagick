@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Crabmagick;
+namespace CrabMagick;
 
 use Composer\Script\Event;
 
@@ -17,7 +17,7 @@ class Installer
 
         if ($bin === null) {
             $io->writeError(
-                '<warning>[crabmagick] No pre-built daemon binary found for arch ' . $arch . '. '
+                '<warning>[CrabMagick] No pre-built daemon binary found for arch ' . $arch . '. '
                 . 'See https://github.com/UsernameN0tAvailable/crabmagick for supported platforms.</warning>'
             );
             return;
@@ -28,8 +28,8 @@ class Installer
             chmod($bin, 0755);
         }
 
-        $io->write("<info>[crabmagick] Daemon binary ready: {$bin}</info>");
-        $io->write('<info>[crabmagick] No php.ini changes needed — the daemon starts automatically.</info>');
+        $io->write("<info>[CrabMagick] Daemon binary ready: {$bin}</info>");
+        $io->write('<info>[CrabMagick] No php.ini changes needed — the daemon starts automatically.</info>');
     }
 
     private static function findBinary(string $packageDir, string $arch): ?string

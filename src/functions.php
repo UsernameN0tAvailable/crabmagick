@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Crabmagick;
+namespace CrabMagick;
 
 /**
  * One-shot decode → crop/resize/rotate → encode.

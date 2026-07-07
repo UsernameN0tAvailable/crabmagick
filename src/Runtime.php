@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace Crabmagick;
+namespace CrabMagick;
 
 /**
- * Low-level dispatch layer for crabmagick.
+ * Low-level dispatch layer for CrabMagick.
  *
  * Automatically uses whichever backend is available:
  *   1. Native PHP extension (crabmagick_process / crabmagick_info are defined)
@@ -105,7 +105,7 @@ final class Runtime
         $payload = self::send(['cmd' => 'info', 'path' => $path, 'page' => $page]);
         $data    = json_decode($payload, true);
         if (!is_array($data) || !isset($data['width'], $data['height'])) {
-            throw new \RuntimeException('[crabmagick] Malformed info response: ' . $payload);
+            throw new \RuntimeException('[CrabMagick] Malformed info response: ' . $payload);
         }
         return ['width' => (int)$data['width'], 'height' => (int)$data['height']];
     }
@@ -116,7 +116,7 @@ final class Runtime
     {
         if (self::$socketPath === null) {
             throw new \RuntimeException(
-                '[crabmagick] Daemon socket not initialised. Did you require vendor/autoload.php?'
+                '[CrabMagick] Daemon socket not initialised. Did you require vendor/autoload.php?'
             );
         }
 
@@ -126,7 +126,7 @@ final class Runtime
         $sock = @stream_socket_client('unix://' . self::$socketPath, $errno, $errstr, 2.0);
         if ($sock === false) {
             throw new \RuntimeException(
-                "[crabmagick] Cannot connect to daemon socket: {$errstr} ({$errno})"
+                "[CrabMagick] Cannot connect to daemon socket: {$errstr} ({$errno})"
             );
         }
         stream_set_timeout($sock, 30);
@@ -142,7 +142,7 @@ final class Runtime
         fclose($sock);
 
         if ((int)$parts['status'] !== 0) {
-            throw new \RuntimeException('[crabmagick] Daemon error: ' . $payload);
+            throw new \RuntimeException('[CrabMagick] Daemon error: ' . $payload);
         }
 
         return $payload;
@@ -156,7 +156,7 @@ final class Runtime
         while ($remaining > 0) {
             $chunk = fread($sock, $remaining);
             if ($chunk === false || $chunk === '') {
-                throw new \RuntimeException('[crabmagick] Daemon connection closed unexpectedly');
+                throw new \RuntimeException('[CrabMagick] Daemon connection closed unexpectedly');
             }
             $buf       .= $chunk;
             $remaining -= strlen($chunk);

@@ -1,19 +1,28 @@
 [workspace]
 members = [
-    "crates/fast-webp",
-    "crates/jxl-encoder",
-    "crates/jxl-encoder-simd",
-    "crates/zenjpeg",
-    "crates/zen-jp2",
     "crates/crabmagick-core",
     "crates/crabmagick-daemon",
 ]
 resolver = "2"
 
-[patch.crates-io]
-zenjpeg = { path = "crates/zenjpeg" }
-crabmagick-core = { path = "crates/crabmagick-core" }
-jxl-encoder-simd = { path = "crates/jxl-encoder-simd" }
-
 [profile.release]
+opt-level = 3
 panic = "abort"
+lto = "fat"
+codegen-units = 8     # fat LTO merges these anyway; =1 hangs LLVM on 300k-line SIMD crate
+debug = false
+strip = "symbols"
+incremental = false
+debug-assertions = false
+overflow-checks = false
+
+[profile.bench]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 8
+debug = false
+strip = false
+incremental = false
+debug-assertions = false
+overflow-checks = false

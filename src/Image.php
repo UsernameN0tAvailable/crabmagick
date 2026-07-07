@@ -2,16 +2,16 @@
 
 declare(strict_types=1);
 
-namespace Crabmagick;
+namespace CrabMagick;
 
 /**
- * Fluent builder for image processing via the crabmagick daemon.
+ * Fluent builder for image processing via the CrabMagick daemon.
  *
  * The daemon is started automatically when this package is loaded via
  * `require vendor/autoload.php`. No php.ini changes required.
  *
  * Example:
- *   $bytes = (new \Crabmagick\Image('/path/to/file.jxl'))
+ *   $bytes = (new \CrabMagick\Image('/path/to/file.jxl'))
  *       ->region(0, 0, 512, 512)
  *       ->resize(256, 256)
  *       ->encode('jpeg', 85);
@@ -97,7 +97,7 @@ class Image
         return Runtime::info($this->path, $this->page);
     }
 
-    /** Returns true if the crabmagick daemon is running and reachable. */
+    /** Returns true if the CrabMagick daemon is running and reachable. */
     public static function isAvailable(): bool
     {
         return Runtime::isReady();

@@ -1,4 +1,4 @@
-name: Build crabmagick FFI binaries
+name: Build CrabMagick daemon binaries
 
 on:
   push:
@@ -6,28 +6,36 @@ on:
       - 'rust/crates/**/*.rs'
       - 'rust/crates/**/*.toml'
       - 'rust/Cargo.toml'
+    branches:
+      - master
   workflow_dispatch:
 
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
             variant: x86_64
-            rustflags: "-C link-arg=-static-libgcc"
+            target: x86_64-unknown-linux-musl
+            rustflags: "-C target-feature=+crt-static"
           - runner: ubuntu-24.04
             variant: x86_64-avx2
-            rustflags: "-C target-cpu=haswell -C link-arg=-static-libgcc"
+            target: x86_64-unknown-linux-musl
+            rustflags: "-C target-feature=+crt-static,+avx2,+fma"
           - runner: ubuntu-24.04
             variant: x86_64-avx512
-            rustflags: "-C target-cpu=skylake-avx512 -C link-arg=-static-libgcc"
+            target: x86_64-unknown-linux-musl
+            rustflags: "-C target-feature=+crt-static,+avx512f,+avx512bw,+avx512cd,+avx512dq,+avx512vl"
           - runner: ubuntu-24.04-arm
             variant: aarch64
-            rustflags: "-C link-arg=-static-libgcc"
+            target: aarch64-unknown-linux-gnu
+            rustflags: "-C target-feature=+neon"
           - runner: ubuntu-24.04-arm
             variant: aarch64-sve
-            rustflags: "-C target-feature=+sve -C link-arg=-static-libgcc"
+            target: aarch64-unknown-linux-gnu
+            rustflags: "-C target-feature=+neon,+sve,+sve2"
 
     runs-on: ${{ matrix.runner }}
 
@@ -36,32 +44,39 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.variant, 'x86_64')
+        run: sudo apt-get install -y musl-tools
 
       - name: Cache Rust deps
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "rust -> target"
+          key: ${{ matrix.variant }}
 
-      - name: Build crabmagick FFI library
+      - name: Build daemon
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           cd rust
-          cargo build -p crabmagick-ffi --release
-          cp target/release/libcrabmagick.so \
-             ../ext/crabmagick-${{ matrix.variant }}-linux.so
+          cargo build -p crabmagick-daemon --release --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/crabmagick-daemon \
+             ../bin/crabmagick-${{ matrix.variant }}-linux
+          chmod +x ../bin/crabmagick-${{ matrix.variant }}-linux
 
-      - name: Verify dynamic deps
+      - name: Verify binary
         run: |
-          echo "=== ldd output ==="
-          ldd ext/crabmagick-${{ matrix.variant }}-linux.so || true
-          echo "=== Expected: only libc + vdso + ld-linux ==="
+          file bin/crabmagick-${{ matrix.variant }}-linux
+          ls -lh bin/crabmagick-${{ matrix.variant }}-linux
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: crabmagick-${{ matrix.variant }}
-          path: ext/crabmagick-${{ matrix.variant }}-linux.so
+          path: bin/crabmagick-${{ matrix.variant }}-linux
 
   commit:
     needs: build
@@ -70,16 +85,19 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
-          path: ext
+          path: bin
           merge-multiple: true
-      - name: Remove old PHP-versioned binaries
-        run: rm -f ext/crabmagick-php*.so
+
+      - name: Mark binaries executable
+        run: chmod +x bin/crabmagick-*-linux
+
       - name: Commit binaries
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ext/
-          git diff --cached --quiet || git commit -m "ci: update pre-built FFI binaries (no libgcc_s)"
+          git add bin/
+          git diff --cached --quiet || git commit -m "ci: update pre-built daemon binaries"
           git push

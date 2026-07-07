@@ -1,30 +1,93 @@
 [package]
 name = "crabmagick-core"
-version = "0.1.0"
-edition = "2021"
+version = "0.1.1"
+edition = "2024"
 description = "Pure-Rust image processing pipeline for PHP — multi-format decode and JXL/JPEG/WebP/PNG/AVIF encode"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/UsernameN0tAvailable/crabmagick"
 keywords = ["image", "jxl", "jpeg", "webp", "iiif"]
 categories = ["multimedia::images"]
 
+[[bench]]
+name = "vs_libvips"
+harness = false
+
 [dependencies]
-fast-webp = { path = "../fast-webp" }
-jxl-encoder = { path = "../jxl-encoder", default-features = false, features = ["std", "parallel", "unsafe-performance"] }
-jxl-oxide = { version = "0.12.6", default-features = false, features = ["rayon"] }
-zenjpeg = { path = "../zenjpeg", features = ["parallel"] }
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "gif", "pnm"] }
+aligned-vec = "0.6"
+archmage = { version = "0.9.15", default-features = false, features = ["macros", "avx512"] }
+brotli = { version = "8.0", default-features = false, features = ["std"], optional = true }
+butteraugli = { version = "0.9", optional = true }
+byteorder-lite = "0.1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+enough = { version = "0.4.3", features = ["std"] }
+fast-ssim2 = { version = "0.7.1", features = ["imgref"], optional = true }
+fearless_simd = { version = "0.4.0", optional = true }
 fast_image_resize = { version = "5", features = ["rayon"] }
-resvg = "0.44"
-ravif = { version = "0.11", default-features = false, features = ["threading"], optional = true }
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "gif", "pnm"] }
+imgref = "1.12"
+brotli-decompressor = "5.0.0"
+tracing = { version = "0.1.40", default-features = false, features = ["std"] }
+lru = "0.12"
+magetypes = { version = "0.9.15", default-features = false, features = ["avx512"] }
+memmap2 = "0.9"
+moxcms = { version = "0.8", optional = true }
+once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
 pdfium-render = { version = "0.8", features = ["static"], optional = true }
-tiff = "0.9"
-zen-jp2 = { path = "../zen-jp2", optional = true }
+quick-error = "2.0.1"
+ravif = { version = "0.11", default-features = false, features = ["threading"], optional = true }
 rayon = "1.10"
-thiserror = "2"
+resvg = "0.44"
+rgb = { version = "0.8", features = ["as-bytes"] }
+safe_unaligned_simd = { version = "0.2.5", features = ["avx512"] }
+tiff = "0.9"
+tinyvec = { version = "1.10", features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+ultrahdr-core = { version = "0.3.0", default-features = false }
+web-sys = { version = "0.3", features = ["console"], optional = true }
+whereat = "0.1.5"
+wide = "1.1"
+yuv = { version = "0.8", features = ["professional_mode"] }
+zencodec = "0.1.11"
+zenlayout = { version = "0.2", optional = true }
+zenpixels = { version = "0.2.1", default-features = false, features = ["imgref"] }
+zenresize = { version = "0.2", optional = true, features = ["layout"] }
+zensim = { version = "0.2", optional = true }
 
 [features]
-default = []
+default = ["std", "parallel", "unsafe-performance", "decoder", "yuv", "simd"]
 avif = ["dep:ravif", "image/avif"]
+butteraugli-loop = ["dep:butteraugli"]
+convenience = []
+debug-ac-strategy = []
+debug-dc = []
+debug-rect = []
+debug-tokens = []
+decoder = []
+jpeg-reencoding = ["decoder", "dep:brotli"]
+jp2 = []
+layout = ["decoder", "dep:zenlayout", "dep:zenresize"]
+logging = ["std"]
+moxcms = ["dep:moxcms"]
+parallel = ["std"]
 pdf = ["dep:pdfium-render"]
-jp2 = ["dep:zen-jp2"]
+rate-control = ["dep:butteraugli"]
+simd = ["dep:fearless_simd", "std"]
+ssim2-loop = ["dep:fast-ssim2"]
+std = ["thiserror/std", "archmage/std", "magetypes/std"]
+trace-bitstream = []
+trellis = []
+ultrahdr = ["decoder", "ultrahdr-core/std", "ultrahdr-core/transfer"]
+unsafe-performance = []
+yuv = []
+zencodec = ["decoder"]
+zensim-loop = ["dep:zensim"]
+__alloc-instrument = []
+__debug-tokens = []
+__expert = []
+__profile = []
+__test-utils = []
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+libvips = "1.6"

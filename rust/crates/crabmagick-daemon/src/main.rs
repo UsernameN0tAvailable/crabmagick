@@ -49,6 +49,7 @@ enum Request {
     Info {
         path: String,
         #[serde(default)]
+        #[allow(dead_code)] // reserved for future page-aware info; field kept for protocol compat
         page: u32,
     },
 }
@@ -135,25 +136,25 @@ fn dispatch(json: &[u8]) -> (u8, Vec<u8>) {
                 Ok(f) => f,
                 Err(e) => return (1, e.into_bytes()),
             };
-            let req = ProcessRequest {
-                region_x,
-                region_y,
-                region_w,
-                region_h,
-                out_w,
-                out_h,
-                format: fmt,
+            let request = ProcessRequest {
+                region_left: region_x,
+                region_top: region_y,
+                region_width: region_w,
+                region_height: region_h,
+                output_width: out_w,
+                output_height: out_h,
+                output_format: fmt,
                 quality,
                 page,
                 rotation,
                 square_region: square,
             };
-            match process_image(&path, req) {
+            match process_image(&path, request) {
                 Ok(bytes) => (0, bytes),
                 Err(e) => (1, e.to_string().into_bytes()),
             }
         }
-        Request::Info { path, page } => {
+        Request::Info { path, page: _ } => {
             match get_info(&path) {
                 Ok(info) => {
                     let json = format!(r#"{{"width":{},"height":{}}}"#, info.width, info.height);

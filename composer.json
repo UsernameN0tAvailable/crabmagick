@@ -1,6 +1,6 @@
 {
     "name": "usernamn0tavailable/crabmagick",
-    "description": "Pure-Rust image processing for PHP — zero config. A daemon is spawned automatically on first use. No php.ini changes, no sudo, just composer require.",
+    "description": "Pure-Rust image processing for PHP — zero config. A CrabMagick daemon is spawned automatically on first use. No php.ini changes, no sudo, just composer require.",
     "type": "library",
     "license": "MIT",
     "keywords": ["image", "rust", "vips", "webp", "jxl", "jpeg", "iiif", "daemon"],
@@ -9,7 +9,7 @@
     },
     "autoload": {
         "psr-4": {
-            "Crabmagick\\": "src/"
+            "CrabMagick\\": "src/"
         },
         "files": [
             "src/bootstrap.php",
@@ -17,7 +17,7 @@
         ]
     },
     "scripts": {
-        "post-install-cmd": ["Crabmagick\\Installer::postInstall"],
-        "post-update-cmd":  ["Crabmagick\\Installer::postInstall"]
+        "post-install-cmd": ["CrabMagick\\Installer::postInstall"],
+        "post-update-cmd":  ["CrabMagick\\Installer::postInstall"]
     }
 }

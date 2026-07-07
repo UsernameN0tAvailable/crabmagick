@@ -1,27 +1,130 @@
-use std::fs;
-use std::io::{BufReader, Cursor};
+//! Low-level decode, transform, and encode primitives used by CrabMagick.
+
+// Allow cfg-guarded returns and chunk patterns that can't use unstable as_chunks.
+#![allow(clippy::needless_return, clippy::collapsible_if, clippy::chunks_exact_to_as_chunks)]
+
+use std::fs::File;
+use std::io::{BufReader, Cursor, Read};
+use std::num::NonZeroUsize;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fast_image_resize as fir;
 use image::{codecs::png::PngEncoder, ColorType, GenericImageView, ImageEncoder, RgbImage};
-use jxl_encoder::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
-use jxl_oxide::{CropInfo, JxlImage, PixelFormat};
+use crate::jxl_oxide_vendored::jxl_oxide::{CropInfo, JxlImage, PixelFormat};
+use lru::LruCache;
+use memmap2::Mmap;
 #[cfg(feature = "pdf")]
 use pdfium_render::prelude::*;
 #[cfg(feature = "avif")]
 use ravif::{Encoder as AvifEncoder, Img as AvifImg, RGB8 as AvifRgb8};
+use rayon::prelude::*;
 use resvg::{tiny_skia, usvg};
 use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
-use zenjpeg::encoder::{ChromaSubsampling, EncoderConfig, PixelLayout as ZenLayout, Unstoppable};
 
-use crate::processor::{ImageInfo, OutputFormat, OxipixError};
+use crate::jxl_encoder::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
+use crate::processor::{CrabMagickError, ImageInfo, OutputFormat, RequestedRegion};
+use crate::zenjpeg::encoder::{
+    ChromaSubsampling, EncoderConfig, PixelLayout as ZenLayout, Unstoppable,
+};
 
+// ── Core image and cache types ───────────────────────────────────────────────
+
+/// Owned RGB pixel data produced by the decoding pipeline.
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
+    /// Packed `RGBRGB...` pixel bytes.
     pub pixels: Vec<u8>,
+    /// Image width in pixels.
     pub width: u32,
+    /// Image height in pixels.
     pub height: u32,
 }
 
+type CacheKey = (String, u32);
+
+const SMALL_FILE_READ_THRESHOLD: u64 = 1_024 * 1_024;
+const AVERAGE_DECODED_IMAGE_BYTES: usize = 4 * 1_024 * 1_024;
+
+/// File-backed or owned input bytes used during decode.
+pub(crate) enum FileBytes {
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Deref for FileBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Mmap(map) => map,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+struct CachedDecodedImage {
+    image: Arc<DecodedImage>,
+    bytes: usize,
+}
+
+struct DecodedImageCache {
+    entries: LruCache<CacheKey, CachedDecodedImage>,
+    bytes_limit: usize,
+    current_bytes: usize,
+}
+
+impl DecodedImageCache {
+    fn new(bytes_limit: usize) -> Self {
+        let estimated_items = bytes_limit
+            .saturating_div(AVERAGE_DECODED_IMAGE_BYTES)
+            .max(1);
+        let capacity = NonZeroUsize::new(estimated_items).expect("cache capacity is non-zero");
+        Self {
+            entries: LruCache::new(capacity),
+            bytes_limit,
+            current_bytes: 0,
+        }
+    }
+
+    fn reset(&mut self, bytes_limit: usize) {
+        *self = Self::new(bytes_limit);
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<DecodedImage>> {
+        if self.bytes_limit == 0 {
+            return None;
+        }
+        self.entries.get(key).map(|entry| Arc::clone(&entry.image))
+    }
+
+    fn put(&mut self, key: CacheKey, image: Arc<DecodedImage>) {
+        if self.bytes_limit == 0 {
+            return;
+        }
+
+        let bytes = image.pixels.len();
+        if bytes > self.bytes_limit {
+            return;
+        }
+
+        if let Some(previous) = self.entries.put(key, CachedDecodedImage { image, bytes }) {
+            self.current_bytes = self.current_bytes.saturating_sub(previous.bytes);
+        }
+        self.current_bytes = self.current_bytes.saturating_add(bytes);
+
+        while self.current_bytes > self.bytes_limit {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.current_bytes = self.current_bytes.saturating_sub(evicted.bytes);
+        }
+    }
+}
+
+static DECODED_IMAGE_CACHE: OnceLock<Mutex<DecodedImageCache>> = OnceLock::new();
+
+/// Source format detected from file signatures and lightweight probes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
     Jxl,
@@ -37,6 +140,77 @@ pub enum SourceFormat {
     Unknown,
 }
 
+// ── Cache helpers ────────────────────────────────────────────────────────────
+
+fn decoded_image_cache() -> &'static Mutex<DecodedImageCache> {
+    DECODED_IMAGE_CACHE.get_or_init(|| Mutex::new(DecodedImageCache::new(0)))
+}
+
+fn cacheable_full_decode(format: SourceFormat, region: Option<(u32, u32, u32, u32)>, square: bool) -> bool {
+    region.is_none()
+        && !square
+        && matches!(
+            format,
+            SourceFormat::Jxl
+                | SourceFormat::Jpeg
+                | SourceFormat::Png
+                | SourceFormat::Webp
+                | SourceFormat::Tiff
+                | SourceFormat::Gif
+                | SourceFormat::Bmp
+                | SourceFormat::Avif
+        )
+}
+
+fn cached_full_decode(path: &str, page: u32) -> Option<DecodedImage> {
+    let key = (path.to_owned(), page);
+    decoded_image_cache()
+        .lock()
+        .expect("decoded image cache lock poisoned")
+        .get(&key)
+        .map(|image| (*image).clone())
+}
+
+fn store_cached_full_decode(path: &str, page: u32, image: &DecodedImage) {
+    let key = (path.to_owned(), page);
+    decoded_image_cache()
+        .lock()
+        .expect("decoded image cache lock poisoned")
+        .put(key, Arc::new(image.clone()));
+}
+
+#[inline]
+pub(crate) fn init_decoded_image_cache(tile_cache_mb: u64) {
+    let bytes_limit = tile_cache_mb
+        .saturating_mul(1024)
+        .saturating_mul(1024)
+        .min(usize::MAX as u64) as usize;
+    decoded_image_cache()
+        .lock()
+        .expect("decoded image cache lock poisoned")
+        .reset(bytes_limit);
+}
+
+#[inline]
+pub(crate) fn read_file_bytes(path: &str) -> Result<FileBytes, CrabMagickError> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > SMALL_FILE_READ_THRESHOLD {
+        // SAFETY: The mapping is read-only and the file handle lives until after the map is
+        // created. The returned Mmap owns the OS mapping independently of the File.
+        let mapped = unsafe { Mmap::map(&file)? };
+        Ok(FileBytes::Mmap(mapped))
+    } else {
+        let mut reader = file;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        reader.read_to_end(&mut bytes)?;
+        Ok(FileBytes::Owned(bytes))
+    }
+}
+
+// ── JPEG XL encode configuration ─────────────────────────────────────────────
+
+/// Fine-grained JPEG XL encoder configuration for [`encode_jxl_rgb`].
 #[derive(Debug, Clone, Copy)]
 pub struct JxlEncodeOptions {
     pub lossless: bool,
@@ -94,6 +268,34 @@ impl Default for JxlEncodeOptions {
     }
 }
 
+// ── Error helpers ────────────────────────────────────────────────────────────
+
+fn decode_malformed(message: impl Into<String>) -> CrabMagickError {
+    CrabMagickError::decode_malformed(message)
+}
+
+fn decode_unsupported_format(message: impl Into<String>) -> CrabMagickError {
+    CrabMagickError::decode_unsupported_format(message)
+}
+
+fn encode_error(message: impl Into<String>) -> CrabMagickError {
+    CrabMagickError::encode_error(message)
+}
+
+fn region_out_of_bounds(region: RequestedRegion, image: ImageInfo) -> CrabMagickError {
+    CrabMagickError::region_out_of_bounds(region, image)
+}
+
+// ── Format detection ─────────────────────────────────────────────────────────
+
+/// Detects the source format from magic bytes and lightweight textual probes.
+///
+/// # Performance
+///
+/// This function reads only the leading bytes needed for signature matching and
+/// falls back to a small UTF-8 probe for SVG detection.
+#[inline]
+#[must_use]
 pub fn detect_format(bytes: &[u8]) -> SourceFormat {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0x0A {
         return SourceFormat::Jxl;
@@ -144,19 +346,37 @@ pub fn detect_format(bytes: &[u8]) -> SourceFormat {
     SourceFormat::Unknown
 }
 
-pub fn decode_jxl(path: &str) -> Result<DecodedImage, OxipixError> {
-    let bytes = fs::read(path)?;
+// ── Decode entry points ──────────────────────────────────────────────────────
+
+/// Decodes a full JPEG XL image from disk into packed RGB pixels.
+///
+/// # Performance
+///
+/// Large files are memory-mapped, and the decode stays inside the bundled JXL
+/// path without involving the generic `image` crate.
+pub fn decode_jxl(path: &str) -> Result<DecodedImage, CrabMagickError> {
+    let bytes = read_file_bytes(path)?;
     decode_jxl_from_bytes(&bytes)
 }
 
-pub fn decode_jxl_from_bytes(bytes: &[u8]) -> Result<DecodedImage, OxipixError> {
-    let image = JxlImage::builder()
-        .read(Cursor::new(bytes))
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+/// Decodes a full JPEG XL image from memory into packed RGB pixels.
+///
+/// # Performance
+///
+/// This is the lowest-overhead full-image JXL decode path exposed publicly.
+pub fn decode_jxl_from_bytes(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    decode_jxl_from_bytes_with_hint(bytes, None)
+}
+
+fn decode_jxl_from_bytes_with_hint(
+    bytes: &[u8],
+    render_size: Option<(u32, u32)>,
+) -> Result<DecodedImage, CrabMagickError> {
+    let image = create_jxl_image(bytes, render_size)?;
 
     let frame = image
         .render_frame(0)
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+        .map_err(|error| decode_malformed(format!("JPEG XL frame rendering failed: {error}")))?;
     let planes = frame.image_planar();
 
     Ok(planar_to_rgb(
@@ -169,27 +389,52 @@ pub fn decode_jxl_from_bytes(bytes: &[u8]) -> Result<DecodedImage, OxipixError> 
     ))
 }
 
+/// Decodes a rectangular JPEG XL region from disk into packed RGB pixels.
+///
+/// # Performance
+///
+/// Uses `jxl-oxide` region decode so only the requested window is rendered.
 pub fn decode_jxl_region(
     path: &str,
     left: u32,
     top: u32,
     width: u32,
     height: u32,
-) -> Result<DecodedImage, OxipixError> {
-    let bytes = fs::read(path)?;
+) -> Result<DecodedImage, CrabMagickError> {
+    let bytes = read_file_bytes(path)?;
     decode_jxl_region_from_bytes(&bytes, left, top, width, height)
 }
 
+/// Decodes a rectangular JPEG XL region from memory into packed RGB pixels.
+///
+/// # Performance
+///
+/// Uses `jxl-oxide` region decode so only the requested window is rendered.
 pub fn decode_jxl_region_from_bytes(
     bytes: &[u8],
     left: u32,
     top: u32,
     width: u32,
     height: u32,
-) -> Result<DecodedImage, OxipixError> {
-    let mut image = JxlImage::builder()
-        .read(Cursor::new(bytes))
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+) -> Result<DecodedImage, CrabMagickError> {
+    decode_jxl_region_from_bytes_with_hint(bytes, left, top, width, height, None)
+}
+
+fn decode_jxl_region_from_bytes_with_hint(
+    bytes: &[u8],
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+    render_size: Option<(u32, u32)>,
+) -> Result<DecodedImage, CrabMagickError> {
+    let mut image = create_jxl_image(bytes, render_size)?;
+    let image_info = ImageInfo {
+        width: image.width(),
+        height: image.height(),
+    };
+    let region = RequestedRegion::new(left, top, width, height);
+    validate_requested_region(region, image_info)?;
 
     image.set_image_region(CropInfo {
         left,
@@ -200,10 +445,12 @@ pub fn decode_jxl_region_from_bytes(
 
     let frame = image
         .render_frame(0)
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+        .map_err(|error| decode_malformed(format!("JPEG XL region rendering failed: {error}")))?;
     let planes = frame.image_planar();
     if planes.is_empty() {
-        return Err(OxipixError::Decode("no planes decoded".to_string()));
+        return Err(decode_malformed(
+            "JPEG XL decode produced no image planes for the requested region",
+        ));
     }
 
     Ok(planar_to_rgb(
@@ -216,15 +463,15 @@ pub fn decode_jxl_region_from_bytes(
     ))
 }
 
-pub fn decode_jxl_info(path: &str) -> Result<ImageInfo, OxipixError> {
-    let bytes = fs::read(path)?;
+/// Returns JPEG XL dimensions without fully rasterizing the image.
+pub fn decode_jxl_info(path: &str) -> Result<ImageInfo, CrabMagickError> {
+    let bytes = read_file_bytes(path)?;
     decode_jxl_info_from_bytes(&bytes)
 }
 
-pub fn decode_jxl_info_from_bytes(bytes: &[u8]) -> Result<ImageInfo, OxipixError> {
-    let image = JxlImage::builder()
-        .read(Cursor::new(bytes))
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+/// Returns JPEG XL dimensions from in-memory bytes.
+pub fn decode_jxl_info_from_bytes(bytes: &[u8]) -> Result<ImageInfo, CrabMagickError> {
+    let image = create_jxl_image(bytes, None)?;
 
     Ok(ImageInfo {
         width: image.width(),
@@ -232,16 +479,36 @@ pub fn decode_jxl_info_from_bytes(bytes: &[u8]) -> Result<ImageInfo, OxipixError
     })
 }
 
+fn create_jxl_image(
+    bytes: &[u8],
+    render_size: Option<(u32, u32)>,
+) -> Result<JxlImage, CrabMagickError> {
+    let _ = render_size;
+    // jxl-oxide 0.12.6 exposes region cropping but does not currently expose a render-size or
+    // decode-scale hint on JxlImage/JxlImageBuilder, so we keep the requested size only as a
+    // future integration hook.
+    JxlImage::builder()
+        .read(Cursor::new(bytes))
+        .map_err(|error| decode_malformed(format!("JPEG XL header parsing failed: {error}")))
+}
+
+/// Decodes any supported source format into packed RGB pixels.
+///
+/// # Performance
+///
+/// Delegates to optimized format-specific decoders and keeps region handling in
+/// the lowest-cost path available for each codec.
 pub fn decode_any(
     path: &str,
     region: Option<(u32, u32, u32, u32)>,
     square: bool,
-) -> Result<DecodedImage, OxipixError> {
+) -> Result<DecodedImage, CrabMagickError> {
     decode_any_with_options(path, region, square, 0, None)
 }
 
-pub fn decode_any_info(path: &str, page: u32) -> Result<ImageInfo, OxipixError> {
-    let bytes = fs::read(path)?;
+/// Returns source-image dimensions for any supported format.
+pub fn decode_any_info(path: &str, page: u32) -> Result<ImageInfo, CrabMagickError> {
+    let bytes = read_file_bytes(path)?;
     match detect_format(&bytes) {
         SourceFormat::Jxl => decode_jxl_info_from_bytes(&bytes),
         SourceFormat::Svg => decode_svg_info(&bytes),
@@ -263,8 +530,8 @@ pub fn decode_any_info(path: &str, page: u32) -> Result<ImageInfo, OxipixError> 
             }
             #[cfg(not(feature = "pdf"))]
             {
-                return Err(OxipixError::Decode(
-                    "PDF support not compiled in (enable the `pdf` feature)".to_string(),
+                return Err(decode_unsupported_format(
+                    "PDF decoding is unavailable in this build; enable the `pdf` feature",
                 ));
             }
         }
@@ -279,8 +546,8 @@ pub fn decode_any_info(path: &str, page: u32) -> Result<ImageInfo, OxipixError> 
             }
             #[cfg(not(feature = "avif"))]
             {
-                return Err(OxipixError::Decode(
-                    "AVIF support not compiled in (enable the `avif` feature)".to_string(),
+                return Err(decode_unsupported_format(
+                    "AVIF decoding is unavailable in this build; enable the `avif` feature",
                 ));
             }
         }
@@ -290,223 +557,327 @@ pub fn decode_any_info(path: &str, page: u32) -> Result<ImageInfo, OxipixError> 
         | SourceFormat::Tiff
         | SourceFormat::Gif
         | SourceFormat::Bmp => {
-            let image =
-                image::load_from_memory(&bytes).map_err(|e| OxipixError::Decode(e.to_string()))?;
+            let image = image::load_from_memory(&bytes)
+                .map_err(|error| decode_malformed(format!("source image decode failed: {error}")))?;
             let (width, height) = image.dimensions();
             Ok(ImageInfo { width, height })
         }
-        SourceFormat::Unknown => Err(OxipixError::Decode(
-            "unsupported or unrecognized image format".to_string(),
+        SourceFormat::Unknown => Err(decode_unsupported_format(
+            "file signature did not match any supported image format",
         )),
     }
 }
 
-pub(crate) fn decode_any_with_options(
+/// Decodes any supported source format with optional region and render hints.
+///
+/// # Performance
+///
+/// - Reuses the shared decoded-image LRU for cacheable full-image requests.
+/// - Routes JPEG and WebP through bundled fast decoders.
+/// - Sends JXL region requests directly to the partial-decode path.
+#[doc(hidden)]
+pub fn decode_any_with_options(
     path: &str,
     region: Option<(u32, u32, u32, u32)>,
     square: bool,
     page: u32,
     render_size: Option<(u32, u32)>,
-) -> Result<DecodedImage, OxipixError> {
-    let bytes = fs::read(path)?;
+) -> Result<DecodedImage, CrabMagickError> {
+    if region.is_none() && !square {
+        if let Some(image) = cached_full_decode(path, page) {
+            return Ok(image);
+        }
+    }
+
+    let bytes = read_file_bytes(path)?;
     let format = detect_format(&bytes);
 
     let image = match format {
-        SourceFormat::Jxl => decode_jxl_any(&bytes, region, square)?,
-        SourceFormat::Jpeg
-        | SourceFormat::Png
-        | SourceFormat::Webp
-        | SourceFormat::Gif
-        | SourceFormat::Bmp => apply_post_decode_ops(decode_via_image(&bytes)?, region, square),
+        SourceFormat::Jxl => {
+            if let Some((x, y, w, h)) = region {
+                decode_jxl_region_from_bytes_with_hint(&bytes, x, y, w, h, render_size)?
+            } else if square {
+                let info = decode_jxl_info_from_bytes(&bytes)?;
+                let side = info.width.min(info.height);
+                let left = (info.width - side) / 2;
+                let top = (info.height - side) / 2;
+                decode_jxl_region_from_bytes_with_hint(&bytes, left, top, side, side, render_size)?
+            } else {
+                decode_jxl_from_bytes_with_hint(&bytes, render_size)?
+            }
+        }
+        SourceFormat::Jpeg => {
+            let decoded = decode_jpeg_fast(&bytes).or_else(|_| decode_via_image(&bytes))?;
+            apply_post_decode_ops(decoded, region, square)?
+        }
+        SourceFormat::Png | SourceFormat::Gif | SourceFormat::Bmp => {
+            apply_post_decode_ops(decode_via_image(&bytes)?, region, square)?
+        }
+        SourceFormat::Webp => apply_post_decode_ops(decode_webp_fast(&bytes)?, region, square)?,
         SourceFormat::Tiff => {
-            apply_post_decode_ops(decode_tiff_page(&bytes, page)?, region, square)
+            apply_post_decode_ops(decode_tiff_page(&bytes, page)?, region, square)?
         }
         SourceFormat::Svg => {
             let (out_w, out_h) = render_size.unwrap_or((0, 0));
-            apply_post_decode_ops(decode_svg(&bytes, out_w, out_h)?, region, square)
+            apply_post_decode_ops(decode_svg(&bytes, out_w, out_h)?, region, square)?
         }
         SourceFormat::Pdf => {
             #[cfg(feature = "pdf")]
             {
                 let (out_w, out_h) = render_size.unwrap_or((0, 0));
-                apply_post_decode_ops(decode_pdf_page(&bytes, page, out_w, out_h)?, region, square)
+                apply_post_decode_ops(decode_pdf_page(&bytes, page, out_w, out_h)?, region, square)?
             }
             #[cfg(not(feature = "pdf"))]
             {
-                return Err(OxipixError::Decode(
-                    "PDF support not compiled in (enable the `pdf` feature)".to_string(),
+                return Err(decode_unsupported_format(
+                    "PDF decoding is unavailable in this build; enable the `pdf` feature",
                 ));
             }
         }
         SourceFormat::Avif => {
             #[cfg(feature = "avif")]
             {
-                apply_post_decode_ops(decode_via_image(&bytes)?, region, square)
+                apply_post_decode_ops(decode_via_image(&bytes)?, region, square)?
             }
             #[cfg(not(feature = "avif"))]
             {
-                return Err(OxipixError::Decode(
-                    "AVIF support not compiled in (enable the `avif` feature)".to_string(),
+                return Err(decode_unsupported_format(
+                    "AVIF decoding is unavailable in this build; enable the `avif` feature",
                 ));
             }
         }
         SourceFormat::Unknown => {
-            return Err(OxipixError::Decode(
-                "unsupported or unrecognized image format".to_string(),
+            return Err(decode_unsupported_format(
+                "file signature did not match any supported image format",
             ));
         }
     };
 
+    if cacheable_full_decode(format, region, square) {
+        store_cached_full_decode(path, page, &image);
+    }
+
     Ok(image)
 }
 
-pub fn resize_rgb(img: DecodedImage, out_w: u32, out_h: u32) -> DecodedImage {
-    if img.width == 0 || img.height == 0 {
-        return img;
+// ── Image transforms ─────────────────────────────────────────────────────────
+
+/// Resizes a packed RGB image while preserving aspect ratio when one dimension is `0`.
+///
+/// # Performance
+///
+/// Uses `fast_image_resize` with a downscale-friendly filter choice and avoids
+/// work when the output size matches the input size.
+#[inline]
+#[must_use]
+pub fn resize_rgb(
+    image: DecodedImage,
+    output_width: u32,
+    output_height: u32,
+) -> DecodedImage {
+    if image.width == 0 || image.height == 0 {
+        return image;
     }
 
-    let (target_w, target_h) = resolve_output_size(img.width, img.height, out_w, out_h);
-    if target_w == img.width && target_h == img.height {
-        return img;
+    let (target_width, target_height) =
+        resolve_output_size(image.width, image.height, output_width, output_height);
+    if target_width == image.width && target_height == image.height {
+        return image;
     }
 
-    let filter = if target_w < img.width / 2 || target_h < img.height / 2 {
+    let filter = if target_width < image.width / 2 || target_height < image.height / 2 {
         fir::FilterType::Bilinear
     } else {
         fir::FilterType::CatmullRom
     };
 
-    let src =
-        fir::images::Image::from_vec_u8(img.width, img.height, img.pixels, fir::PixelType::U8x3)
-            .expect("validated RGB buffer");
-    let mut dst = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x3);
+    let source = fir::images::Image::from_vec_u8(
+        image.width,
+        image.height,
+        image.pixels,
+        fir::PixelType::U8x3,
+    )
+    .expect("validated RGB buffer");
+    let mut destination =
+        fir::images::Image::new(target_width, target_height, fir::PixelType::U8x3);
 
     let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(filter));
     fir::Resizer::new()
-        .resize(&src, &mut dst, Some(&options))
+        .resize(&source, &mut destination, Some(&options))
         .expect("resize should succeed for RGB buffers");
 
     DecodedImage {
-        pixels: dst.buffer().to_vec(),
-        width: target_w,
-        height: target_h,
+        pixels: destination.buffer().to_vec(),
+        width: target_width,
+        height: target_height,
     }
 }
 
-pub fn rotate_rgb(img: DecodedImage, degrees: u16) -> DecodedImage {
+/// Rotates a packed RGB image clockwise by `0`, `90`, `180`, or `270` degrees.
+///
+/// # Performance
+///
+/// The outer row loop is parallelized with Rayon for all non-trivial rotations.
+#[inline]
+#[must_use]
+pub fn rotate_rgb(image: DecodedImage, degrees: u16) -> DecodedImage {
     match degrees % 360 {
-        0 => img,
+        0 => image,
         180 => {
-            let mut pixels = vec![0u8; img.pixels.len()];
-            let stride = img.width as usize * 3;
-            for row in 0..img.height as usize {
-                let src = &img.pixels[(img.height as usize - 1 - row) * stride..][..stride];
-                let dst = &mut pixels[row * stride..][..stride];
-                for col in 0..img.width as usize {
-                    dst[col * 3..col * 3 + 3]
-                        .copy_from_slice(&src[(img.width as usize - 1 - col) * 3..][..3]);
-                }
-            }
+            let width = image.width;
+            let height = image.height;
+            let stride = width as usize * 3;
+            let src_pixels = image.pixels;
+            let src_height = height as usize;
+            let src_width = width as usize;
+            let mut pixels = vec![0u8; src_pixels.len()];
+            pixels
+                .par_chunks_mut(stride)
+                .enumerate()
+                .for_each(|(row, dst)| {
+                    let src = &src_pixels[(src_height - 1 - row) * stride..][..stride];
+                    for col in 0..src_width {
+                        dst[col * 3..col * 3 + 3]
+                            .copy_from_slice(&src[(src_width - 1 - col) * 3..][..3]);
+                    }
+                });
             DecodedImage {
                 pixels,
-                width: img.width,
-                height: img.height,
+                width,
+                height,
             }
         }
         90 => {
-            let (ow, oh) = (img.width as usize, img.height as usize);
-            let mut pixels = vec![0u8; img.pixels.len()];
-            for row in 0..oh {
-                for col in 0..ow {
-                    let src = &img.pixels[(row * ow + col) * 3..][..3];
-                    let dst_row = col;
-                    let dst_col = oh - 1 - row;
-                    pixels[(dst_row * oh + dst_col) * 3..][..3].copy_from_slice(src);
-                }
-            }
+            let width = image.width;
+            let height = image.height;
+            let (ow, oh) = (width as usize, height as usize);
+            let src_pixels = image.pixels;
+            let mut pixels = vec![0u8; src_pixels.len()];
+            pixels
+                .par_chunks_mut(oh * 3)
+                .enumerate()
+                .for_each(|(dst_row, dst_chunk)| {
+                    for dst_col in 0..oh {
+                        let src_row = oh - 1 - dst_col;
+                        let src_col = dst_row;
+                        dst_chunk[dst_col * 3..dst_col * 3 + 3]
+                            .copy_from_slice(&src_pixels[(src_row * ow + src_col) * 3..][..3]);
+                    }
+                });
             DecodedImage {
                 pixels,
-                width: img.height,
-                height: img.width,
+                width: height,
+                height: width,
             }
         }
         270 => {
-            let (ow, oh) = (img.width as usize, img.height as usize);
-            let mut pixels = vec![0u8; img.pixels.len()];
-            for row in 0..oh {
-                for col in 0..ow {
-                    let src = &img.pixels[(row * ow + col) * 3..][..3];
-                    let dst_row = ow - 1 - col;
-                    let dst_col = row;
-                    pixels[(dst_row * oh + dst_col) * 3..][..3].copy_from_slice(src);
-                }
-            }
+            let width = image.width;
+            let height = image.height;
+            let (ow, oh) = (width as usize, height as usize);
+            let src_pixels = image.pixels;
+            let mut pixels = vec![0u8; src_pixels.len()];
+            pixels
+                .par_chunks_mut(oh * 3)
+                .enumerate()
+                .for_each(|(dst_row, dst_chunk)| {
+                    for dst_col in 0..oh {
+                        let src_row = dst_col;
+                        let src_col = ow - 1 - dst_row;
+                        dst_chunk[dst_col * 3..dst_col * 3 + 3]
+                            .copy_from_slice(&src_pixels[(src_row * ow + src_col) * 3..][..3]);
+                    }
+                });
             DecodedImage {
                 pixels,
-                width: img.height,
-                height: img.width,
+                width: height,
+                height: width,
             }
         }
-        _ => img,
+        _ => image,
     }
 }
 
+// ── Encode entry points ──────────────────────────────────────────────────────
+
+/// Encodes a packed RGB image into one of CrabMagick's output formats.
+///
+/// # Performance
+///
+/// Reuses format-specific fast paths and avoids constructing intermediary image
+/// wrappers except where the downstream encoder requires them.
+#[inline]
+#[must_use]
 pub fn encode(
-    img: DecodedImage,
+    image: DecodedImage,
     format: OutputFormat,
     quality: u8,
-) -> Result<Vec<u8>, OxipixError> {
+) -> Result<Vec<u8>, CrabMagickError> {
     let DecodedImage {
         pixels,
         width,
         height,
-    } = img;
-    let rgb = RgbImage::from_raw(width, height, pixels)
-        .ok_or_else(|| OxipixError::Encode("invalid RGB buffer dimensions".to_string()))?;
+    } = image;
 
     match format {
         OutputFormat::Jpeg => {
+            // TODO: plumb jxl-oxide's planar render buffers directly into zenjpeg once the
+            // encoder exposes a non-packed RGB/YCbCr entry point. Today the hot path still
+            // expects packed RGB8 slices, so JXL->JPEG keeps this intermediate representation.
             let config = EncoderConfig::ycbcr(quality.min(100), ChromaSubsampling::Quarter);
             let mut enc = config
-                .encode_from_bytes(rgb.width(), rgb.height(), ZenLayout::Rgb8Srgb)
-                .map_err(|e| OxipixError::Encode(e.to_string()))?;
-            enc.push_packed(rgb.as_raw(), Unstoppable)
-                .map_err(|e| OxipixError::Encode(e.to_string()))?;
-            enc.finish().map_err(|e| OxipixError::Encode(e.to_string()))
+                .encode_from_bytes(width, height, ZenLayout::Rgb8Srgb)
+                .map_err(|error| encode_error(format!("JPEG encoder initialization failed: {error}")))?;
+            enc.push_packed(&pixels, Unstoppable)
+                .map_err(|error| encode_error(format!("JPEG pixel upload failed: {error}")))?;
+            enc.finish()
+                .map_err(|error| encode_error(format!("JPEG finalization failed: {error}")))
         }
-        OutputFormat::Webp => fast_webp::encode_lossy_webp(&rgb, quality.min(100))
-            .map_err(|e| OxipixError::Encode(e.to_string())),
+        OutputFormat::Webp => {
+            let rgb = RgbImage::from_raw(width, height, pixels)
+                .ok_or_else(|| encode_error("WebP encoding received an invalid RGB buffer shape"))?;
+            crate::fast_webp::encode_lossy_webp(&rgb, quality.min(100))
+                .map_err(|error| encode_error(format!("WebP encoding failed: {error}")))
+        }
         OutputFormat::Png => {
             let mut out = Vec::new();
             PngEncoder::new(&mut out)
                 .write_image(
-                    rgb.as_raw(),
-                    rgb.width(),
-                    rgb.height(),
+                    &pixels,
+                    width,
+                    height,
                     ColorType::Rgb8.into(),
                 )
-                .map_err(|e| OxipixError::Encode(e.to_string()))?;
+                .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
             Ok(out)
         }
         OutputFormat::Jxl => encode_jxl_rgb(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
+            &pixels,
+            width,
+            height,
             &JxlEncodeOptions {
                 distance: Some(distance_from_quality(quality)),
                 ..JxlEncodeOptions::default()
             },
         ),
-        OutputFormat::Avif => encode_avif_rgb(rgb.as_raw(), rgb.width(), rgb.height(), quality),
+        OutputFormat::Avif => encode_avif_rgb(&pixels, width, height, quality),
     }
 }
 
+/// Encodes packed RGB pixels into JPEG XL using bundled encoder modules.
+///
+/// # Performance
+///
+/// Keeps the call entirely within the bundled same-crate encoder stack so the
+/// optimizer can inline configuration and dispatch code across former crate
+/// boundaries.
+#[inline]
+#[must_use]
 pub fn encode_jxl_rgb(
     pixels: &[u8],
     width: u32,
     height: u32,
     options: &JxlEncodeOptions,
-) -> Result<Vec<u8>, OxipixError> {
+) -> Result<Vec<u8>, CrabMagickError> {
     if options.lossless {
         let mut config = LosslessConfig::new()
             .with_effort(options.effort)
@@ -526,7 +897,7 @@ pub fn encode_jxl_rgb(
         }
         config
             .encode(pixels, width, height, JxlLayout::Rgb8)
-            .map_err(|e| OxipixError::Encode(e.to_string()))
+            .map_err(|error| encode_error(format!("lossless JPEG XL encoding failed: {error}")))
     } else {
         let mut config = LossyConfig::new(options.distance.unwrap_or(1.0))
             .with_effort(options.effort)
@@ -579,30 +950,13 @@ pub fn encode_jxl_rgb(
         }
         config
             .encode(pixels, width, height, JxlLayout::Rgb8)
-            .map_err(|e| OxipixError::Encode(e.to_string()))
+            .map_err(|error| encode_error(format!("lossy JPEG XL encoding failed: {error}")))
     }
 }
 
-fn decode_jxl_any(
-    bytes: &[u8],
-    region: Option<(u32, u32, u32, u32)>,
-    square: bool,
-) -> Result<DecodedImage, OxipixError> {
-    if let Some((x, y, w, h)) = region {
-        return decode_jxl_region_from_bytes(bytes, x, y, w, h);
-    }
-    if square {
-        let info = decode_jxl_info_from_bytes(bytes)?;
-        let side = info.width.min(info.height);
-        let left = (info.width - side) / 2;
-        let top = (info.height - side) / 2;
-        return decode_jxl_region_from_bytes(bytes, left, top, side, side);
-    }
-    decode_jxl_from_bytes(bytes)
-}
-
-fn decode_via_image(bytes: &[u8]) -> Result<DecodedImage, OxipixError> {
-    let image = image::load_from_memory(bytes).map_err(|e| OxipixError::Decode(e.to_string()))?;
+fn decode_via_image(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    let image = image::load_from_memory(bytes)
+        .map_err(|error| decode_malformed(format!("generic image decode failed: {error}")))?;
     let rgb = image.to_rgb8();
     Ok(DecodedImage {
         width: rgb.width(),
@@ -611,10 +965,69 @@ fn decode_via_image(bytes: &[u8]) -> Result<DecodedImage, OxipixError> {
     })
 }
 
-fn decode_svg(bytes: &[u8], out_w: u32, out_h: u32) -> Result<DecodedImage, OxipixError> {
+#[inline]
+fn decode_jpeg_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    use crate::zune_core::bytestream::ZCursor;
+    use crate::zune_core::colorspace::ColorSpace;
+    use crate::zune_core::options::DecoderOptions;
+    use crate::zune_jpeg::JpegDecoder;
+
+    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
+    decoder
+        .decode_headers()
+        .map_err(|e| decode_malformed(format!("JPEG header: {e}")))?;
+    let pixels = decoder
+        .decode()
+        .map_err(|e| decode_malformed(format!("JPEG decode: {e}")))?;
+    let (width, height) = decoder
+        .dimensions()
+        .ok_or_else(|| decode_malformed("JPEG: no dimensions after decode"))?;
+    Ok(DecodedImage {
+        pixels,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
+#[inline]
+fn decode_webp_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    let reader = BufReader::new(Cursor::new(bytes));
+    let mut decoder = crate::fast_webp::WebPDecoder::new(reader)
+        .map_err(|error| decode_malformed(format!("WebP decoder initialization failed: {error}")))?;
+    let (width, height) = decoder.dimensions();
+    let has_alpha = decoder.has_alpha();
+    let mut decoded = vec![
+        0u8;
+        decoder
+            .output_buffer_size()
+            .ok_or_else(|| decode_malformed("WebP output buffer would exceed addressable memory"))?
+    ];
+    decoder
+        .read_image(&mut decoded)
+        .map_err(|error| decode_malformed(format!("WebP pixel decode failed: {error}")))?;
+
+    let pixels = if has_alpha {
+        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        for rgba in decoded.chunks_exact(4) {
+            rgb.extend_from_slice(&rgba[..3]);
+        }
+        rgb
+    } else {
+        decoded
+    };
+
+    Ok(DecodedImage {
+        pixels,
+        width,
+        height,
+    })
+}
+
+fn decode_svg(bytes: &[u8], out_w: u32, out_h: u32) -> Result<DecodedImage, CrabMagickError> {
     let options = usvg::Options::default();
-    let tree =
-        usvg::Tree::from_data(bytes, &options).map_err(|e| OxipixError::Decode(e.to_string()))?;
+    let tree = usvg::Tree::from_data(bytes, &options)
+        .map_err(|error| decode_malformed(format!("SVG parsing failed: {error}")))?;
 
     let natural = tree.size().to_int_size();
     let (width, height) = resolve_output_size(natural.width(), natural.height(), out_w, out_h);
@@ -623,7 +1036,7 @@ fn decode_svg(bytes: &[u8], out_w: u32, out_h: u32) -> Result<DecodedImage, Oxip
     let transform = tiny_skia::Transform::from_scale(sx, sy);
 
     let mut pixmap = tiny_skia::Pixmap::new(width, height)
-        .ok_or_else(|| OxipixError::Decode("failed to allocate SVG raster surface".to_string()))?;
+        .ok_or_else(|| decode_malformed("failed to allocate the SVG raster surface"))?;
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     let mut pixels = Vec::with_capacity((width * height * 3) as usize);
@@ -646,10 +1059,10 @@ fn decode_svg(bytes: &[u8], out_w: u32, out_h: u32) -> Result<DecodedImage, Oxip
     })
 }
 
-fn decode_svg_info(bytes: &[u8]) -> Result<ImageInfo, OxipixError> {
+fn decode_svg_info(bytes: &[u8]) -> Result<ImageInfo, CrabMagickError> {
     let options = usvg::Options::default();
-    let tree =
-        usvg::Tree::from_data(bytes, &options).map_err(|e| OxipixError::Decode(e.to_string()))?;
+    let tree = usvg::Tree::from_data(bytes, &options)
+        .map_err(|error| decode_malformed(format!("SVG parsing failed: {error}")))?;
     let size = tree.size().to_int_size();
     Ok(ImageInfo {
         width: size.width(),
@@ -663,15 +1076,15 @@ fn decode_pdf_page(
     page: u32,
     out_w: u32,
     out_h: u32,
-) -> Result<DecodedImage, OxipixError> {
+) -> Result<DecodedImage, CrabMagickError> {
     let pdfium = Pdfium::default();
     let document = pdfium
         .load_pdf_from_byte_vec(bytes.to_vec(), None)
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+        .map_err(|error| decode_malformed(format!("PDF loading failed: {error}")))?;
     let page = document
         .pages()
         .get(page as u16)
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+        .map_err(|error| decode_malformed(format!("PDF page lookup failed: {error}")))?;
 
     let mut config = PdfRenderConfig::new();
     if out_w > 0 {
@@ -683,7 +1096,7 @@ fn decode_pdf_page(
 
     let image = page
         .render_with_config(&config)
-        .map_err(|e| OxipixError::Decode(e.to_string()))?
+        .map_err(|error| decode_malformed(format!("PDF rasterization failed: {error}")))?
         .as_image();
     let rgb = image.to_rgb8();
     Ok(DecodedImage {
@@ -693,32 +1106,33 @@ fn decode_pdf_page(
     })
 }
 
-fn decode_tiff_page(bytes: &[u8], page: u32) -> Result<DecodedImage, OxipixError> {
+fn decode_tiff_page(bytes: &[u8], page: u32) -> Result<DecodedImage, CrabMagickError> {
     let cursor = Cursor::new(bytes);
     let reader = BufReader::new(cursor);
-    let mut decoder = TiffDecoder::new(reader).map_err(|e| OxipixError::Decode(e.to_string()))?;
+    let mut decoder = TiffDecoder::new(reader)
+        .map_err(|error| decode_malformed(format!("TIFF decoder initialization failed: {error}")))?;
 
     for _ in 0..page {
         if decoder.more_images() {
             decoder
                 .next_image()
-                .map_err(|e| OxipixError::Decode(e.to_string()))?;
+                .map_err(|error| decode_malformed(format!("TIFF page advance failed: {error}")))?;
         } else {
-            return Err(OxipixError::Decode(format!(
-                "TIFF page {page} out of range"
+            return Err(decode_malformed(format!(
+                "TIFF page index {page} is out of range for this file",
             )));
         }
     }
 
     let (width, height) = decoder
         .dimensions()
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+        .map_err(|error| decode_malformed(format!("TIFF dimension read failed: {error}")))?;
     let color = decoder
         .colortype()
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+        .map_err(|error| decode_malformed(format!("TIFF color-type read failed: {error}")))?;
     let image = decoder
         .read_image()
-        .map_err(|e| OxipixError::Decode(e.to_string()))?;
+        .map_err(|error| decode_malformed(format!("TIFF pixel decode failed: {error}")))?;
 
     tiff_to_rgb(image, color, width, height)
 }
@@ -728,7 +1142,7 @@ fn tiff_to_rgb(
     color: tiff::ColorType,
     width: u32,
     height: u32,
-) -> Result<DecodedImage, OxipixError> {
+) -> Result<DecodedImage, CrabMagickError> {
     match (image, color) {
         (DecodingResult::U8(data), tiff::ColorType::Gray(8)) => {
             let mut pixels = Vec::with_capacity((width * height * 3) as usize);
@@ -792,8 +1206,8 @@ fn tiff_to_rgb(
                 height,
             })
         }
-        _ => Err(OxipixError::Decode(
-            "unsupported TIFF pixel format".to_string(),
+        _ => Err(decode_unsupported_format(
+            "TIFF pixel format is unsupported; only Gray/RGB/RGBA 8-bit and 16-bit images are supported",
         )),
     }
 }
@@ -843,66 +1257,74 @@ fn planar_to_rgb(
 }
 
 fn apply_post_decode_ops(
-    img: DecodedImage,
+    image: DecodedImage,
     region: Option<(u32, u32, u32, u32)>,
     square: bool,
-) -> DecodedImage {
+) -> Result<DecodedImage, CrabMagickError> {
     if let Some((x, y, w, h)) = region {
-        return apply_region(img, x, y, w, h);
+        let requested_region = RequestedRegion::new(x, y, w, h);
+        let image_info = ImageInfo {
+            width: image.width,
+            height: image.height,
+        };
+        validate_requested_region(requested_region, image_info)?;
+        return Ok(apply_region(image, requested_region));
     }
     if square {
-        return square_crop(img);
+        return Ok(square_crop(image));
     }
-    img
+    Ok(image)
 }
 
-fn apply_region(img: DecodedImage, x: u32, y: u32, w: u32, h: u32) -> DecodedImage {
-    if w == 0 || h == 0 {
-        return img;
+fn validate_requested_region(
+    region: RequestedRegion,
+    image: ImageInfo,
+) -> Result<(), CrabMagickError> {
+    if region.width == 0 || region.height == 0 {
+        return Err(decode_malformed(
+            "requested region width and height must both be greater than zero",
+        ));
     }
 
-    let start_x = x.min(img.width);
-    let start_y = y.min(img.height);
-    let end_x = start_x.saturating_add(w).min(img.width);
-    let end_y = start_y.saturating_add(h).min(img.height);
-    let crop_w = end_x.saturating_sub(start_x);
-    let crop_h = end_y.saturating_sub(start_y);
+    if image.contains_region(region) {
+        Ok(())
+    } else {
+        Err(region_out_of_bounds(region, image))
+    }
+}
 
-    if crop_w == 0 || crop_h == 0 {
-        return DecodedImage {
-            pixels: Vec::new(),
-            width: 0,
-            height: 0,
-        };
+fn apply_region(image: DecodedImage, region: RequestedRegion) -> DecodedImage {
+    if region.left == 0
+        && region.top == 0
+        && region.width == image.width
+        && region.height == image.height
+    {
+        return image;
     }
 
-    if crop_w == img.width && crop_h == img.height && start_x == 0 && start_y == 0 {
-        return img;
-    }
+    let source_stride = image.width as usize * 3;
+    let destination_stride = region.width as usize * 3;
+    let mut pixels = vec![0u8; (region.width * region.height * 3) as usize];
 
-    let src_stride = img.width as usize * 3;
-    let dst_stride = crop_w as usize * 3;
-    let mut pixels = vec![0u8; (crop_w * crop_h * 3) as usize];
-
-    for row in 0..crop_h as usize {
-        let src_offset = (start_y as usize + row) * src_stride + start_x as usize * 3;
-        let dst_offset = row * dst_stride;
-        pixels[dst_offset..dst_offset + dst_stride]
-            .copy_from_slice(&img.pixels[src_offset..src_offset + dst_stride]);
+    for row in 0..region.height as usize {
+        let src_offset = (region.top as usize + row) * source_stride + region.left as usize * 3;
+        let dst_offset = row * destination_stride;
+        pixels[dst_offset..dst_offset + destination_stride]
+            .copy_from_slice(&image.pixels[src_offset..src_offset + destination_stride]);
     }
 
     DecodedImage {
         pixels,
-        width: crop_w,
-        height: crop_h,
+        width: region.width,
+        height: region.height,
     }
 }
 
-fn square_crop(img: DecodedImage) -> DecodedImage {
-    let side = img.width.min(img.height);
-    let x = (img.width - side) / 2;
-    let y = (img.height - side) / 2;
-    apply_region(img, x, y, side, side)
+fn square_crop(image: DecodedImage) -> DecodedImage {
+    let side = image.width.min(image.height);
+    let region =
+        RequestedRegion::new((image.width - side) / 2, (image.height - side) / 2, side, side);
+    apply_region(image, region)
 }
 
 fn encode_avif_rgb(
@@ -910,7 +1332,7 @@ fn encode_avif_rgb(
     width: u32,
     height: u32,
     quality: u8,
-) -> Result<Vec<u8>, OxipixError> {
+) -> Result<Vec<u8>, CrabMagickError> {
     #[cfg(feature = "avif")]
     {
         let pixels: Vec<AvifRgb8> = pixels
@@ -925,14 +1347,14 @@ fn encode_avif_rgb(
                 width as usize,
                 height as usize,
             ))
-            .map_err(|e| OxipixError::Encode(e.to_string()))?;
+            .map_err(|error| encode_error(format!("AVIF encoding failed: {error}")))?;
         Ok(encoded.avif_file)
     }
     #[cfg(not(feature = "avif"))]
     {
         let _ = (pixels, width, height, quality);
-        Err(OxipixError::Encode(
-            "AVIF output not compiled in (enable the `avif` feature)".to_string(),
+        Err(encode_error(
+            "AVIF output is unavailable in this build; enable the `avif` feature",
         ))
     }
 }
@@ -956,3 +1378,4 @@ fn distance_from_quality(quality: u8) -> f32 {
     let quality = quality.clamp(1, 100) as f32;
     (100.0 - quality) / 25.0 + 0.5
 }
+
