@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "crabmagick-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aligned-vec",
  "archmage",

@@ -283,7 +283,9 @@ impl Histogram {
     /// out-of-order engine while preserving exact sequential semantics.
     #[inline(always)]
     fn decode_symbol_once(&self, bitstream: &mut Bitstream, state: &mut u32) -> CodingResult<u32> {
-        assert_eq!(std::mem::size_of::<Bucket>(), 8);
+        // `size_of::<Bucket>() == 8` is guaranteed at compile time by the `const _` assertion
+        // above, so the transmute below is always valid. Keeping the check out of this
+        // `#[inline(always)]` hot path avoids a redundant per-symbol branch in unoptimized builds.
         let is_le = usize::from_le(1) == 1;
 
         let idx = *state & 0xfff;
