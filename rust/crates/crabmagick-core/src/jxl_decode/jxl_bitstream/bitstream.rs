@@ -52,8 +52,15 @@ impl<'buf> Bitstream<'buf> {
 
 impl Bitstream<'_> {
     /// Fills bit buffer from byte buffer.
-    #[inline]
+    #[inline(always)]
     fn refill(&mut self) {
+        if self.remaining_buf_bits < 56 {
+            self.refill_inner();
+        }
+    }
+
+    #[inline(never)]
+    fn refill_inner(&mut self) {
         if let &[b0, b1, b2, b3, b4, b5, b6, b7, ..] = self.bytes {
             let bits = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
             self.buf |= bits << self.remaining_buf_bits;

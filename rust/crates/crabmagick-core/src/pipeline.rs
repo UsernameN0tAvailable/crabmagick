@@ -1,7 +1,11 @@
 //! Low-level decode, transform, and encode primitives used by CrabMagick.
 
 // Allow cfg-guarded returns and chunk patterns that can't use unstable as_chunks.
-#![allow(clippy::needless_return, clippy::collapsible_if, clippy::chunks_exact_to_as_chunks)]
+#![allow(
+    clippy::needless_return,
+    clippy::collapsible_if,
+    clippy::chunks_exact_to_as_chunks
+)]
 
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
@@ -9,9 +13,9 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, PixelFormat};
 use fast_image_resize as fir;
 use image::{codecs::png::PngEncoder, ColorType, GenericImageView, ImageEncoder, RgbImage};
-use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, PixelFormat};
 use lru::LruCache;
 use memmap2::Mmap;
 #[cfg(feature = "pdf")]
@@ -22,11 +26,11 @@ use rayon::prelude::*;
 use resvg::{tiny_skia, usvg};
 use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
 
-use crate::jxl_encode::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
-use crate::processor::{CrabMagickError, ImageInfo, OutputFormat, RequestedRegion};
 use crate::jpeg_encode::encoder::{
     ChromaSubsampling, EncoderConfig, PixelLayout as ZenLayout, Unstoppable,
 };
+use crate::jxl_encode::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
+use crate::processor::{CrabMagickError, ImageInfo, OutputFormat, RequestedRegion};
 
 // ── Core image and cache types ───────────────────────────────────────────────
 
@@ -146,7 +150,11 @@ fn decoded_image_cache() -> &'static Mutex<DecodedImageCache> {
     DECODED_IMAGE_CACHE.get_or_init(|| Mutex::new(DecodedImageCache::new(0)))
 }
 
-fn cacheable_full_decode(format: SourceFormat, region: Option<(u32, u32, u32, u32)>, square: bool) -> bool {
+fn cacheable_full_decode(
+    format: SourceFormat,
+    region: Option<(u32, u32, u32, u32)>,
+    square: bool,
+) -> bool {
     region.is_none()
         && !square
         && matches!(
@@ -377,16 +385,36 @@ fn decode_jxl_from_bytes_with_hint(
     let frame = image
         .render_frame(0)
         .map_err(|error| decode_malformed(format!("JPEG XL frame rendering failed: {error}")))?;
-    let planes = frame.image_planar();
 
-    Ok(planar_to_rgb(
-        image.pixel_format(),
+    let width = image.width();
+    let height = image.height();
+    let pixel_format = image.pixel_format();
+
+    // Fast path: zero-copy — access the AlignedGrid<f32> buffers directly without
+    // allocating new FrameBuffers or doing the scalar per-pixel copy in `from_grids`.
+    if let Some(raw) = frame.color_channels_raw_f32() {
+        let result = planar_to_rgb(
+            pixel_format,
+            raw[0],
+            raw.get(1).copied(),
+            raw.get(2).copied(),
+            width,
+            height,
+        );
+        return Ok(result);
+    }
+
+    // Slow path: orientation != 1 or non-f32 channels
+    let planes = frame.image_planar();
+    let result = planar_to_rgb(
+        pixel_format,
         planes[0].buf(),
         planes.get(1).map(|plane| plane.buf()),
         planes.get(2).map(|plane| plane.buf()),
-        image.width(),
-        image.height(),
-    ))
+        width,
+        height,
+    );
+    Ok(result)
 }
 
 /// Decodes a rectangular JPEG XL region from disk into packed RGB pixels.
@@ -446,6 +474,26 @@ fn decode_jxl_region_from_bytes_with_hint(
     let frame = image
         .render_frame(0)
         .map_err(|error| decode_malformed(format!("JPEG XL region rendering failed: {error}")))?;
+    if let Some(raw) = frame.color_channels_raw_f32() {
+        if raw.is_empty() {
+            return Err(decode_malformed(
+                "JPEG XL decode produced no image planes for the requested region",
+            ));
+        }
+        // The raw buffer length equals rendered_width * rendered_height; derive from buffer.
+        let rendered_pixels = raw[0].len() as u32;
+        let rendered_h = height.min(image.height().saturating_sub(top));
+        let rendered_w = if rendered_h > 0 { rendered_pixels / rendered_h } else { 0 };
+        return Ok(planar_to_rgb(
+            image.pixel_format(),
+            raw[0],
+            raw.get(1).copied(),
+            raw.get(2).copied(),
+            rendered_w,
+            rendered_h,
+        ));
+    }
+
     let planes = frame.image_planar();
     if planes.is_empty() {
         return Err(decode_malformed(
@@ -557,8 +605,9 @@ pub fn decode_any_info(path: &str, page: u32) -> Result<ImageInfo, CrabMagickErr
         | SourceFormat::Tiff
         | SourceFormat::Gif
         | SourceFormat::Bmp => {
-            let image = image::load_from_memory(&bytes)
-                .map_err(|error| decode_malformed(format!("source image decode failed: {error}")))?;
+            let image = image::load_from_memory(&bytes).map_err(|error| {
+                decode_malformed(format!("source image decode failed: {error}"))
+            })?;
             let (width, height) = image.dimensions();
             Ok(ImageInfo { width, height })
         }
@@ -670,11 +719,7 @@ pub fn decode_any_with_options(
 /// work when the output size matches the input size.
 #[inline]
 #[must_use]
-pub fn resize_rgb(
-    image: DecodedImage,
-    output_width: u32,
-    output_height: u32,
-) -> DecodedImage {
+pub fn resize_rgb(image: DecodedImage, output_width: u32, output_height: u32) -> DecodedImage {
     if image.width == 0 || image.height == 0 {
         return image;
     }
@@ -826,27 +871,25 @@ pub fn encode(
             let config = EncoderConfig::ycbcr(quality.min(100), ChromaSubsampling::Quarter);
             let mut enc = config
                 .encode_from_bytes(width, height, ZenLayout::Rgb8Srgb)
-                .map_err(|error| encode_error(format!("JPEG encoder initialization failed: {error}")))?;
+                .map_err(|error| {
+                    encode_error(format!("JPEG encoder initialization failed: {error}"))
+                })?;
             enc.push_packed(&pixels, Unstoppable)
                 .map_err(|error| encode_error(format!("JPEG pixel upload failed: {error}")))?;
             enc.finish()
                 .map_err(|error| encode_error(format!("JPEG finalization failed: {error}")))
         }
         OutputFormat::Webp => {
-            let rgb = RgbImage::from_raw(width, height, pixels)
-                .ok_or_else(|| encode_error("WebP encoding received an invalid RGB buffer shape"))?;
+            let rgb = RgbImage::from_raw(width, height, pixels).ok_or_else(|| {
+                encode_error("WebP encoding received an invalid RGB buffer shape")
+            })?;
             crate::webp_decode::encode_lossy_webp(&rgb, quality.min(100))
                 .map_err(|error| encode_error(format!("WebP encoding failed: {error}")))
         }
         OutputFormat::Png => {
             let mut out = Vec::new();
             PngEncoder::new(&mut out)
-                .write_image(
-                    &pixels,
-                    width,
-                    height,
-                    ColorType::Rgb8.into(),
-                )
+                .write_image(&pixels, width, height, ColorType::Rgb8.into())
                 .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
             Ok(out)
         }
@@ -967,10 +1010,10 @@ fn decode_via_image(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
 
 #[inline]
 fn decode_jpeg_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    use crate::jpeg_decode::JpegDecoder;
     use crate::jpeg_decode_core::bytestream::ZCursor;
     use crate::jpeg_decode_core::colorspace::ColorSpace;
     use crate::jpeg_decode_core::options::DecoderOptions;
-    use crate::jpeg_decode::JpegDecoder;
 
     let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
@@ -993,15 +1036,18 @@ fn decode_jpeg_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
 #[inline]
 fn decode_webp_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
     let reader = BufReader::new(Cursor::new(bytes));
-    let mut decoder = crate::webp_decode::WebPDecoder::new(reader)
-        .map_err(|error| decode_malformed(format!("WebP decoder initialization failed: {error}")))?;
+    let mut decoder = crate::webp_decode::WebPDecoder::new(reader).map_err(|error| {
+        decode_malformed(format!("WebP decoder initialization failed: {error}"))
+    })?;
     let (width, height) = decoder.dimensions();
     let has_alpha = decoder.has_alpha();
     let mut decoded = vec![
         0u8;
         decoder
             .output_buffer_size()
-            .ok_or_else(|| decode_malformed("WebP output buffer would exceed addressable memory"))?
+            .ok_or_else(|| decode_malformed(
+                "WebP output buffer would exceed addressable memory"
+            ))?
     ];
     decoder
         .read_image(&mut decoded)
@@ -1109,8 +1155,9 @@ fn decode_pdf_page(
 fn decode_tiff_page(bytes: &[u8], page: u32) -> Result<DecodedImage, CrabMagickError> {
     let cursor = Cursor::new(bytes);
     let reader = BufReader::new(cursor);
-    let mut decoder = TiffDecoder::new(reader)
-        .map_err(|error| decode_malformed(format!("TIFF decoder initialization failed: {error}")))?;
+    let mut decoder = TiffDecoder::new(reader).map_err(|error| {
+        decode_malformed(format!("TIFF decoder initialization failed: {error}"))
+    })?;
 
     for _ in 0..page {
         if decoder.more_images() {
@@ -1220,31 +1267,42 @@ fn planar_to_rgb(
     width: u32,
     height: u32,
 ) -> DecodedImage {
-    #[inline(always)]
-    fn f32_to_u8(v: f32) -> u8 {
-        (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
-    }
-
     let mut pixels = vec![0u8; (width * height * 3) as usize];
     match pixel_format {
         PixelFormat::Gray | PixelFormat::Graya => {
-            for (chunk, &value) in pixels.chunks_exact_mut(3).zip(r.iter()) {
-                let gray = f32_to_u8(value);
-                chunk[0] = gray;
-                chunk[1] = gray;
-                chunk[2] = gray;
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("ssse3")
+                && std::is_x86_feature_detected!("fma")
+            {
+                unsafe {
+                    planar_to_rgb_gray_avx2(r, &mut pixels);
+                }
+            } else {
+                planar_to_rgb_gray_scalar(r, &mut pixels);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                planar_to_rgb_gray_scalar(r, &mut pixels);
             }
         }
         PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Cmyk | PixelFormat::Cmyka => {
             let g = g.expect("green plane present for RGB-like JXL image");
             let b = b.expect("blue plane present for RGB-like JXL image");
-            for (chunk, ((rv, gv), bv)) in pixels
-                .chunks_exact_mut(3)
-                .zip(r.iter().zip(g.iter()).zip(b.iter()))
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("ssse3")
+                && std::is_x86_feature_detected!("fma")
             {
-                chunk[0] = f32_to_u8(*rv);
-                chunk[1] = f32_to_u8(*gv);
-                chunk[2] = f32_to_u8(*bv);
+                unsafe {
+                    planar_to_rgb_rgb_avx2(r, g, b, &mut pixels);
+                }
+            } else {
+                planar_to_rgb_rgb_scalar(r, g, b, &mut pixels);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                planar_to_rgb_rgb_scalar(r, g, b, &mut pixels);
             }
         }
     }
@@ -1254,6 +1312,149 @@ fn planar_to_rgb(
         width,
         height,
     }
+}
+
+#[inline(always)]
+fn f32_to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+fn planar_to_rgb_gray_scalar(r: &[f32], out: &mut [u8]) {
+    for (chunk, &value) in out.chunks_exact_mut(3).zip(r.iter()) {
+        let gray = f32_to_u8(value);
+        chunk[0] = gray;
+        chunk[1] = gray;
+        chunk[2] = gray;
+    }
+}
+
+fn planar_to_rgb_rgb_scalar(r: &[f32], g: &[f32], b: &[f32], out: &mut [u8]) {
+    for (chunk, ((rv, gv), bv)) in out
+        .chunks_exact_mut(3)
+        .zip(r.iter().zip(g.iter()).zip(b.iter()))
+    {
+        chunk[0] = f32_to_u8(*rv);
+        chunk[1] = f32_to_u8(*gv);
+        chunk[2] = f32_to_u8(*bv);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[target_feature(enable = "avx2,ssse3,fma")]
+unsafe fn planar_to_rgb_rgb_avx2(r: &[f32], g: &[f32], b: &[f32], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(r.len(), g.len());
+    debug_assert_eq!(r.len(), b.len());
+    debug_assert_eq!(out.len(), r.len() * 3);
+
+    #[inline(always)]
+    unsafe fn quantize_u8x8(values: &[f32], index: usize) -> __m256i {
+        use std::arch::x86_64::*;
+
+        let zero = _mm256_setzero_ps();
+        let scale = _mm256_set1_ps(255.0);
+        let round = _mm256_set1_ps(0.5);
+        let max_u8 = _mm256_set1_ps(255.0);
+        let value = unsafe { _mm256_loadu_ps(values.as_ptr().add(index)) };
+        let value = _mm256_max_ps(value, zero);
+        let value = _mm256_fmadd_ps(value, scale, round);
+        let value = _mm256_min_ps(value, max_u8);
+        _mm256_cvttps_epi32(value)
+    }
+
+    #[inline(always)]
+    unsafe fn store_rgb_4pixels(dst: *mut u8, packed: __m128i, shuffle: __m128i) {
+        use std::arch::x86_64::*;
+
+        let packed = _mm_shuffle_epi8(packed, shuffle);
+        unsafe {
+            _mm_storel_epi64(dst.cast::<__m128i>(), packed);
+            std::ptr::write_unaligned(
+                dst.add(8).cast::<u32>(),
+                _mm_extract_epi32::<2>(packed) as u32,
+            );
+        }
+    }
+
+    let shuffle = _mm_setr_epi8(0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, 0, 0, 0, 0);
+    let zero = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 8 <= r.len() {
+        let ir = unsafe { quantize_u8x8(r, i) };
+        let ig = unsafe { quantize_u8x8(g, i) };
+        let ib = unsafe { quantize_u8x8(b, i) };
+        let rg16 = _mm256_packs_epi32(ir, ig);
+        let b016 = _mm256_packs_epi32(ib, zero);
+        let rgb8 = _mm256_packus_epi16(rg16, b016);
+        let lane0 = _mm256_castsi256_si128(rgb8);
+        let lane1 = _mm256_extracti128_si256::<1>(rgb8);
+        let dst = unsafe { out.as_mut_ptr().add(i * 3) };
+        unsafe {
+            store_rgb_4pixels(dst, lane0, shuffle);
+            store_rgb_4pixels(dst.add(12), lane1, shuffle);
+        }
+        i += 8;
+    }
+
+    planar_to_rgb_rgb_scalar(&r[i..], &g[i..], &b[i..], &mut out[i * 3..]);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[target_feature(enable = "avx2,ssse3,fma")]
+unsafe fn planar_to_rgb_gray_avx2(r: &[f32], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(out.len(), r.len() * 3);
+
+    #[inline(always)]
+    unsafe fn quantize_u8x8(values: &[f32], index: usize) -> __m256i {
+        use std::arch::x86_64::*;
+
+        let zero = _mm256_setzero_ps();
+        let scale = _mm256_set1_ps(255.0);
+        let round = _mm256_set1_ps(0.5);
+        let max_u8 = _mm256_set1_ps(255.0);
+        let value = unsafe { _mm256_loadu_ps(values.as_ptr().add(index)) };
+        let value = _mm256_max_ps(value, zero);
+        let value = _mm256_fmadd_ps(value, scale, round);
+        let value = _mm256_min_ps(value, max_u8);
+        _mm256_cvttps_epi32(value)
+    }
+
+    #[inline(always)]
+    unsafe fn store_rgb_4pixels(dst: *mut u8, packed: __m128i, shuffle: __m128i) {
+        use std::arch::x86_64::*;
+
+        let packed = _mm_shuffle_epi8(packed, shuffle);
+        unsafe {
+            _mm_storel_epi64(dst.cast::<__m128i>(), packed);
+            std::ptr::write_unaligned(
+                dst.add(8).cast::<u32>(),
+                _mm_extract_epi32::<2>(packed) as u32,
+            );
+        }
+    }
+
+    let shuffle = _mm_setr_epi8(0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, 0, 0, 0, 0);
+    let mut i = 0usize;
+    while i + 8 <= r.len() {
+        let iv = unsafe { quantize_u8x8(r, i) };
+        let rrgg16 = _mm256_packs_epi32(iv, iv);
+        let rgb8 = _mm256_packus_epi16(rrgg16, rrgg16);
+        let lane0 = _mm256_castsi256_si128(rgb8);
+        let lane1 = _mm256_extracti128_si256::<1>(rgb8);
+        let dst = unsafe { out.as_mut_ptr().add(i * 3) };
+        unsafe {
+            store_rgb_4pixels(dst, lane0, shuffle);
+            store_rgb_4pixels(dst.add(12), lane1, shuffle);
+        }
+        i += 8;
+    }
+
+    planar_to_rgb_gray_scalar(&r[i..], &mut out[i * 3..]);
 }
 
 fn apply_post_decode_ops(
@@ -1322,8 +1523,12 @@ fn apply_region(image: DecodedImage, region: RequestedRegion) -> DecodedImage {
 
 fn square_crop(image: DecodedImage) -> DecodedImage {
     let side = image.width.min(image.height);
-    let region =
-        RequestedRegion::new((image.width - side) / 2, (image.height - side) / 2, side, side);
+    let region = RequestedRegion::new(
+        (image.width - side) / 2,
+        (image.height - side) / 2,
+        side,
+        side,
+    );
     apply_region(image, region)
 }
 
@@ -1378,5 +1583,3 @@ fn distance_from_quality(quality: u8) -> f32 {
     let quality = quality.clamp(1, 100) as f32;
     (100.0 - quality) / 25.0 + 0.5
 }
-
-

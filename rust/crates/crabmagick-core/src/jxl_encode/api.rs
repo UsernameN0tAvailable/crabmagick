@@ -19,6 +19,9 @@
 //! # Ok::<_, crate::jxl_encode::At<crate::jxl_encode::EncodeError>>(())
 //! ```
 
+#[cfg(test)]
+use crate::jxl_oxide;
+
 pub use crate::jxl_encode::entropy_coding::Lz77Method;
 pub use enough::{Stop, Unstoppable};
 pub use whereat::{At, ResultAtExt, at};

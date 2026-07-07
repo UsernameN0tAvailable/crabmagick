@@ -99,7 +99,6 @@ pub(crate) fn render_frame<S: Sample>(
         );
         scratch_buffer = Some(fb_scratch);
     }
-
     if let EdgePreservingFilter::Enabled(epf_params) = &frame_header.restoration_filter.epf {
         if fb.color_channels() < 3 {
             tracing::trace!("Cloning gray channel");

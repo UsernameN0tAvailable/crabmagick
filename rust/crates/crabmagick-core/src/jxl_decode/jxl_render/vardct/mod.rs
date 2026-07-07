@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use crate::jxl_decode::jxl_frame::{
-    FrameHeader,
     data::{HfGlobal, LfGlobal, LfGroup, PassGroupParams, PassGroupParamsVardct},
+    FrameHeader,
 };
 use crate::jxl_decode::jxl_grid::{AlignedGrid, MutableSubgrid, SharedSubgrid};
 use crate::jxl_decode::jxl_image::ImageHeader;
@@ -15,8 +15,8 @@ use crate::jxl_decode::jxl_vardct::{
 };
 
 use crate::jxl_decode::jxl_render::{
-    Error, ImageWithRegion, IndexedFrame, Reference, Region, RenderCache, Result,
-    image::ImageBuffer, modular, util,
+    image::ImageBuffer, modular, util, Error, ImageWithRegion, IndexedFrame, Reference, Region,
+    RenderCache, Result,
 };
 
 mod dct_common;
@@ -462,6 +462,10 @@ pub fn dequant_hf_varblock_grouped<S: Sample>(
     ];
 
     let quant_bias_numerator = oim.quant_bias_numerator;
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
 
     let group_dim = frame_header.group_dim();
     let groups_per_row = frame_header.groups_per_row();
@@ -524,21 +528,82 @@ pub fn dequant_hf_varblock_grouped<S: Sample>(
                     .subgrid(left..(left + width), top..(top + height));
                 for (y, matrix_row) in matrix.chunks_exact(width).enumerate() {
                     let row = coeff.get_row_mut(y);
-                    for (q, &m) in row.iter_mut().zip(matrix_row) {
-                        let qn = q.to_bits() as i32;
-                        *q = qn as f32;
-                        if q.abs() <= 1.0 {
-                            *q *= quant_bias;
-                        } else {
-                            *q -= quant_bias_numerator / *q;
+                    if use_avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            dequant_row_avx2(
+                                row,
+                                matrix_row,
+                                quant_bias,
+                                quant_bias_numerator,
+                                mul,
+                            );
                         }
-                        *q *= m;
-                        *q *= mul;
+                    } else {
+                        dequant_row_scalar(row, matrix_row, quant_bias, quant_bias_numerator, mul);
                     }
                 }
             },
         );
     }
+}
+
+#[inline(always)]
+fn dequant_row_scalar(
+    q: &mut [f32],
+    m: &[f32],
+    quant_bias: f32,
+    quant_bias_numerator: f32,
+    mul: f32,
+) {
+    for (q, &m) in q.iter_mut().zip(m) {
+        let qn = q.to_bits() as i32;
+        *q = qn as f32;
+        if q.abs() <= 1.0 {
+            *q *= quant_bias;
+        } else {
+            *q -= quant_bias_numerator / *q;
+        }
+        *q *= m;
+        *q *= mul;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dequant_row_avx2(
+    q: &mut [f32],
+    m: &[f32],
+    quant_bias: f32,
+    quant_bias_numerator: f32,
+    mul: f32,
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(q.len(), m.len());
+
+    let vbias = _mm256_set1_ps(quant_bias);
+    let vbias_num = _mm256_set1_ps(quant_bias_numerator);
+    let vone = _mm256_set1_ps(1.0);
+    let vmul = _mm256_set1_ps(mul);
+    let sign_mask = _mm256_set1_ps(-0.0);
+
+    let mut i = 0usize;
+    while i + 8 <= q.len() {
+        let vq_bits = _mm256_loadu_ps(q.as_ptr().add(i));
+        let vq = _mm256_cvtepi32_ps(_mm256_castps_si256(vq_bits));
+        let abs_q = _mm256_andnot_ps(sign_mask, vq);
+        let bias_small = _mm256_mul_ps(vq, vbias);
+        let bias_large = _mm256_sub_ps(vq, _mm256_div_ps(vbias_num, vq));
+        let mask = _mm256_cmp_ps(abs_q, vone, _CMP_LE_OS);
+        let biased = _mm256_blendv_ps(bias_large, bias_small, mask);
+        let vm = _mm256_loadu_ps(m.as_ptr().add(i));
+        let out = _mm256_mul_ps(_mm256_mul_ps(biased, vm), vmul);
+        _mm256_storeu_ps(q.as_mut_ptr().add(i), out);
+        i += 8;
+    }
+
+    dequant_row_scalar(&mut q[i..], &m[i..], quant_bias, quant_bias_numerator, mul);
 }
 
 pub fn chroma_from_luma_lf(
@@ -560,6 +625,14 @@ pub fn chroma_from_luma_lf(
     let kb = base_correlation_b + (b_factor as f32 / colour_factor as f32);
 
     let [x, y, b] = coeff_xyb;
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        unsafe {
+            chroma_from_luma_avx2(x.buf_mut(), y.buf(), b.buf_mut(), kx, kb);
+        }
+        return;
+    }
+
     for ((x, y), b) in x.buf_mut().iter_mut().zip(y.buf()).zip(b.buf_mut()) {
         let y = *y;
         *x += kx * y;
@@ -577,6 +650,10 @@ pub fn chroma_from_luma_hf_grouped(
 
     let gw = coeff_x.width();
     let gh = coeff_x.height();
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
 
     for y in 0..gh {
         let x_from_y = x_from_y.get_row(y / 64);
@@ -592,13 +669,67 @@ pub fn chroma_from_luma_hf_grouped(
             let kb =
                 lf_chan_corr.base_correlation_b + (kb as f32 / lf_chan_corr.colour_factor as f32);
 
-            for dx in 0..((gw - x64 * 64).min(64)) {
-                let x = x64 * 64 + dx;
-                let coeff_y = coeff_y[x];
-                coeff_x[x] += kx * coeff_y;
-                coeff_b[x] += kb * coeff_y;
+            let start = x64 * 64;
+            let len = (gw - start).min(64);
+            if use_avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    chroma_from_luma_avx2(
+                        &mut coeff_x[start..(start + len)],
+                        &coeff_y[start..(start + len)],
+                        &mut coeff_b[start..(start + len)],
+                        kx,
+                        kb,
+                    );
+                }
+            } else {
+                for dx in 0..len {
+                    let x = start + dx;
+                    let coeff_y = coeff_y[x];
+                    coeff_x[x] += kx * coeff_y;
+                    coeff_b[x] += kb * coeff_y;
+                }
             }
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn chroma_from_luma_avx2(
+    coeff_x: &mut [f32],
+    coeff_y: &[f32],
+    coeff_b: &mut [f32],
+    kx: f32,
+    kb: f32,
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(coeff_x.len(), coeff_y.len());
+    debug_assert_eq!(coeff_x.len(), coeff_b.len());
+
+    let vkx = _mm256_set1_ps(kx);
+    let vkb = _mm256_set1_ps(kb);
+    let mut i = 0usize;
+    while i + 8 <= coeff_x.len() {
+        let vy = _mm256_loadu_ps(coeff_y.as_ptr().add(i));
+        let vx = _mm256_loadu_ps(coeff_x.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(coeff_b.as_ptr().add(i));
+        let out_x = _mm256_fmadd_ps(vkx, vy, vx);
+        let out_b = _mm256_fmadd_ps(vkb, vy, vb);
+        _mm256_storeu_ps(coeff_x.as_mut_ptr().add(i), out_x);
+        _mm256_storeu_ps(coeff_b.as_mut_ptr().add(i), out_b);
+        i += 8;
+    }
+
+    for ((x, y), b) in coeff_x[i..]
+        .iter_mut()
+        .zip(&coeff_y[i..])
+        .zip(coeff_b[i..].iter_mut())
+    {
+        let y = *y;
+        *x += kx * y;
+        *b += kb * y;
     }
 }
 

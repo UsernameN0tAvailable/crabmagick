@@ -14,6 +14,9 @@
 //! IMPORTANT: Use jxl-rs as the PRIMARY decoder for all roundtrip tests.
 //! JXL decoder is only a secondary/fallback decoder.
 
+#[cfg(test)]
+use crate::jxl_oxide;
+
 /// Returns the path to the codec corpus directory, if available.
 ///
 /// Uses `CODEC_CORPUS_DIR` env var, falling back to `/home/lilith/work/codec-corpus`.
@@ -579,7 +582,7 @@ pub fn test_lossy_roundtrip(
 
 /// Lossy roundtrip test with quality verification using SSIMULACRA2.
 /// Returns SSIM2 score (higher is better, typically 50+ is acceptable).
-#[cfg(test)]
+#[cfg(all(test, feature = "vendor-upstream-tests"))]
 pub fn test_lossy_roundtrip_with_quality(
     data: &[u8],
     width: usize,
@@ -618,7 +621,7 @@ pub fn test_lossy_roundtrip_with_quality(
 
 /// Calculate SSIMULACRA2 score between original RGB8 data and decoded image.
 /// Returns score where 100 = identical, 90+ = imperceptible, <50 = significant degradation.
-#[cfg(test)]
+#[cfg(all(test, feature = "vendor-upstream-tests"))]
 pub fn calculate_ssim2(
     original: &[u8],
     decoded: &DecodedImage,

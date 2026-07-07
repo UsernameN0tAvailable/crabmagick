@@ -28,6 +28,12 @@ pub(crate) mod jpeg_decode_core;
 pub(crate) mod jpeg_decode;
 
 pub use pipeline::{JxlEncodeOptions, decode_jxl_info_from_bytes, encode_jxl_rgb};
+
+/// Alias for vendored jxl_oxide module, available in tests under the original crate name.
+#[cfg(test)]
+pub(crate) mod jxl_oxide {
+    pub use crate::jxl_decode::jxl_oxide::*;
+}
 pub use jxl_encode::{EncoderMode, PixelLayout as JxlPixelLayout};
 pub use processor::{
     get_info, init, process_image, CrabMagickError, CrabMagickProcessor, ImageInfo, OutputFormat,

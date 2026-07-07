@@ -875,6 +875,14 @@ impl ColorTransformOp {
                 let [a, b, c, ..] = channels else {
                     unreachable!()
                 };
+
+                #[cfg(target_arch = "x86_64")]
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    // SAFETY: feature check above
+                    unsafe { matrix3x3_avx2(matrix, a, b, c) };
+                    return Ok(3);
+                }
+
                 for ((a, b), c) in a.iter_mut().zip(&mut **b).zip(&mut **c) {
                     let result = crate::jxl_decode::jxl_color::ciexyz::matmul3vec(matrix, &[*a, *b, *c]);
                     *a = result[0];
@@ -960,6 +968,61 @@ impl ColorTransformOp {
                 transform.num_output_channels()
             }
         })
+    }
+}
+
+/// Apply a 3×3 matrix to planar RGB channels, 8 pixels/iter with AVX2+FMA.
+///
+/// matrix is row-major: [m00 m01 m02 | m10 m11 m12 | m20 m21 m22]
+/// out_r[i] = m[0]*a[i] + m[1]*b[i] + m[2]*c[i]
+/// out_g[i] = m[3]*a[i] + m[4]*b[i] + m[5]*c[i]
+/// out_b[i] = m[6]*a[i] + m[7]*b[i] + m[8]*c[i]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+unsafe fn matrix3x3_avx2(matrix: &[f32; 9], a: &mut [f32], b: &mut [f32], c: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let m0 = _mm256_set1_ps(matrix[0]);
+    let m1 = _mm256_set1_ps(matrix[1]);
+    let m2 = _mm256_set1_ps(matrix[2]);
+    let m3 = _mm256_set1_ps(matrix[3]);
+    let m4 = _mm256_set1_ps(matrix[4]);
+    let m5 = _mm256_set1_ps(matrix[5]);
+    let m6 = _mm256_set1_ps(matrix[6]);
+    let m7 = _mm256_set1_ps(matrix[7]);
+    let m8 = _mm256_set1_ps(matrix[8]);
+
+    let len = a.len().min(b.len()).min(c.len());
+    let pa = a.as_mut_ptr();
+    let pb = b.as_mut_ptr();
+    let pc = c.as_mut_ptr();
+
+    let mut i = 0usize;
+    while i + 8 <= len {
+        let va = _mm256_loadu_ps(pa.add(i));
+        let vb = _mm256_loadu_ps(pb.add(i));
+        let vc = _mm256_loadu_ps(pc.add(i));
+        // new_a = m0*va + m1*vb + m2*vc
+        let na = _mm256_fmadd_ps(m0, va, _mm256_fmadd_ps(m1, vb, _mm256_mul_ps(m2, vc)));
+        // new_b = m3*va + m4*vb + m5*vc
+        let nb = _mm256_fmadd_ps(m3, va, _mm256_fmadd_ps(m4, vb, _mm256_mul_ps(m5, vc)));
+        // new_c = m6*va + m7*vb + m8*vc
+        let nc = _mm256_fmadd_ps(m6, va, _mm256_fmadd_ps(m7, vb, _mm256_mul_ps(m8, vc)));
+        _mm256_storeu_ps(pa.add(i), na);
+        _mm256_storeu_ps(pb.add(i), nb);
+        _mm256_storeu_ps(pc.add(i), nc);
+        i += 8;
+    }
+    // Scalar tail
+    while i < len {
+        let av = *pa.add(i);
+        let bv = *pb.add(i);
+        let cv = *pc.add(i);
+        *pa.add(i) = matrix[0] * av + matrix[1] * bv + matrix[2] * cv;
+        *pb.add(i) = matrix[3] * av + matrix[4] * bv + matrix[5] * cv;
+        *pc.add(i) = matrix[6] * av + matrix[7] * bv + matrix[8] * cv;
+        i += 1;
     }
 }
 

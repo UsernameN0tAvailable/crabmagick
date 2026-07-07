@@ -635,10 +635,23 @@ impl RenderContext {
             .keyframes
             .get(keyframe_idx)
             .ok_or(Error::IncompleteFrame)?;
-        let grid = self.render_by_index(idx)?;
         let frame = &*self.frames[idx];
+        let can_reference = frame.header().can_reference();
 
-        self.postprocess_keyframe(frame, grid)
+        let grid = if self.narrow_modular() {
+            let handle = Arc::clone(&self.renders_narrow[idx]);
+            let grid = Arc::clone(&handle).run_with_image()?.blend(None, &self.pool)?;
+            if !can_reference { handle.release_blended_cache(); }
+            grid
+        } else {
+            let handle = Arc::clone(&self.renders_wide[idx]);
+            let grid = Arc::clone(&handle).run_with_image()?.blend(None, &self.pool)?;
+            if !can_reference { handle.release_blended_cache(); }
+            grid
+        };
+
+        let result = self.postprocess_keyframe(frame, grid);
+        result
     }
 
     pub fn render_loading_keyframe(&mut self) -> Result<(&IndexedFrame, Arc<ImageWithRegion>)> {
@@ -946,7 +959,11 @@ impl RenderContext {
                 return Ok(grid);
             }
 
-            let mut grid = grid.try_clone()?;
+            // Try to take ownership without cloning; fall back to clone if the Arc is shared.
+            let mut grid = match Arc::try_unwrap(grid) {
+                Ok(g) => g,
+                Err(arc) => arc.try_clone()?,
+            };
 
             if frame_header.do_ycbcr {
                 grid.convert_modular_color(self.image_header.metadata.bit_depth)?;

@@ -43,8 +43,12 @@ pub(crate) fn epf_row<const STEP: usize>(epf_row: EpfRow<'_, '_>) {
     };
 
     let simd_range = {
-        let start = 4;
-        let end = (width - right_edge_width) & !3;
+        // Widened from 4-wide (SSE) to 8-wide alignment so that the region skipped here matches
+        // exactly what the widest available SIMD kernel (AVX2, 8 lanes) processes. Narrower SIMD
+        // kernels process a superset of this range; the generic handler runs afterwards and
+        // overwrites the border pixels, so correctness is preserved.
+        let start = 8;
+        let end = (width - right_edge_width) & !7;
         if start > end {
             start..start
         } else {

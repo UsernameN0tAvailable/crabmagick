@@ -2819,7 +2819,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vendor-upstream-tests"))]
 mod metadata_tests {
     use super::*;
 

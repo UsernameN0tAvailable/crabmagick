@@ -4,6 +4,9 @@
 
 //! Main tiny encoder implementation.
 
+#[cfg(test)]
+use crate::jxl_oxide;
+
 use super::ac_strategy::{
     AcStrategyMap, adjust_quant_field_float_with_distance, adjust_quant_field_with_distance,
     compute_ac_strategy,

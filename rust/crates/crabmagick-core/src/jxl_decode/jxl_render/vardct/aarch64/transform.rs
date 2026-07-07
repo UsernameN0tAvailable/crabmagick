@@ -5,7 +5,9 @@ use crate::jxl_decode::jxl_grid::{MutableSubgrid, SharedSubgrid};
 use crate::jxl_decode::jxl_modular::ChannelShift;
 use crate::jxl_decode::jxl_vardct::{BlockInfo, TransformType};
 
-use crate::jxl_decode::jxl_render::vardct::{dct_common::DctDirection, transform_common::transform_varblocks_inner};
+use crate::jxl_decode::jxl_render::vardct::{
+    dct_common::DctDirection, transform_common::transform_varblocks_inner,
+};
 
 use super::generic;
 

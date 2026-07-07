@@ -163,6 +163,15 @@ impl<S: Sample> FrameRenderHandle<S> {
         std::mem::replace(&mut *render_ref, FrameRender::None)
     }
 
+    /// Release the cached blended image, allowing the returned Arc to become uniquely owned.
+    /// Only safe to call when this frame won't be used as a reference by subsequent frames.
+    pub(crate) fn release_blended_cache(&self) {
+        let mut render_ref = self.render.lock().unwrap();
+        if matches!(&*render_ref, FrameRender::Blended(_)) {
+            *render_ref = FrameRender::None;
+        }
+    }
+
     fn start_render(&self) -> Result<Option<FrameRender<S>>> {
         let mut render_ref = self.render.lock().unwrap();
         let render = std::mem::replace(&mut *render_ref, FrameRender::Rendering);

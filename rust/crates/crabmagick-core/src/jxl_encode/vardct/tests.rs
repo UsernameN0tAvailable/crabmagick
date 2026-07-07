@@ -4,6 +4,8 @@
 
 //! Tests for the VarDCT encoder module.
 
+use crate::jxl_oxide;
+
 use super::*;
 use crate::jxl_encode::entropy_coding::token;
 

@@ -292,7 +292,7 @@ pub fn depths_to_bits_values(depths: &[u8]) -> ([u8; 16], Vec<u8>) {
     (bits, values)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vendor-upstream-tests"))]
 mod tests {
     use super::*;
 

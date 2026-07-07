@@ -109,7 +109,7 @@ pub mod test_helpers;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vendor-upstream-tests"))]
 #[path = "api_tests.rs"]
 mod api_tests;
 

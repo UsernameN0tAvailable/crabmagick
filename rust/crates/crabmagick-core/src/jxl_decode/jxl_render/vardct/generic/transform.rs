@@ -5,7 +5,7 @@ use crate::jxl_decode::jxl_vardct::{BlockInfo, TransformType};
 
 use crate::jxl_decode::jxl_render::vardct::{
     dct_common::DctDirection,
-    transform_common::{AFV_BASIS, transform_varblocks_inner},
+    transform_common::{transform_varblocks_inner, AFV_BASIS},
 };
 
 use super::dct_2d;

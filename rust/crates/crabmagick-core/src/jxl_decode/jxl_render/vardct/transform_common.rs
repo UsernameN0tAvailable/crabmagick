@@ -3,8 +3,8 @@ use crate::jxl_decode::jxl_modular::ChannelShift;
 use crate::jxl_decode::jxl_vardct::{BlockInfo, TransformType};
 
 use crate::jxl_decode::jxl_render::vardct::{
+    dct_common::{scale_f, DctDirection},
     VarblockInfo,
-    dct_common::{DctDirection, scale_f},
 };
 
 #[inline(always)]

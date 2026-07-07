@@ -11,6 +11,9 @@
 //! and transform descriptors in `encode_transforms`. All public items are re-exported
 //! here so consumers can continue using `crate::jxl_encode::modular::encode::*`.
 
+#[cfg(test)]
+use crate::jxl_oxide;
+
 use crate::jxl_encode::bit_writer::BitWriter;
 #[allow(unused_imports)]
 use crate::jxl_encode::debug_rect;

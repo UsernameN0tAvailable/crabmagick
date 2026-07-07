@@ -357,14 +357,31 @@ impl Histogram {
     }
 
     #[inline]
+    pub fn read_symbols_batched(
+        &self,
+        bitstream: &mut Bitstream,
+        out: &mut [u32],
+    ) -> CodingResult<()> {
+        let mut chunks = out.chunks_exact_mut(4);
+        for chunk in &mut chunks {
+            chunk[0] = self.read_symbol(bitstream)?;
+            chunk[1] = self.read_symbol(bitstream)?;
+            chunk[2] = self.read_symbol(bitstream)?;
+            chunk[3] = self.read_symbol(bitstream)?;
+        }
+        for slot in chunks.into_remainder() {
+            *slot = self.read_symbol(bitstream)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
     pub fn single_symbol(&self) -> Option<u32> {
-        if let &[
-            Entry {
-                nested: false,
-                bits_or_mask: 0,
-                symbol_or_offset: symbol,
-            },
-        ] = &*self.toplevel_entries
+        if let &[Entry {
+            nested: false,
+            bits_or_mask: 0,
+            symbol_or_offset: symbol,
+        }] = &*self.toplevel_entries
         {
             Some(symbol as u32)
         } else {

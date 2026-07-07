@@ -1197,6 +1197,45 @@ impl Render {
             .collect()
     }
 
+    /// Zero-copy fast path: returns raw `&[f32]` slices (one per color channel) when
+    /// the image is in native orientation (orientation=1) and all channels are already
+    /// stored as `f32` grids with no region offset. Returns `None` otherwise.
+    ///
+    /// The caller must use `color_channels_count` to know how many channels are returned.
+    /// This avoids the allocation + scalar copy performed by `image_planar`.
+    pub fn color_channels_raw_f32(&self) -> Option<Vec<&[f32]>> {
+        use crate::jxl_decode::jxl_render::ImageBuffer;
+        if self.orientation != 1 {
+            return None;
+        }
+        let grids = self.image.buffer();
+        let color_count = self.image.color_channels();
+        let regions = self.image.regions_and_shifts();
+        let target = self.target_frame_region;
+
+        let mut out = Vec::with_capacity(color_count);
+        for i in 0..color_count {
+            let (region, _shift) = regions[i];
+            // Grid start must align with target, width must match exactly (same row stride),
+            // height may be larger (group-aligned padding) — we slice only target.height rows.
+            if region.left != target.left || region.top != target.top {
+                return None;
+            }
+            if region.width != target.width || region.height < target.height {
+                return None;
+            }
+            match &grids[i] {
+                ImageBuffer::F32(g) => {
+                    // stride == region.width == target.width, so rows are contiguous.
+                    let len = target.width as usize * target.height as usize;
+                    out.push(&g.buf()[..len]);
+                }
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
     /// Returns the color channels.
     ///
     /// Orientation is not applied.
