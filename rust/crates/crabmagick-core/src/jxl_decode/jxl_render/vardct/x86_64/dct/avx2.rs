@@ -6,10 +6,9 @@
 //! instead of four. The scalar butterflies are element-wise and therefore widen
 //! without any change; only the in-register transpose becomes an 8x8 transpose.
 //!
-//! The specialized `dct8x8` in-lane fast path from the SSE2 module is intentionally
-//! omitted: its `width == 2` assumption is tied to a 4-wide lane. The general lane
-//! path below computes the identical separable 2D DCT for 8x8 (and every other
-//! size whose dimensions are multiples of `LANE_SIZE`).
+//! For the dominant 8×8 block size a specialized `dct8x8_avx2` fast path is used.
+//! It keeps the full 512-byte working set in registers between the two DCT passes
+//! and avoids the per-block heap allocation that `dct_2d_lane` requires.
 
 use std::arch::x86_64::*;
 
@@ -63,7 +62,51 @@ pub(crate) unsafe fn dct_2d_avx2(io: &mut MutableSubgrid<'_>, direction: DctDire
         return generic::dct_2d(io, direction);
     };
 
+    // Fast path for 8×8 (the dominant block size in VarDCT): avoids a heap
+    // allocation for scratch space and keeps data in registers between passes.
+    if io.width() == 1 && io.height() == LANE_SIZE {
+        return dct8x8_avx2(&mut io, direction);
+    }
+
     dct_2d_lane(&mut io, direction);
+}
+
+/// Specialised 2-D DCT for 8×8 blocks (represented as a 1×8 `MutableSubgrid<__m256>`).
+///
+/// Compared to the general `dct_2d_lane` path this function:
+/// - Avoids the per-block `vec!` heap allocation for scratch space.
+/// - Keeps the 512-byte working set in AVX2 registers across both passes.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dct8x8_avx2(io: &mut MutableSubgrid<'_, Lane>, direction: DctDirection) {
+    let mut data: [Lane; 8] = [_mm256_setzero_ps(); 8];
+
+    // Load all 8 rows into registers.
+    for y in 0..8usize {
+        data[y] = io.get(0, y);
+    }
+
+    // Pass 1: column-direction DCT (element-wise across 8 parallel columns).
+    if direction == DctDirection::Forward {
+        dct8_forward(&mut MutableSubgrid::from_buf(&mut data, 1, 8, 1));
+    } else {
+        dct8_inverse(&mut MutableSubgrid::from_buf(&mut data, 1, 8, 1));
+    }
+    // Transpose so that the second pass operates on the row direction.
+    transpose_lane(&mut data);
+
+    // Pass 2: row-direction DCT (same butterfly, data already transposed).
+    if direction == DctDirection::Forward {
+        dct8_forward(&mut MutableSubgrid::from_buf(&mut data, 1, 8, 1));
+    } else {
+        dct8_inverse(&mut MutableSubgrid::from_buf(&mut data, 1, 8, 1));
+    }
+    // Transpose back to restore canonical layout.
+    transpose_lane(&mut data);
+
+    // Store results.
+    for y in 0..8usize {
+        *io.get_mut(0, y) = data[y];
+    }
 }
 
 #[target_feature(enable = "avx2,fma")]

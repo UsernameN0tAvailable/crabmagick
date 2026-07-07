@@ -148,7 +148,8 @@ pub(crate) fn load_lf_groups<S: Sample>(
         let Region { width, height, .. } = lf_region;
         for shift in shifts_cbycr {
             let (width, height) = shift.shift_size((width, height));
-            let buffer = AlignedGrid::with_alloc_tracker(width as usize, height as usize, tracker)?;
+            // SAFETY: copy_lf_dequant writes every element of this buffer before it is read.
+            let buffer = unsafe { AlignedGrid::<f32>::uninit(width as usize, height as usize, tracker)? };
             out.append_channel_shifted(ImageBuffer::F32(buffer), lf_region, shift);
         }
         Some(out)

@@ -84,11 +84,14 @@ pub(crate) fn render_frame<S: Sample>(
             let tracker = fb.alloc_tracker();
             let width = color_padded_region.width as usize;
             let height = color_padded_region.height as usize;
-            [
-                AlignedGrid::with_alloc_tracker(width, height, tracker)?,
-                AlignedGrid::with_alloc_tracker(width, height, tracker)?,
-                AlignedGrid::with_alloc_tracker(width, height, tracker)?,
-            ]
+            // SAFETY: apply_gabor_like writes every output pixel before reading.
+            unsafe {
+                [
+                    AlignedGrid::<f32>::uninit(width, height, tracker)?,
+                    AlignedGrid::<f32>::uninit(width, height, tracker)?,
+                    AlignedGrid::<f32>::uninit(width, height, tracker)?,
+                ]
+            }
         };
         filter::apply_gabor_like(
             &mut fb,
@@ -112,11 +115,14 @@ pub(crate) fn render_frame<S: Sample>(
             let tracker = fb.alloc_tracker();
             let width = color_padded_region.width as usize;
             let height = color_padded_region.height as usize;
-            [
-                AlignedGrid::with_alloc_tracker(width, height, tracker)?,
-                AlignedGrid::with_alloc_tracker(width, height, tracker)?,
-                AlignedGrid::with_alloc_tracker(width, height, tracker)?,
-            ]
+            // SAFETY: apply_epf writes every output pixel before reading.
+            unsafe {
+                [
+                    AlignedGrid::<f32>::uninit(width, height, tracker)?,
+                    AlignedGrid::<f32>::uninit(width, height, tracker)?,
+                    AlignedGrid::<f32>::uninit(width, height, tracker)?,
+                ]
+            }
         };
         filter::apply_epf(
             &mut fb,

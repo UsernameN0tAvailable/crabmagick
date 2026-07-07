@@ -156,6 +156,49 @@ impl<S: Default + Clone> AlignedGrid<S> {
     }
 }
 
+impl AlignedGrid<f32> {
+    /// Creates an f32 grid with capacity but without zero-initialization.
+    ///
+    /// # Safety
+    /// The caller MUST write to every element of the grid before reading any element.
+    /// Every pixel in the region `[0..width) × [0..height)` must be initialized.
+    #[inline]
+    pub unsafe fn uninit(
+        width: usize,
+        height: usize,
+        tracker: Option<&AllocTracker>,
+    ) -> Result<Self, OutOfMemory> {
+        let len = width
+            .checked_mul(height)
+            .expect("grid dimensions overflow usize");
+        let buf_len = len
+            .checked_add((Self::ALIGN - 1) / std::mem::size_of::<f32>())
+            .expect("aligned grid buffer length overflows usize");
+        let handle = tracker
+            .map(|tracker| tracker.alloc::<f32>(buf_len))
+            .transpose()?;
+
+        let mut buf: Vec<f32> = Vec::with_capacity(buf_len);
+        let extra = buf.as_ptr() as usize & (Self::ALIGN - 1);
+        let offset = ((Self::ALIGN - extra) % Self::ALIGN) / std::mem::size_of::<f32>();
+        let len_with_offset = len
+            .checked_add(offset)
+            .expect("aligned grid buffer length overflows usize");
+
+        // SAFETY: alignment padding elements [0..offset] are never read by any grid accessor.
+        // Data elements [offset..len_with_offset] MUST be written by caller before any read.
+        buf.set_len(len_with_offset);
+
+        Ok(Self {
+            width,
+            height,
+            offset,
+            buf,
+            handle,
+        })
+    }
+}
+
 impl<S> AlignedGrid<S> {
     /// Returns the width of the grid.
     #[inline]

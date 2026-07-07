@@ -344,29 +344,50 @@ impl SelfCorrectingPredictor {
                 >> 5),
         ];
 
-        let mut subpred_err_sum = [0u32; 4];
-        for (i, sum) in subpred_err_sum.iter_mut().enumerate() {
-            *sum = subpred_err_nw_ww[i]
-                .wrapping_add(subpred_err_n_w[i])
-                .wrapping_add(subpred_err_ne[i]);
-        }
+        // Use SSE2 to add three [u32; 4] arrays in one go.
+        let subpred_err_sum = {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: SSE2 is mandatory on x86_64 ABI.
+            unsafe {
+                use std::arch::x86_64::*;
+                let a = _mm_loadu_si128(subpred_err_nw_ww.as_ptr().cast::<__m128i>());
+                let b = _mm_loadu_si128(subpred_err_n_w.as_ptr().cast::<__m128i>());
+                let c = _mm_loadu_si128(subpred_err_ne.as_ptr().cast::<__m128i>());
+                let sum = _mm_add_epi32(_mm_add_epi32(a, b), c);
+                let mut out = [0u32; 4];
+                _mm_storeu_si128(out.as_mut_ptr().cast::<__m128i>(), sum);
+                out
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let mut out = [0u32; 4];
+                for i in 0..4 {
+                    out[i] = subpred_err_nw_ww[i]
+                        .wrapping_add(subpred_err_n_w[i])
+                        .wrapping_add(subpred_err_ne[i]);
+                }
+                out
+            }
+        };
 
         let wp_wn = [wp.wp_w0, wp.wp_w1, wp.wp_w2, wp.wp_w3];
         let mut weight = [0u32; 4];
-        for ((w, err_sum), maxweight) in weight.iter_mut().zip(subpred_err_sum).zip(wp_wn) {
-            let shift = ((err_sum as u64 + 1) >> 5).checked_ilog2().unwrap_or(0);
-            *w = 4 + ((maxweight * DIV_LOOKUP[(err_sum >> shift) as usize + 1]) >> shift);
+        for i in 0..4 {
+            let err_sum = subpred_err_sum[i];
+            // Faster ilog2: avoid Option overhead with direct leading_zeros.
+            let x = (err_sum as u64).wrapping_add(1) >> 5;
+            let shift = if x == 0 { 0u32 } else { 63 - x.leading_zeros() };
+            weight[i] = 4 + ((wp_wn[i] * DIV_LOOKUP[(err_sum >> shift) as usize + 1]) >> shift);
         }
 
-        let sum_weights: u32 = weight.iter().copied().sum();
+        let sum_weights: u32 = weight[0] + weight[1] + weight[2] + weight[3];
         let log_weight = (sum_weights as u64 >> 4).ilog2();
-        for w in &mut weight {
-            *w >>= log_weight;
-        }
-        let sum_weights: u32 = weight.iter().copied().sum();
+        let weight = [weight[0] >> log_weight, weight[1] >> log_weight,
+                      weight[2] >> log_weight, weight[3] >> log_weight];
+        let sum_weights: u32 = weight[0] + weight[1] + weight[2] + weight[3];
         let mut s = (sum_weights as i64 >> 1) - 1;
-        for (subpred, weight) in subpred.into_iter().zip(weight) {
-            s += subpred * weight as i64;
+        for (sp, wt) in subpred.into_iter().zip(weight) {
+            s += sp * wt as i64;
         }
         let mut prediction = (s * DIV_LOOKUP[sum_weights as usize] as i64) >> 24;
         if (true_err_n ^ true_err_w) | (true_err_n ^ true_err_nw) <= 0 {
@@ -375,13 +396,11 @@ impl SelfCorrectingPredictor {
             prediction = prediction.clamp(min, max);
         }
 
-        let true_errors = [true_err_n, true_err_nw, true_err_ne];
+        // Match original tie-breaking: w has priority, n/nw/ne only win when strictly larger.
         let mut max_error = true_err_w;
-        for err in true_errors {
-            if err.abs() > max_error.abs() {
-                max_error = err;
-            }
-        }
+        if true_err_n.abs() > max_error.abs() { max_error = true_err_n; }
+        if true_err_nw.abs() > max_error.abs() { max_error = true_err_nw; }
+        if true_err_ne.abs() > max_error.abs() { max_error = true_err_ne; }
 
         PredictionResult {
             prediction,
