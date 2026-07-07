@@ -329,14 +329,14 @@ impl Histogram {
         let offset = offset + pos;
 
         let next_state = (*state >> 12) * dist + offset;
+        // peek_bits_const::<16>() calls the internal refill, ensuring ≥56 bits in the buffer.
+        // consume_bits_unchecked is therefore bounds-safe (we consume at most 16).
         let appended_state = (next_state << 16) | bitstream.peek_bits_const::<16>();
         let select_appended = next_state < (1 << 16);
-        *state = if select_appended {
-            appended_state
-        } else {
-            next_state
-        };
-        bitstream.consume_bits(if select_appended { 16 } else { 0 })?;
+        *state = if select_appended { appended_state } else { next_state };
+        // SAFETY: peek_bits_const above called refill(), guaranteeing ≥56 bits; we consume at most 16.
+        unsafe { bitstream.consume_bits_unchecked(if select_appended { 16 } else { 0 }) };
+
         Ok(symbol as u32)
     }
 

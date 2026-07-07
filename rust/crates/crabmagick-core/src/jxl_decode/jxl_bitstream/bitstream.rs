@@ -52,29 +52,30 @@ impl<'buf> Bitstream<'buf> {
 
 impl Bitstream<'_> {
     /// Fills bit buffer from byte buffer.
+    ///
+    /// Inlined so the compiler can hoist the refill check out of tight decode loops and eliminate
+    /// it entirely for call sites that can prove the buffer is already full.  The cold slow-path
+    /// (fewer than 8 bytes remaining) is out-of-line via `refill_slow`.
     #[inline(always)]
     fn refill(&mut self) {
         if self.remaining_buf_bits < 56 {
-            self.refill_inner();
-        }
-    }
-
-    #[inline(never)]
-    fn refill_inner(&mut self) {
-        if let &[b0, b1, b2, b3, b4, b5, b6, b7, ..] = self.bytes {
-            let bits = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
-            self.buf |= bits << self.remaining_buf_bits;
-            let read_bytes = (63 - self.remaining_buf_bits) >> 3;
-            self.remaining_buf_bits |= 56;
-            // SAFETY: read_bytes < 8, self.bytes.len() >= 8 (from the pattern).
-            self.bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.bytes.as_ptr().add(read_bytes),
-                    self.bytes.len() - read_bytes,
-                )
-            };
-        } else {
-            self.refill_slow()
+            // Fast path: at least 8 bytes remain — one 64-bit unaligned load, branchless advance.
+            if self.bytes.len() >= 8 {
+                // SAFETY: len >= 8, pointer is valid for 8 bytes.
+                let bits =
+                    unsafe { (self.bytes.as_ptr() as *const u64).read_unaligned() }.to_le();
+                self.buf |= bits << self.remaining_buf_bits;
+                let read_bytes = (63 - self.remaining_buf_bits) >> 3;
+                self.remaining_buf_bits |= 56; // rounds up to the range 56..=63
+                self.bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.bytes.as_ptr().add(read_bytes),
+                        self.bytes.len() - read_bytes,
+                    )
+                };
+            } else {
+                self.refill_slow();
+            }
         }
     }
 
@@ -145,6 +146,20 @@ impl Bitstream<'_> {
         self.num_read_bits += n;
         self.buf >>= n;
         Ok(())
+    }
+
+    /// Consumes `n` bits without bounds-checking.
+    ///
+    /// # Safety
+    /// Caller must ensure `n <= self.remaining_buf_bits`.  The ANS decode hot-path calls this
+    /// with `n ∈ {0, 16}` immediately after a `refill()` that guarantees ≥56 bits available,
+    /// so the precondition is always satisfied.
+    #[inline(always)]
+    pub unsafe fn consume_bits_unchecked(&mut self, n: usize) {
+        debug_assert!(n <= self.remaining_buf_bits, "consume_bits_unchecked: buffer underflow");
+        self.remaining_buf_bits -= n;
+        self.num_read_bits += n;
+        self.buf >>= n;
     }
 
     /// Consumes bits in bit buffer.

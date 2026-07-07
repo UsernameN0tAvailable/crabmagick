@@ -371,14 +371,17 @@ impl SelfCorrectingPredictor {
         };
 
         let wp_wn = [wp.wp_w0, wp.wp_w1, wp.wp_w2, wp.wp_w3];
-        let mut weight = [0u32; 4];
-        for i in 0..4 {
-            let err_sum = subpred_err_sum[i];
-            // Faster ilog2: avoid Option overhead with direct leading_zeros.
-            let x = (err_sum as u64).wrapping_add(1) >> 5;
-            let shift = if x == 0 { 0u32 } else { 63 - x.leading_zeros() };
-            weight[i] = 4 + ((wp_wn[i] * DIV_LOOKUP[(err_sum >> shift) as usize + 1]) >> shift);
-        }
+
+        let weight = {
+            let mut w = [0u32; 4];
+            for i in 0..4 {
+                let err_sum = subpred_err_sum[i];
+                let x = (err_sum as u64).wrapping_add(1) >> 5;
+                let shift = if x == 0 { 0u32 } else { 63 - x.leading_zeros() };
+                w[i] = 4 + ((wp_wn[i] * DIV_LOOKUP[(err_sum >> shift) as usize + 1]) >> shift);
+            }
+            w
+        };
 
         let sum_weights: u32 = weight[0] + weight[1] + weight[2] + weight[3];
         let log_weight = (sum_weights as u64 >> 4).ilog2();

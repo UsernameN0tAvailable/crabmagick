@@ -1267,41 +1267,81 @@ fn planar_to_rgb(
     width: u32,
     height: u32,
 ) -> DecodedImage {
-    let mut pixels = vec![0u8; (width * height * 3) as usize];
+    let total = (width * height) as usize;
+
+    // Only parallelize when the image is large enough to amortize rayon task-scheduling + thread
+    // wakeup overhead. Empirically, ≥3M pixels is the break-even for this machine.
+    const PARALLEL_THRESHOLD: usize = 3_000_000;
+    // Process 8192-pixel chunks in parallel (each chunk: ~96 KB of f32 in, ~24 KB u8 out).
+    const CHUNK: usize = 8192;
+    let parallel = total >= PARALLEL_THRESHOLD;
+
+    // Serial path: zero-fill warms cache lines before the AVX2 write pass, avoiding demand-paging
+    // stalls on cold pages.  Parallel path: every byte is overwritten, so skip the zero-fill.
+    let mut pixels: Vec<u8> = if parallel {
+        let mut v = Vec::with_capacity(total * 3);
+        unsafe { v.set_len(total * 3) };
+        v
+    } else {
+        vec![0u8; total * 3]
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("ssse3")
+        && std::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2 = false;
+
     match pixel_format {
         PixelFormat::Gray | PixelFormat::Graya => {
-            #[cfg(target_arch = "x86_64")]
-            if std::is_x86_feature_detected!("avx2")
-                && std::is_x86_feature_detected!("ssse3")
-                && std::is_x86_feature_detected!("fma")
-            {
-                unsafe {
-                    planar_to_rgb_gray_avx2(r, &mut pixels);
-                }
+            if parallel {
+                pixels
+                    .par_chunks_mut(CHUNK * 3)
+                    .enumerate()
+                    .for_each(|(i, out_chunk)| {
+                        let start = i * CHUNK;
+                        let n = out_chunk.len() / 3;
+                        let r_chunk = &r[start..start + n];
+                        if avx2 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe { planar_to_rgb_gray_avx2(r_chunk, out_chunk) };
+                        } else {
+                            planar_to_rgb_gray_scalar(r_chunk, out_chunk);
+                        }
+                    });
+            } else if avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { planar_to_rgb_gray_avx2(r, &mut pixels) };
             } else {
-                planar_to_rgb_gray_scalar(r, &mut pixels);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
                 planar_to_rgb_gray_scalar(r, &mut pixels);
             }
         }
         PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Cmyk | PixelFormat::Cmyka => {
             let g = g.expect("green plane present for RGB-like JXL image");
             let b = b.expect("blue plane present for RGB-like JXL image");
-            #[cfg(target_arch = "x86_64")]
-            if std::is_x86_feature_detected!("avx2")
-                && std::is_x86_feature_detected!("ssse3")
-                && std::is_x86_feature_detected!("fma")
-            {
-                unsafe {
-                    planar_to_rgb_rgb_avx2(r, g, b, &mut pixels);
-                }
+
+            if parallel {
+                pixels
+                    .par_chunks_mut(CHUNK * 3)
+                    .enumerate()
+                    .for_each(|(i, out_chunk)| {
+                        let start = i * CHUNK;
+                        let n = out_chunk.len() / 3;
+                        let r_chunk = &r[start..start + n];
+                        let g_chunk = &g[start..start + n];
+                        let b_chunk = &b[start..start + n];
+                        if avx2 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe { planar_to_rgb_rgb_avx2(r_chunk, g_chunk, b_chunk, out_chunk) };
+                        } else {
+                            planar_to_rgb_rgb_scalar(r_chunk, g_chunk, b_chunk, out_chunk);
+                        }
+                    });
+            } else if avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { planar_to_rgb_rgb_avx2(r, g, b, &mut pixels) };
             } else {
-                planar_to_rgb_rgb_scalar(r, g, b, &mut pixels);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
                 planar_to_rgb_rgb_scalar(r, g, b, &mut pixels);
             }
         }
