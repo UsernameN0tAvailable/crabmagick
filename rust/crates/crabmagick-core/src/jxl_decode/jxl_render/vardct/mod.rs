@@ -243,139 +243,188 @@ pub(crate) fn render_vardct<S: Sample>(
             })
             .collect::<Vec<_>>()
     });
-    tracing::trace_span!("Decode PassGroup").in_scope(|| {
+    // Fused "Decode + Dequant + Transform": runs decode_pass_group immediately followed by
+    // dequant/CfL/IDCT inside the *same* scope.spawn for every group.  This eliminates a
+    // full Rayon barrier between the former "Decode PassGroup" and "Dequant and transform"
+    // phases and keeps each group's HF coefficients hot in L2 cache through the transition.
+    tracing::trace_span!("Decode and transform").in_scope(|| -> Result<()> {
+        let groups_per_row = frame_header.groups_per_row();
+        let lf_xyb_ref = &lf_xyb;
+        let lf_groups_ref: &HashMap<u32, LfGroup<S>> = lf_groups;
+
         let Some(hf_global) = hf_global else {
+            // Modular / LF-only frame: nothing to decode; transform with LF for all groups.
+            pool.for_each_vec(it, |job| {
+                let (group_idx, mut grid_xyb, _) = job;
+                transform_with_lf_grouped(lf_xyb_ref, &mut grid_xyb, group_idx, frame_header, lf_groups_ref);
+            });
             return Ok(());
         };
 
+        let global_ma_config = gmodular.ma_config.as_ref();
         let result = std::sync::RwLock::new(Result::Ok(()));
+        let num_passes = frame_header.passes.num_passes as usize;
 
-        for (pass_idx, pass_image) in pass_group_image.into_iter().enumerate() {
-            let pass_idx = pass_idx as u32;
+        // Per-pass modular subimage iterators (indexed by group_idx).
+        let mut pass_modular_vecs: Vec<Vec<_>> = pass_group_image
+            .into_iter()
+            .map(|pass_image| pass_image.into_iter().enumerate().collect())
+            .collect();
 
-            pool.scope(|scope| {
-                let global_ma_config = gmodular.ma_config.as_ref();
+        // Per-group task: owns the output grid and all per-pass bitstreams.
+        // Constructed sequentially on the main thread before the parallel scope.
+        struct GroupTask<'g, 'frame, S: Sample> {
+            group_idx: u32,
+            grid_xyb: [MutableSubgrid<'g, f32>; 3],
+            lf_group: &'frame LfGroup<S>,
+            // Per-pass: Some(bitstream, allow_partial, optional modular) or None when unavailable.
+            pass_data: Vec<Option<(
+                crate::jxl_decode::jxl_bitstream::Bitstream<'frame>,
+                bool,
+                Option<crate::jxl_decode::jxl_modular::image::TransformedModularSubimage<'g, S>>,
+            )>>,
+        }
+        // SAFETY: all fields are Send (MutableSubgrid<f32>: Send, &LfGroup: Send if LfGroup: Sync,
+        // Bitstream<'_>: Send, TransformedModularSubimage: Send).
+        unsafe impl<'g, 'frame, S: Sample + Send> Send for GroupTask<'g, 'frame, S> {}
 
-                let mut image_it = pass_image.into_iter().enumerate();
-                for &mut (group_idx, ref mut grid_xyb, lf_group) in &mut it {
-                    if lf_group.hf_meta.is_none() {
-                        continue;
+        let group_tasks: Vec<GroupTask<'_, '_, S>> = it
+            .into_iter()
+            .map(|(group_idx, grid_xyb, lf_group)| {
+                let pass_data = (0..num_passes)
+                    .map(|pass_idx| {
+                        let modular = pass_modular_vecs.get_mut(pass_idx).and_then(|v| {
+                            v.iter()
+                                .position(|(idx, _)| *idx == group_idx as usize)
+                                .map(|pos| v.remove(pos).1)
+                        });
+                        match frame.pass_group_bitstream(pass_idx as u32, group_idx) {
+                            Some(Ok(bs)) => Some((bs.bitstream, bs.partial, modular)),
+                            Some(Err(e)) => {
+                                *result.write().unwrap() = Err(e.into());
+                                None
+                            }
+                            None => None,
+                        }
+                    })
+                    .collect();
+                GroupTask { group_idx, grid_xyb, lf_group, pass_data }
+            })
+            .collect();
+
+        pool.scope(|scope| {
+            for task in group_tasks {
+                let result_ref = &result;
+                let GroupTask { group_idx, mut grid_xyb, lf_group, pass_data } = task;
+                let group_x = group_idx % groups_per_row;
+                let group_y = group_idx / groups_per_row;
+                let transform_hf = {
+                    let left = group_x * group_dim;
+                    let top = group_y * group_dim;
+                    let gr = Region {
+                        left: left as i32,
+                        top: top as i32,
+                        width: group_dim,
+                        height: group_dim,
+                    };
+                    !gr.intersection(aligned_region).is_empty()
+                };
+
+                scope.spawn(move |_| {
+                    let has_hf = lf_group.hf_meta.is_some() && transform_hf;
+                    let mut decode_ok = true;
+
+                    if has_hf {
+                        for (pass_idx, entry) in pass_data.into_iter().enumerate() {
+                            let Some((mut bitstream, allow_partial, modular)) = entry else {
+                                continue;
+                            };
+                            // Decode HF coefficients into the i32 reinterpretation of grid_xyb.
+                            // The i32 reborrow is scoped so it's released before dequant below.
+                            {
+                                let [x, y, b] = &mut grid_xyb;
+                                let mut gi32 = [
+                                    x.borrow_mut().into_i32(),
+                                    y.borrow_mut().into_i32(),
+                                    b.borrow_mut().into_i32(),
+                                ];
+                                let r = crate::jxl_decode::jxl_frame::data::decode_pass_group(
+                                    &mut bitstream,
+                                    PassGroupParams {
+                                        frame_header,
+                                        lf_group,
+                                        pass_idx: pass_idx as u32,
+                                        group_idx,
+                                        global_ma_config,
+                                        modular,
+                                        vardct: Some(PassGroupParamsVardct {
+                                            lf_vardct: lf_global_vardct,
+                                            hf_global,
+                                            hf_coeff_output: &mut gi32,
+                                        }),
+                                        allow_partial,
+                                        tracker,
+                                        pool,
+                                    },
+                                );
+                                if !allow_partial && r.is_err() {
+                                    *result_ref.write().unwrap() = r.map_err(From::from);
+                                    decode_ok = false;
+                                }
+                            } // gi32 dropped → i32 reborrow released
+                        }
                     }
 
-                    let mut grid_xyb = {
-                        let [x, y, b] = grid_xyb;
-                        [x, y, b].map(|grid| grid.borrow_mut().into_i32())
-                    };
-
-                    let bitstream = match frame.pass_group_bitstream(pass_idx, group_idx) {
-                        Some(Ok(bitstream)) => bitstream,
-                        Some(Err(e)) => {
-                            *result.write().unwrap() = Err(e.into());
-                            continue;
-                        }
-                        None => continue,
-                    };
-                    let allow_partial = bitstream.partial;
-                    let mut bitstream = bitstream.bitstream;
-
-                    let modular = image_it
-                        .find(|(image_idx, _)| *image_idx == group_idx as usize)
-                        .map(|(_, modular)| modular);
-
-                    let result = &result;
-                    scope.spawn(move |_| {
-                        let vardct = Some(PassGroupParamsVardct {
-                            lf_vardct: lf_global_vardct,
+                    // Immediately dequant + CfL + IDCT (HF coefficients are still hot in cache).
+                    if has_hf && decode_ok {
+                        dequant_hf_varblock_grouped(
+                            &mut grid_xyb,
+                            group_idx,
+                            image_header,
+                            frame_header,
+                            lf_global,
+                            lf_groups_ref,
                             hf_global,
-                            hf_coeff_output: &mut grid_xyb,
-                        });
-
-                        let r = crate::jxl_decode::jxl_frame::data::decode_pass_group(
-                            &mut bitstream,
-                            PassGroupParams {
-                                frame_header,
-                                lf_group,
-                                pass_idx,
-                                group_idx,
-                                global_ma_config,
-                                modular,
-                                vardct,
-                                allow_partial,
-                                tracker,
-                                pool,
-                            },
                         );
-                        if !allow_partial && r.is_err() {
-                            *result.write().unwrap() = r.map_err(From::from);
+
+                        if !subsampled {
+                            let hf_meta = lf_group.hf_meta.as_ref().unwrap();
+                            let lf_chan_corr = &lf_global_vardct.lf_chan_corr;
+                            let cfl_base_x = ((group_x % 8) * group_dim / 64) as usize;
+                            let cfl_base_y = ((group_y % 8) * group_dim / 64) as usize;
+                            let gw = grid_xyb[0].width().div_ceil(64);
+                            let gh = grid_xyb[0].height().div_ceil(64);
+                            let x_from_y = hf_meta.x_from_y.as_subgrid().subgrid(
+                                cfl_base_x..(cfl_base_x + gw),
+                                cfl_base_y..(cfl_base_y + gh),
+                            );
+                            let b_from_y = hf_meta.b_from_y.as_subgrid().subgrid(
+                                cfl_base_x..(cfl_base_x + gw),
+                                cfl_base_y..(cfl_base_y + gh),
+                            );
+                            chroma_from_luma_hf_grouped(
+                                &mut grid_xyb,
+                                &x_from_y,
+                                &b_from_y,
+                                lf_chan_corr,
+                            );
                         }
-                    });
-                }
-            });
-        }
+                    }
+
+                    // LF→pixel IDCT always runs (covers both LF-only and HF groups).
+                    transform_with_lf_grouped(
+                        lf_xyb_ref,
+                        &mut grid_xyb,
+                        group_idx,
+                        frame_header,
+                        lf_groups_ref,
+                    );
+                });
+            }
+        });
 
         result.into_inner().unwrap()
     })?;
-
-    tracing::trace_span!("Dequant and transform").in_scope(|| {
-        let groups_per_row = frame_header.groups_per_row();
-
-        pool.for_each_vec(it, |job| {
-            let (group_idx, mut grid_xyb, lf_group) = job;
-            let grid_xyb = &mut grid_xyb;
-            let group_x = group_idx % groups_per_row;
-            let group_y = group_idx / groups_per_row;
-
-            let transform_hf = {
-                let left = group_x * group_dim;
-                let top = group_y * group_dim;
-
-                let group_region = Region {
-                    left: left as i32,
-                    top: top as i32,
-                    width: group_dim,
-                    height: group_dim,
-                };
-                !group_region.intersection(aligned_region).is_empty()
-            };
-
-            if lf_group.hf_meta.is_none() || hf_global.is_none() || !transform_hf {
-                transform_with_lf_grouped(&lf_xyb, grid_xyb, group_idx, frame_header, lf_groups);
-                return;
-            }
-
-            let hf_global = hf_global.unwrap();
-
-            dequant_hf_varblock_grouped(
-                grid_xyb,
-                group_idx,
-                image_header,
-                frame_header,
-                lf_global,
-                lf_groups,
-                hf_global,
-            );
-
-            if !subsampled {
-                let hf_meta = lf_group.hf_meta.as_ref().unwrap();
-                let lf_chan_corr = &lf_global_vardct.lf_chan_corr;
-                let cfl_base_x = ((group_x % 8) * group_dim / 64) as usize;
-                let cfl_base_y = ((group_y % 8) * group_dim / 64) as usize;
-                let gw = grid_xyb[0].width().div_ceil(64);
-                let gh = grid_xyb[0].height().div_ceil(64);
-                let x_from_y = hf_meta
-                    .x_from_y
-                    .as_subgrid()
-                    .subgrid(cfl_base_x..(cfl_base_x + gw), cfl_base_y..(cfl_base_y + gh));
-                let b_from_y = hf_meta
-                    .b_from_y
-                    .as_subgrid()
-                    .subgrid(cfl_base_x..(cfl_base_x + gw), cfl_base_y..(cfl_base_y + gh));
-                chroma_from_luma_hf_grouped(grid_xyb, &x_from_y, &b_from_y, lf_chan_corr);
-            }
-
-            transform_with_lf_grouped(&lf_xyb, grid_xyb, group_idx, frame_header, lf_groups);
-        });
-    });
 
     if let Some(modular_image) = modular_image {
         tracing::trace_span!("Extra channel inverse transform").in_scope(|| {

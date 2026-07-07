@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, PixelFormat};
+use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, JxlThreadPool, PixelFormat};
 use fast_image_resize as fir;
 use image::{codecs::png::PngEncoder, ColorType, GenericImageView, ImageEncoder, RgbImage};
 use lru::LruCache;
@@ -389,32 +389,33 @@ fn decode_jxl_from_bytes_with_hint(
     let width = image.width();
     let height = image.height();
     let pixel_format = image.pixel_format();
+    let pool = image.pool();
 
     // Fast path: zero-copy — access the AlignedGrid<f32> buffers directly without
     // allocating new FrameBuffers or doing the scalar per-pixel copy in `from_grids`.
     if let Some(raw) = frame.color_channels_raw_f32() {
-        let result = planar_to_rgb(
+        return Ok(planar_to_rgb(
             pixel_format,
             raw[0],
             raw.get(1).copied(),
             raw.get(2).copied(),
             width,
             height,
-        );
-        return Ok(result);
+            pool,
+        ));
     }
 
     // Slow path: orientation != 1 or non-f32 channels
     let planes = frame.image_planar();
-    let result = planar_to_rgb(
+    Ok(planar_to_rgb(
         pixel_format,
         planes[0].buf(),
         planes.get(1).map(|plane| plane.buf()),
         planes.get(2).map(|plane| plane.buf()),
         width,
         height,
-    );
-    Ok(result)
+        pool,
+    ))
 }
 
 /// Decodes a rectangular JPEG XL region from disk into packed RGB pixels.
@@ -474,6 +475,7 @@ fn decode_jxl_region_from_bytes_with_hint(
     let frame = image
         .render_frame(0)
         .map_err(|error| decode_malformed(format!("JPEG XL region rendering failed: {error}")))?;
+    let pool = image.pool();
     if let Some(raw) = frame.color_channels_raw_f32() {
         if raw.is_empty() {
             return Err(decode_malformed(
@@ -491,6 +493,7 @@ fn decode_jxl_region_from_bytes_with_hint(
             raw.get(2).copied(),
             rendered_w,
             rendered_h,
+            pool,
         ));
     }
 
@@ -508,6 +511,7 @@ fn decode_jxl_region_from_bytes_with_hint(
         planes.get(2).map(|plane| plane.buf()),
         planes[0].width() as u32,
         planes[0].height() as u32,
+        pool,
     ))
 }
 
@@ -1266,15 +1270,16 @@ fn planar_to_rgb(
     b: Option<&[f32]>,
     width: u32,
     height: u32,
+    pool: &JxlThreadPool,
 ) -> DecodedImage {
     let total = (width * height) as usize;
 
-    // Only parallelize when the image is large enough to amortize rayon task-scheduling + thread
-    // wakeup overhead. Empirically, ≥3M pixels is the break-even for this machine.
+    // Only parallelize when the image is large enough to amortize task-scheduling overhead.
+    // Empirically, ≥3M pixels is the break-even point.
     const PARALLEL_THRESHOLD: usize = 3_000_000;
-    // Process 8192-pixel chunks in parallel (each chunk: ~96 KB of f32 in, ~24 KB u8 out).
+    // 8192-pixel chunks: ~96 KB f32 in, ~24 KB u8 out — fits well in L1/L2 per task.
     const CHUNK: usize = 8192;
-    let parallel = total >= PARALLEL_THRESHOLD;
+    let parallel = pool.is_multithreaded() && total >= PARALLEL_THRESHOLD;
 
     // Serial path: zero-fill warms cache lines before the AVX2 write pass, avoiding demand-paging
     // stalls on cold pages.  Parallel path: every byte is overwritten, so skip the zero-fill.
@@ -1296,20 +1301,24 @@ fn planar_to_rgb(
     match pixel_format {
         PixelFormat::Gray | PixelFormat::Graya => {
             if parallel {
-                pixels
-                    .par_chunks_mut(CHUNK * 3)
-                    .enumerate()
-                    .for_each(|(i, out_chunk)| {
-                        let start = i * CHUNK;
-                        let n = out_chunk.len() / 3;
-                        let r_chunk = &r[start..start + n];
-                        if avx2 {
-                            #[cfg(target_arch = "x86_64")]
-                            unsafe { planar_to_rgb_gray_avx2(r_chunk, out_chunk) };
-                        } else {
-                            planar_to_rgb_gray_scalar(r_chunk, out_chunk);
-                        }
-                    });
+                // Use pool.install so par_chunks_mut runs on the warm dedicated pool threads
+                // (still spinning from the decode pass), avoiding global-pool wakeup latency.
+                pool.install(|| {
+                    pixels
+                        .par_chunks_mut(CHUNK * 3)
+                        .enumerate()
+                        .for_each(|(i, out_chunk)| {
+                            let start = i * CHUNK;
+                            let n = out_chunk.len() / 3;
+                            let r_chunk = &r[start..start + n];
+                            if avx2 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe { planar_to_rgb_gray_avx2(r_chunk, out_chunk) };
+                            } else {
+                                planar_to_rgb_gray_scalar(r_chunk, out_chunk);
+                            }
+                        });
+                });
             } else if avx2 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe { planar_to_rgb_gray_avx2(r, &mut pixels) };
@@ -1322,22 +1331,26 @@ fn planar_to_rgb(
             let b = b.expect("blue plane present for RGB-like JXL image");
 
             if parallel {
-                pixels
-                    .par_chunks_mut(CHUNK * 3)
-                    .enumerate()
-                    .for_each(|(i, out_chunk)| {
-                        let start = i * CHUNK;
-                        let n = out_chunk.len() / 3;
-                        let r_chunk = &r[start..start + n];
-                        let g_chunk = &g[start..start + n];
-                        let b_chunk = &b[start..start + n];
-                        if avx2 {
-                            #[cfg(target_arch = "x86_64")]
-                            unsafe { planar_to_rgb_rgb_avx2(r_chunk, g_chunk, b_chunk, out_chunk) };
-                        } else {
-                            planar_to_rgb_rgb_scalar(r_chunk, g_chunk, b_chunk, out_chunk);
-                        }
-                    });
+                pool.install(|| {
+                    pixels
+                        .par_chunks_mut(CHUNK * 3)
+                        .enumerate()
+                        .for_each(|(i, out_chunk)| {
+                            let start = i * CHUNK;
+                            let n = out_chunk.len() / 3;
+                            let r_chunk = &r[start..start + n];
+                            let g_chunk = &g[start..start + n];
+                            let b_chunk = &b[start..start + n];
+                            if avx2 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    planar_to_rgb_rgb_avx2(r_chunk, g_chunk, b_chunk, out_chunk)
+                                };
+                            } else {
+                                planar_to_rgb_rgb_scalar(r_chunk, g_chunk, b_chunk, out_chunk);
+                            }
+                        });
+                });
             } else if avx2 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe { planar_to_rgb_rgb_avx2(r, g, b, &mut pixels) };

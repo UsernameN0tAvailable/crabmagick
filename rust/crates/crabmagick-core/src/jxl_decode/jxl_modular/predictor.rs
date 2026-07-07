@@ -211,6 +211,59 @@ impl<'prev, 'a, S: Sample> PredictorState<'prev, 'a, S> {
         Properties::new::<EDGE>(self, prediction)
     }
 
+    /// Fast path for SelfCorrecting single-node decode: returns the WP prediction result and
+    /// `prev_grad` (= `w − nw + n`) without building the full 16-element `prop_cache`.
+    /// Only call this when the predictor is `SelfCorrecting` and `self_correcting` is `Some`.
+    #[inline(always)]
+    pub(super) fn sc_predict_fast<const EDGE: bool>(&self) -> (PredictionResult, i32) {
+        let n = self.n;
+        let nw = self.nw;
+        let w = self.w;
+        let pred_result = self.run_sc_pred::<EDGE>(
+            self.self_correcting.as_ref().expect("SC predictor present"),
+        );
+        let prev_grad = w.wrapping_sub(nw).wrapping_add(n);
+        (pred_result, prev_grad)
+    }
+
+    /// Fast-path record for SelfCorrecting single-node decode.  Updates both the SC predictor's
+    /// error arrays and the general predictor state without going through `Properties`.
+    /// `prev_grad` must be the value returned by the matching `sc_predict_fast` call.
+    #[inline(always)]
+    pub(super) fn record_sc_fast(&mut self, pred_result: PredictionResult, sample: i32, prev_grad: i32) {
+        if let Some(sc) = &mut self.self_correcting {
+            sc.record(pred_result, sample);
+        }
+
+        if let Some(out) = self.curr_row.get_mut(self.x as usize) {
+            *out = sample;
+        } else {
+            self.curr_row.push(sample);
+        }
+        self.x += 1;
+
+        if self.x >= self.width {
+            self.y += 1;
+            self.x = 0;
+            std::mem::swap(&mut self.prev_row, &mut self.curr_row);
+            self.prev_grad = 0;
+            let n = self.prev_row[0];
+            self.n = n;
+            self.w = n;
+            self.nw = n;
+        } else {
+            self.prev_grad = prev_grad;
+            self.w = sample;
+            if self.prev_row.is_empty() {
+                self.nw = sample;
+                self.n = sample;
+            } else {
+                self.nw = self.n;
+                self.n = self.prev_row[self.x as usize];
+            }
+        }
+    }
+
     #[inline(always)]
     fn run_sc_pred<const EDGE: bool>(&self, sc_pred: &SelfCorrectingPredictor) -> PredictionResult {
         sc_pred.predict(

@@ -7,7 +7,7 @@ use crate::jxl_decode::jxl_grid::{AlignedGrid, AllocTracker, MutableSubgrid};
 use crate::jxl_decode::jxl_modular::{
     MaConfig, ModularChannelInfo, ModularChannels, ModularHeader, Result,
     ma::{FlatMaTree, MaTreeLeafClustered, SimpleMaTable},
-    predictor::{Predictor, PredictorState, Properties, WpHeader},
+    predictor::{Predictor, PredictionResult, PredictorState, Properties, WpHeader},
     sample::Sample,
 };
 
@@ -761,6 +761,17 @@ fn decode_single_node<S: Sample>(
             tracing::trace!("Simple gradient: quite fast path");
             decode_simple_grad(bitstream, decoder, cluster, dist_multiplier, grid)
         }
+        (Predictor::SelfCorrecting, _) => {
+            predictor_state.reset(grid.width() as u32, &[], Some(wp_header));
+            decode_single_node_slow_sc(
+                bitstream,
+                decoder,
+                dist_multiplier,
+                node,
+                predictor_state,
+                grid,
+            )
+        }
         _ => {
             let wp_header = (predictor == Predictor::SelfCorrecting).then_some(wp_header);
             predictor_state.reset(grid.width() as u32, &[], wp_header);
@@ -890,6 +901,69 @@ fn decode_one<S: Sample, const EDGE: bool>(
     Ok(diff.add(S::from_i32(sample_prediction)))
 }
 
+/// Specialised fast path for [`decode_single_node_slow`] when the predictor is
+/// `Predictor::SelfCorrecting`.  Skips building the full 16-element `prop_cache` in
+/// [`Properties::new`] because the MA tree has exactly one node (no decisions needed).
+/// Only `sc_prediction.prediction` and `prev_grad` (= `w − nw + n`) are required.
+#[inline(never)]
+fn decode_single_node_slow_sc<S: Sample>(
+    bitstream: &mut Bitstream,
+    decoder: &mut Decoder,
+    dist_multiplier: u32,
+    leaf: &MaTreeLeafClustered,
+    predictor: &mut PredictorState<S>,
+    grid: &mut MutableSubgrid<S>,
+) -> Result<()> {
+    #[inline(always)]
+    fn decode_sc_pixel<S: Sample, const EDGE: bool>(
+        bitstream: &mut Bitstream,
+        decoder: &mut Decoder,
+        dist_multiplier: u32,
+        leaf: &MaTreeLeafClustered,
+        predictor: &mut PredictorState<S>,
+    ) -> Result<S> {
+        let (pred_result, prev_grad) = predictor.sc_predict_fast::<EDGE>();
+        let prediction = ((pred_result.prediction + 3) >> 3) as i32;
+        let token = decoder.read_varint_with_multiplier_clustered(
+            bitstream,
+            leaf.cluster,
+            dist_multiplier,
+        )?;
+        let diff = S::unpack_signed_u32(token).wrapping_muladd_i32(leaf.multiplier as i32, leaf.offset);
+        let true_value = diff.add(S::from_i32(prediction));
+        predictor.record_sc_fast(pred_result, true_value.to_i32(), prev_grad);
+        Ok(true_value)
+    }
+
+    let height = grid.height();
+    for y in 0..2usize.min(height) {
+        let row = grid.get_row_mut(y);
+        for out in row.iter_mut() {
+            *out = decode_sc_pixel::<_, true>(bitstream, decoder, dist_multiplier, leaf, predictor)?;
+        }
+    }
+    for y in 2..height {
+        let row = grid.get_row_mut(y);
+        let (row_left, row_middle, row_right) = if row.len() <= 4 {
+            (row, [].as_mut(), [].as_mut())
+        } else {
+            let (l, m) = row.split_at_mut(2);
+            let (m, r) = m.split_at_mut(m.len() - 2);
+            (l, m, r)
+        };
+        for out in row_left {
+            *out = decode_sc_pixel::<_, true>(bitstream, decoder, dist_multiplier, leaf, predictor)?;
+        }
+        for out in row_middle {
+            *out = decode_sc_pixel::<_, false>(bitstream, decoder, dist_multiplier, leaf, predictor)?;
+        }
+        for out in row_right {
+            *out = decode_sc_pixel::<_, true>(bitstream, decoder, dist_multiplier, leaf, predictor)?;
+        }
+    }
+    Ok(())
+}
+
 #[inline(never)]
 fn decode_single_node_slow<S: Sample>(
     bitstream: &mut Bitstream,
@@ -971,6 +1045,26 @@ fn decode_simple_table<S: Sample>(
             bitstream,
             decoder,
             dist_multiplier,
+            grid,
+            value_base,
+            cluster_table,
+        );
+    }
+
+    // Hot path: SelfCorrecting predictor with max_error cluster selection (decision_prop=15).
+    // Both max_error and the prediction come from the WP prediction result — skip building
+    // the full 16-element prop_cache (props 0-14 are unused for this combination).
+    if offset == 0
+        && multiplier == 1
+        && decision_prop == 15
+        && predictor == Predictor::SelfCorrecting
+    {
+        return decode_simple_table_sc_max_err(
+            bitstream,
+            decoder,
+            dist_multiplier,
+            predictor_state,
+            wp_header,
             grid,
             value_base,
             cluster_table,
@@ -1080,6 +1174,80 @@ fn decode_table_one<S: Sample, const EDGE: bool>(
     let predictor = table.predictor;
     let sample_prediction = predictor.predict::<_, EDGE>(properties);
     Ok(diff.add(S::from_i32(sample_prediction)))
+}
+
+/// Specialised fast path for `decode_simple_table_slow` when `decision_prop == 15`
+/// (SC `max_error`) and `predictor == SelfCorrecting` with `offset == 0, multiplier == 1`.
+///
+/// Both the cluster key (`max_error`) and the pixel prediction come from the WP prediction
+/// result, so `prop_cache[0..14]` is never needed.  Using [`PredictorState::sc_predict_fast`]
+/// and [`PredictorState::record_sc_fast`] avoids all unnecessary property computations.
+#[inline(never)]
+fn decode_simple_table_sc_max_err<S: Sample>(
+    bitstream: &mut Bitstream,
+    decoder: &mut Decoder,
+    dist_multiplier: u32,
+    predictor: &mut PredictorState<S>,
+    wp_header: &WpHeader,
+    grid: &mut MutableSubgrid<S>,
+    value_base: i32,
+    cluster_table: &[u8],
+) -> Result<()> {
+    predictor.reset(grid.width() as u32, &[], Some(wp_header));
+
+    #[inline(always)]
+    fn decode_sc_max_err_pixel<S: Sample, const EDGE: bool>(
+        bitstream: &mut Bitstream,
+        decoder: &mut Decoder,
+        dist_multiplier: u32,
+        predictor: &mut PredictorState<S>,
+        value_base: i32,
+        cluster_table: &[u8],
+    ) -> Result<S> {
+        let (pred_result, prev_grad) = predictor.sc_predict_fast::<EDGE>();
+        let cluster = cluster_from_table(pred_result.max_error, value_base, cluster_table);
+        let token = decoder.read_varint_with_multiplier_clustered(bitstream, cluster, dist_multiplier)?;
+        let prediction = ((pred_result.prediction + 3) >> 3) as i32;
+        let true_value = S::unpack_signed_u32(token).add(S::from_i32(prediction));
+        predictor.record_sc_fast(pred_result, true_value.to_i32(), prev_grad);
+        Ok(true_value)
+    }
+
+    let height = grid.height();
+    for y in 0..2usize.min(height) {
+        let row = grid.get_row_mut(y);
+        for out in row.iter_mut() {
+            *out = decode_sc_max_err_pixel::<_, true>(
+                bitstream, decoder, dist_multiplier, predictor, value_base, cluster_table,
+            )?;
+        }
+    }
+    for y in 2..height {
+        let row = grid.get_row_mut(y);
+        let (row_left, row_middle, row_right) = if row.len() <= 4 {
+            (row, [].as_mut(), [].as_mut())
+        } else {
+            let (l, m) = row.split_at_mut(2);
+            let (m, r) = m.split_at_mut(m.len() - 2);
+            (l, m, r)
+        };
+        for out in row_left {
+            *out = decode_sc_max_err_pixel::<_, true>(
+                bitstream, decoder, dist_multiplier, predictor, value_base, cluster_table,
+            )?;
+        }
+        for out in row_middle {
+            *out = decode_sc_max_err_pixel::<_, false>(
+                bitstream, decoder, dist_multiplier, predictor, value_base, cluster_table,
+            )?;
+        }
+        for out in row_right {
+            *out = decode_sc_max_err_pixel::<_, true>(
+                bitstream, decoder, dist_multiplier, predictor, value_base, cluster_table,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[inline(never)]

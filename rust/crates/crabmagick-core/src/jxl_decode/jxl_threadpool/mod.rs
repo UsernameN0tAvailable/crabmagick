@@ -146,6 +146,21 @@ impl JxlThreadPool {
         }
     }
 
+    /// Runs the given closure on the thread pool, returning its result.
+    ///
+    /// When backed by a dedicated Rayon [`ThreadPool`][rayon_core::ThreadPool], any parallel
+    /// iterators used inside `op` will execute on that pool's threads (which stay warm after a
+    /// decode pass) rather than the global Rayon thread pool.
+    pub fn install<R: Send, F: FnOnce() -> R + Send>(&self, f: F) -> R {
+        match &self.0 {
+            #[cfg(feature = "rayon")]
+            JxlThreadPoolImpl::Rayon(pool) => pool.install(f),
+            #[cfg(feature = "rayon")]
+            JxlThreadPoolImpl::RayonGlobal => f(),
+            JxlThreadPoolImpl::None => f(),
+        }
+    }
+
     /// Consumes the `Vec`, and runs a job for each element of the `Vec`.
     pub fn for_each_vec<T: Send>(&self, v: Vec<T>, op: impl Fn(T) + Send + Sync) {
         match &self.0 {
