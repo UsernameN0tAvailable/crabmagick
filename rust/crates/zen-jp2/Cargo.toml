@@ -3,7 +3,7 @@ name = "zen-jp2"
 version = "0.1.0"
 edition = "2024"
 description = "Pure Rust JPEG 2000 decoder (JP2/J2K) — forked from hayro-jpeg2000, optimized for parallel tile decode"
-license = "Apache-2.0 OR MIT"
+license = "AGPL-3.0-or-later"
 rust-version = "1.89"
 
 [features]

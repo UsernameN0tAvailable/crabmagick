@@ -42,7 +42,7 @@ categories = [
     "multimedia::images",
     "multimedia::encoding",
 ]
-license = "AGPL-3.0-only OR LicenseRef-Imazen-Commercial"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/imazen/jxl-encoder"
 resolver = "2"
 

@@ -1,0 +1,36 @@
+CrabMagick
+Copyright (C) 2024 the CrabMagick contributors
+Licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later).
+See LICENSE for the full license text.
+
+Commercial licenses available at https://www.imazen.io/pricing (for the JXL encoder component).
+
+────────────────────────────────────────────────────────────────────────────────
+Third-party components bundled in this distribution
+────────────────────────────────────────────────────────────────────────────────
+
+1. JXL encoder (src/jxl_encode/)
+   Copyright (c) Imazen LLC and the JPEG XL Project Authors.
+   Algorithms and constants derived from libjxl (BSD-3-Clause).
+   Licensed under AGPL-3.0-or-later.
+   Commercial licenses: https://www.imazen.io/pricing
+
+2. JXL decoder (src/jxl_decode/)
+   Copyright (c) 2023 the jxl-oxide contributors.
+   Licensed under MIT OR Apache-2.0.
+   https://github.com/tirr-c/jxl-oxide
+
+3. JPEG decoder (src/jpeg_decode/, src/jpeg_decode_core/)
+   Copyright (c) 2023 Caleb Zulawski and the zune-image contributors.
+   Licensed under MIT OR Apache-2.0 OR Zlib.
+   https://github.com/etemesi254/zune-image
+
+4. WebP decoder (src/webp_decode/)
+   Copyright (c) the image-rs contributors.
+   Licensed under MIT OR Apache-2.0.
+   https://github.com/image-rs/image-webp
+
+5. JPEG 2000 decoder (src/jpeg2000_decode/)
+   Copyright (c) Laurenz Stampfl (hayro-jpeg2000).
+   Licensed under MIT OR Apache-2.0.
+   https://github.com/LaurenzV/hayro

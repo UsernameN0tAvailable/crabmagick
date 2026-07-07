@@ -12,13 +12,13 @@ use crate::pipeline::{
 /// Output codecs supported by [`process_image`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// Baseline JPEG output encoded through bundled `zenjpeg`.
+    /// Baseline JPEG output encoded through bundled JPEG encoder.
     Jpeg,
-    /// Lossy WebP output encoded through bundled `fast-webp`.
+    /// Lossy WebP output encoded through bundled WebP decoder.
     Webp,
     /// PNG output encoded through the `image` crate.
     Png,
-    /// JPEG XL output encoded through bundled `jxl-encoder`.
+    /// JPEG XL output encoded through bundled JXL encoder.
     Jxl,
     /// AVIF output encoded through `ravif` when the `avif` feature is enabled.
     Avif,

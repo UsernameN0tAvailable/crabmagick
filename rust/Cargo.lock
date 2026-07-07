@@ -518,6 +518,7 @@ dependencies = [
  "quick-error",
  "ravif 0.11.20",
  "rayon",
+ "rayon-core",
  "resvg",
  "rgb",
  "safe_unaligned_simd",

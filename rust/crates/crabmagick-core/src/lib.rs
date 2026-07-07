@@ -6,29 +6,29 @@ extern crate alloc;
 
 whereat::define_at_crate_info!(path = "crabmagick-core/");
 
-/// Bundled fast WebP codec implementation used internally by the pipeline.
-pub(crate) mod fast_webp;
-/// Bundled JPEG XL encoder implementation used internally by the pipeline.
-pub mod jxl_encoder;
-/// Vendored `jxl-oxide` decoder ecosystem with upgraded AVX2/AVX512 DCT.
-pub(crate) mod jxl_oxide_vendored;
-/// Bundled SIMD helpers shared by the JPEG XL encoder.
-pub(crate) mod jxl_encoder_simd;
+/// WebP decode implementation.
+pub(crate) mod webp_decode;
+/// JXL encode implementation.
+pub mod jxl_encode;
+/// JXL decode implementation (AVX2/AVX512 DCT).
+pub(crate) mod jxl_decode;
+/// JXL encoder SIMD kernels.
+pub(crate) mod jxl_encode_simd;
 /// Low-level decode, transform, and encode primitives.
 pub mod pipeline;
 /// High-level request types and orchestration helpers.
 pub mod processor;
-/// Bundled JPEG 2000 decoder implementation used internally by the pipeline.
-pub(crate) mod zen_jp2;
-/// Bundled JPEG codec implementation used internally by the pipeline.
-pub(crate) mod zenjpeg;
-/// Vendored `zune-core` support crate (shared types for the JPEG decoder).
-pub(crate) mod zune_core;
-/// Vendored `zune-jpeg` decoder with added AVX-512 IDCT and color-convert paths.
-pub(crate) mod zune_jpeg;
+/// JPEG 2000 decode implementation.
+pub(crate) mod jpeg2000_decode;
+/// JPEG encode implementation.
+pub(crate) mod jpeg_encode;
+/// JPEG decoder core types.
+pub(crate) mod jpeg_decode_core;
+/// JPEG decode implementation (SIMD AVX-512/AVX2/NEON).
+pub(crate) mod jpeg_decode;
 
 pub use pipeline::{JxlEncodeOptions, decode_jxl_info_from_bytes, encode_jxl_rgb};
-pub use jxl_encoder::{EncoderMode, PixelLayout as JxlPixelLayout};
+pub use jxl_encode::{EncoderMode, PixelLayout as JxlPixelLayout};
 pub use processor::{
     get_info, init, process_image, CrabMagickError, CrabMagickProcessor, ImageInfo, OutputFormat,
     ProcessRequest, RequestedRegion,

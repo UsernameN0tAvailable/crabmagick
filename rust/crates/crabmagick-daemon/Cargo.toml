@@ -3,7 +3,7 @@ name = "crabmagick-daemon"
 version = "0.1.0"
 edition = "2021"
 description = "Unix socket daemon for crabmagick — spawned automatically by PHP, no php.ini needed"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/UsernameN0tAvailable/crabmagick"
 
 [[bin]]

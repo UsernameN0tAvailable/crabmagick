@@ -1,9 +1,9 @@
 [package]
 name = "crabmagick-core"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Pure-Rust image processing pipeline for PHP — multi-format decode and JXL/JPEG/WebP/PNG/AVIF encode"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/UsernameN0tAvailable/crabmagick"
 keywords = ["image", "jxl", "jpeg", "webp", "iiif"]
 categories = ["multimedia::images"]
@@ -37,6 +37,7 @@ pdfium-render = { version = "0.8", features = ["static"], optional = true }
 quick-error = "2.0.1"
 ravif = { version = "0.11", default-features = false, features = ["threading"], optional = true }
 rayon = "1.10"
+rayon-core = "1"
 resvg = "0.44"
 rgb = { version = "0.8", features = ["as-bytes"] }
 safe_unaligned_simd = { version = "0.2.5", features = ["avx512"] }
@@ -69,9 +70,13 @@ jp2 = []
 layout = ["decoder", "dep:zenlayout", "dep:zenresize"]
 logging = ["std"]
 moxcms = ["dep:moxcms"]
-parallel = ["std"]
+parallel = ["std", "rayon"]
 pdf = ["dep:pdfium-render"]
 rate-control = ["dep:butteraugli"]
+# Enables Rayon-backed multithreaded JPEG XL group decoding in the vendored jxl-oxide.
+# Gated so the vendored `#[cfg(feature = "rayon")]` paths (jxl_threadpool/jxl_oxide) compile and
+# `default_pool()` returns the global Rayon pool instead of the single-threaded `none()` pool.
+rayon = []
 simd = ["dep:fearless_simd", "std"]
 ssim2-loop = ["dep:fast-ssim2"]
 std = ["thiserror/std", "archmage/std", "magetypes/std"]

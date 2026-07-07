@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use fast_image_resize as fir;
 use image::{codecs::png::PngEncoder, ColorType, GenericImageView, ImageEncoder, RgbImage};
-use crate::jxl_oxide_vendored::jxl_oxide::{CropInfo, JxlImage, PixelFormat};
+use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, PixelFormat};
 use lru::LruCache;
 use memmap2::Mmap;
 #[cfg(feature = "pdf")]
@@ -22,9 +22,9 @@ use rayon::prelude::*;
 use resvg::{tiny_skia, usvg};
 use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
 
-use crate::jxl_encoder::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
+use crate::jxl_encode::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
 use crate::processor::{CrabMagickError, ImageInfo, OutputFormat, RequestedRegion};
-use crate::zenjpeg::encoder::{
+use crate::jpeg_encode::encoder::{
     ChromaSubsampling, EncoderConfig, PixelLayout as ZenLayout, Unstoppable,
 };
 
@@ -393,7 +393,7 @@ fn decode_jxl_from_bytes_with_hint(
 ///
 /// # Performance
 ///
-/// Uses `jxl-oxide` region decode so only the requested window is rendered.
+/// Uses JXL decoder region decode so only the requested window is rendered.
 pub fn decode_jxl_region(
     path: &str,
     left: u32,
@@ -409,7 +409,7 @@ pub fn decode_jxl_region(
 ///
 /// # Performance
 ///
-/// Uses `jxl-oxide` region decode so only the requested window is rendered.
+/// Uses JXL decoder region decode so only the requested window is rendered.
 pub fn decode_jxl_region_from_bytes(
     bytes: &[u8],
     left: u32,
@@ -484,7 +484,7 @@ fn create_jxl_image(
     render_size: Option<(u32, u32)>,
 ) -> Result<JxlImage, CrabMagickError> {
     let _ = render_size;
-    // jxl-oxide 0.12.6 exposes region cropping but does not currently expose a render-size or
+    // JXL decoder 0.12.6 exposes region cropping but does not currently expose a render-size or
     // decode-scale hint on JxlImage/JxlImageBuilder, so we keep the requested size only as a
     // future integration hook.
     JxlImage::builder()
@@ -820,7 +820,7 @@ pub fn encode(
 
     match format {
         OutputFormat::Jpeg => {
-            // TODO: plumb jxl-oxide's planar render buffers directly into zenjpeg once the
+            // TODO: plumb JXL decoder's planar render buffers directly into JPEG encoder once the
             // encoder exposes a non-packed RGB/YCbCr entry point. Today the hot path still
             // expects packed RGB8 slices, so JXL->JPEG keeps this intermediate representation.
             let config = EncoderConfig::ycbcr(quality.min(100), ChromaSubsampling::Quarter);
@@ -835,7 +835,7 @@ pub fn encode(
         OutputFormat::Webp => {
             let rgb = RgbImage::from_raw(width, height, pixels)
                 .ok_or_else(|| encode_error("WebP encoding received an invalid RGB buffer shape"))?;
-            crate::fast_webp::encode_lossy_webp(&rgb, quality.min(100))
+            crate::webp_decode::encode_lossy_webp(&rgb, quality.min(100))
                 .map_err(|error| encode_error(format!("WebP encoding failed: {error}")))
         }
         OutputFormat::Png => {
@@ -967,10 +967,10 @@ fn decode_via_image(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
 
 #[inline]
 fn decode_jpeg_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
-    use crate::zune_core::bytestream::ZCursor;
-    use crate::zune_core::colorspace::ColorSpace;
-    use crate::zune_core::options::DecoderOptions;
-    use crate::zune_jpeg::JpegDecoder;
+    use crate::jpeg_decode_core::bytestream::ZCursor;
+    use crate::jpeg_decode_core::colorspace::ColorSpace;
+    use crate::jpeg_decode_core::options::DecoderOptions;
+    use crate::jpeg_decode::JpegDecoder;
 
     let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
@@ -993,7 +993,7 @@ fn decode_jpeg_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
 #[inline]
 fn decode_webp_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
     let reader = BufReader::new(Cursor::new(bytes));
-    let mut decoder = crate::fast_webp::WebPDecoder::new(reader)
+    let mut decoder = crate::webp_decode::WebPDecoder::new(reader)
         .map_err(|error| decode_malformed(format!("WebP decoder initialization failed: {error}")))?;
     let (width, height) = decoder.dimensions();
     let has_alpha = decoder.has_alpha();
@@ -1378,4 +1378,5 @@ fn distance_from_quality(quality: u8) -> f32 {
     let quality = quality.clamp(1, 100) as f32;
     (100.0 - quality) / 25.0 + 0.5
 }
+
 
