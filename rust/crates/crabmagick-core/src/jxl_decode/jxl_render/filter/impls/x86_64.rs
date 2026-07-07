@@ -6,7 +6,7 @@ use crate::jxl_decode::jxl_render::{
     Region,
     filter::{
         epf::run_epf_rows,
-        gabor::{run_gabor_row_generic, run_gabor_rows, run_gabor_rows_unsafe},
+        gabor::{run_gabor_row_generic, run_gabor_rows, run_gabor_3ch_rows_unsafe},
     },
 };
 
@@ -79,17 +79,16 @@ pub fn apply_gabor_like(
     pool: &crate::jxl_decode::jxl_threadpool::JxlThreadPool,
 ) {
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        // SAFETY: Features are checked above.
+        // SAFETY: Features are checked above. run_gabor_3ch_rows_unsafe processes all
+        // 3 channels in a single pool::for_each_vec, eliminating 2 sequential barriers.
         unsafe {
-            for ((input, output), weights) in fb.into_iter().zip(fb_scratch).zip(weights) {
-                run_gabor_rows_unsafe(
-                    input,
-                    output,
-                    weights,
-                    pool,
-                    gabor_avx2::run_gabor_row_x86_64_avx2,
-                );
-            }
+            run_gabor_3ch_rows_unsafe(
+                fb,
+                fb_scratch,
+                weights,
+                pool,
+                gabor_avx2::run_gabor_row_x86_64_avx2,
+            );
         }
         return;
     }

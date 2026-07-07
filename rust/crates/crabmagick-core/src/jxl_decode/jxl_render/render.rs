@@ -66,7 +66,6 @@ pub(crate) fn render_frame<S: Sample>(
             }
         }
     };
-
     if frame_header.do_ycbcr {
         fb.upsample_jpeg(color_padded_region, image_header.metadata.bit_depth)?;
     }

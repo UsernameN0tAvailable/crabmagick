@@ -115,6 +115,84 @@ pub(super) unsafe fn run_gabor_rows_unsafe<'buf>(
     }
 }
 
+/// Like `run_gabor_rows_unsafe`, but processes all 3 channels in a single parallel pass,
+/// eliminating the 3 sequential pool barriers of calling it three times.
+pub(super) unsafe fn run_gabor_3ch_rows_unsafe(
+    inputs: [MutableSubgrid<'_, f32>; 3],
+    outputs: &mut [AlignedGrid<f32>; 3],
+    weights: [[f32; 2]; 3],
+    pool: &JxlThreadPool,
+    handle_row: for<'a> unsafe fn(GaborRow<'a>),
+) {
+    let width = inputs[0].width();
+    let height = inputs[0].height();
+
+    if height == 1 {
+        for c in 0..3 {
+            gabor_row_edge(inputs[c].get_row(0), None, outputs[c].buf_mut(), weights[c]);
+        }
+        return;
+    }
+
+    // Top + bottom edge rows for all 3 channels (scalar).
+    for c in 0..3 {
+        let out = outputs[c].buf_mut();
+        gabor_row_edge(inputs[c].get_row(0), Some(inputs[c].get_row(1)), &mut out[..width], weights[c]);
+        gabor_row_edge(inputs[c].get_row(height - 1), Some(inputs[c].get_row(height - 2)), &mut out[(height - 1) * width..], weights[c]);
+    }
+
+    if height <= 2 {
+        return;
+    }
+
+    let num_inner = height - 2;
+    let num_blocks = num_inner.div_ceil(8);
+
+    // Raw pointers to the start of inner rows (after top edge) for each output channel.
+    // Safety: these remain valid for the lifetime of `outputs`; each job accesses
+    // non-overlapping rows (unique y8) and non-overlapping channels (distinct allocations).
+    struct Job {
+        y8: usize,
+        rows_in_block: usize,
+        out_ptrs: [*mut f32; 3],
+    }
+    unsafe impl Send for Job {}
+
+    let out_ptrs = [
+        outputs[0].buf_mut().as_mut_ptr().add(width),
+        outputs[1].buf_mut().as_mut_ptr().add(width),
+        outputs[2].buf_mut().as_mut_ptr().add(width),
+    ];
+
+    let jobs: Vec<Job> = (0..num_blocks)
+        .map(|y8| Job {
+            y8,
+            rows_in_block: (num_inner - y8 * 8).min(8),
+            out_ptrs,
+        })
+        .collect();
+
+    pool.for_each_vec(jobs, |job| {
+        for dy in 0..job.rows_in_block {
+            let row_offset = job.y8 * 8 + dy;
+            let y_up = row_offset; // inner row index 0 maps to image row y=1
+            for c in 0..3 {
+                let output_row = unsafe {
+                    std::slice::from_raw_parts_mut(job.out_ptrs[c].add(row_offset * width), width)
+                };
+                let input_rows = [
+                    inputs[c].get_row(y_up),
+                    inputs[c].get_row(y_up + 1),
+                    inputs[c].get_row(y_up + 2),
+                ];
+                unsafe {
+                    handle_row(GaborRow { input_rows, output_row, weights: weights[c] });
+                }
+            }
+        }
+    });
+}
+
 #[allow(unused)]
 pub(crate) fn run_gabor_row_generic(row: GaborRow) {
     super::impls::generic::gabor::run_gabor_row_generic(row)

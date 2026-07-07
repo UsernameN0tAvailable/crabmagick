@@ -243,7 +243,6 @@ pub(crate) fn render_vardct<S: Sample>(
             })
             .collect::<Vec<_>>()
     });
-
     tracing::trace_span!("Decode PassGroup").in_scope(|| {
         let Some(hf_global) = hf_global else {
             return Ok(());
