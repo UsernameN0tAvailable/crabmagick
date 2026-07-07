@@ -597,7 +597,12 @@ unsafe fn dequant_row_avx2(
         let vq = _mm256_cvtepi32_ps(_mm256_castps_si256(vq_bits));
         let abs_q = _mm256_andnot_ps(sign_mask, vq);
         let bias_small = _mm256_mul_ps(vq, vbias);
-        let bias_large = _mm256_sub_ps(vq, _mm256_div_ps(vbias_num, vq));
+        // Replace slow _mm256_div_ps (10-cycle throughput) with rcp + Newton-Raphson
+        // (4+0.5+0.5 = 5-cycle throughput). rcp_ps gives ~12-bit; one NR step gives 24-bit.
+        // When |q| <= 1 the blend selects bias_small, so NaN from rcp(0) is harmless.
+        let vq_rcp0 = _mm256_rcp_ps(vq);
+        let vq_rcp = _mm256_mul_ps(vq_rcp0, _mm256_fnmadd_ps(vq, vq_rcp0, _mm256_set1_ps(2.0)));
+        let bias_large = _mm256_fnmadd_ps(vbias_num, vq_rcp, vq); // q - bias_num/q
         let mask = _mm256_cmp_ps(abs_q, vone, _CMP_LE_OS);
         let biased = _mm256_blendv_ps(bias_large, bias_small, mask);
         let vm = _mm256_loadu_ps(m.as_ptr().add(i));
