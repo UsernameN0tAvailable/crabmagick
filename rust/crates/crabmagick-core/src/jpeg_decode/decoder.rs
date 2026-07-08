@@ -143,6 +143,12 @@ pub struct JpegDecoder<T> {
     /// restart markers
     pub(crate) restart_interval: usize,
     pub(crate) todo:             usize,
+    /// When set, disables the parallel RST-segment decode path and forces the
+    /// serial decoder. Used by tests to compare the two paths for equivalence.
+    pub(crate) force_serial_rst: bool,
+    /// Set to true once the parallel RST-segment decode path has run to
+    /// completion. Used by tests to assert the fast path was actually taken.
+    pub(crate) used_parallel_rst: bool,
     // decoder options
     pub(crate) options:          DecoderOptions,
     // byte-stream
@@ -195,6 +201,8 @@ where
             z_order:           [0; MAX_COMPONENTS],
             restart_interval:  0,
             todo:              0x7fff_ffff,
+            force_serial_rst:  false,
+            used_parallel_rst: false,
             options:           options,
             stream:            ZReader::new(buffer),
             headers_decoded:   false,

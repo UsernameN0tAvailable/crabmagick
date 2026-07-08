@@ -11,6 +11,7 @@ use alloc::{format, vec};
 use core::cmp::min;
 
 use crate::jpeg_decode_core::bytestream::ZByteReaderTrait;
+use crate::jpeg_decode_core::bytestream::{ZCursor, ZReader, ZSeekFrom};
 use crate::jpeg_decode_core::colorspace::ColorSpace;
 use crate::jpeg_decode_core::colorspace::ColorSpace::Luma;
 use crate::jpeg_decode_core::log::{error, trace, warn};
@@ -18,7 +19,9 @@ use crate::jpeg_decode_core::log::{error, trace, warn};
 use crate::jpeg_decode::bitstream::BitStream;
 use crate::jpeg_decode::components::SampleRatios;
 use crate::jpeg_decode::decoder::MAX_COMPONENTS;
+use crate::jpeg_decode::decoder::IDCTPtr;
 use crate::jpeg_decode::errors::DecodeErrors;
+use crate::jpeg_decode::huffman::HuffmanTable;
 use crate::jpeg_decode::marker::Marker;
 use crate::jpeg_decode::mcu_prog::get_marker;
 use crate::jpeg_decode::misc::{calculate_padded_width, setup_component_params};
@@ -189,6 +192,15 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         let is_hv = usize::from(self.is_interleaved);
         let upsampler_scratch_size = is_hv * self.components.iter().map(|x| x.width_stride).max().unwrap_or(0) * 8;
         let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
+
+        // Fast path: for files with RST markers where all components are in the
+        // first scan, each restart segment is independently decodable. Decode
+        // segments in parallel then run the (fast) post-processing serially.
+        if self.restart_interval > 0 && all_components_in_first_scan && !self.force_serial_rst {
+            if let Some(result) = self.try_parallel_rst_decode(mcu_width, mcu_height, pixels) {
+                return result;
+            }
+        }
 
         'sos: loop {
             trace!(
@@ -784,6 +796,229 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
         Ok(())
     }
+
+    /// Read the remaining bytes from the current stream position into an owned
+    /// buffer. Leaves the reader positioned at the end of the stream on success.
+    fn read_remaining_bytes_from_current(&mut self) -> Option<Vec<u8>> {
+        let cur = self.stream.position().ok()? as usize;
+        let end = self.stream.seek(ZSeekFrom::End(0)).ok()? as usize;
+        if end <= cur {
+            let _ = self.stream.set_position(cur);
+            return None;
+        }
+        let len = end - cur;
+        self.stream.set_position(cur).ok()?;
+        let mut buf = vec![0u8; len];
+        self.stream.read_exact_bytes(&mut buf).ok()?;
+        Some(buf)
+    }
+
+    /// Attempt to decode a restart-marker segmented baseline scan in parallel.
+    ///
+    /// Each restart interval is an independently decodable segment (DC
+    /// predictors reset to 0 at every RST marker). We pre-scan the raw scan
+    /// bytes for RST marker positions, decode every segment concurrently into
+    /// per-component sample planes, and then run the (cheap) up-sampling and
+    /// colour-conversion post-processing serially.
+    ///
+    /// Returns `None` (falling back to the serial decoder, and restoring the
+    /// stream position) whenever any precondition is not satisfied or the
+    /// marker layout is not as expected.
+    #[allow(clippy::too_many_lines)]
+    fn try_parallel_rst_decode(
+        &mut self, mcu_width: usize, mcu_height: usize, pixels: &mut [u8]
+    ) -> Option<Result<(), DecodeErrors>> {
+        use rayon::prelude::*;
+
+        let num_scans = usize::from(self.num_scans);
+        let num_comps = self.components.len();
+
+        // Only handle the common, safe cases; anything unusual falls back to serial.
+        if num_scans != num_comps || num_comps == 0 {
+            return None;
+        }
+        if !self.components.iter().all(|c| c.needed) {
+            return None;
+        }
+        // `coeff == 2` and Luma-with-interleaving are handled by special MCU
+        // height fix-ups in the serial path that we do not replicate here.
+        if self.coeff != 1 || self.is_progressive {
+            return None;
+        }
+        if self.input_colorspace == ColorSpace::Luma && self.is_interleaved {
+            return None;
+        }
+        let out_cs = self.options.jpeg_get_out_colorspace();
+        if self.is_interleaved
+            && self.input_colorspace.num_components() > 1
+            && out_cs.num_components() == 1
+        {
+            return None;
+        }
+
+        let total_mcus = mcu_width.checked_mul(mcu_height)?;
+        if total_mcus == 0 {
+            return None;
+        }
+        let ri = self.restart_interval;
+        let expected_segments = (total_mcus + ri - 1) / ri;
+        // Not worth the parallelization overhead for only a handful of segments.
+        if expected_segments < 4 {
+            return None;
+        }
+
+        // Remember where the entropy-coded scan starts so we can fall back.
+        let scan_start = self.stream.position().ok()? as usize;
+        let raw = match self.read_remaining_bytes_from_current() {
+            Some(r) => r,
+            None => {
+                let _ = self.stream.set_position(scan_start);
+                return None;
+            }
+        };
+
+        let offsets = scan_rst_offsets(&raw);
+        if offsets.len() + 1 != expected_segments {
+            // Unexpected marker layout (trailing RST, non-standard interval or
+            // markers embedded in the data): use the serial decoder instead.
+            let _ = self.stream.set_position(scan_start);
+            return None;
+        }
+
+        let sampled = self.scan_subsampled;
+
+        // Immutable per-component info used for sizing and scatter.
+        let mut comp_infos: Vec<CompInfo> = Vec::with_capacity(num_comps);
+        for comp in &self.components {
+            comp_infos.push(CompInfo {
+                v: comp.vertical_sample,
+                h: comp.horizontal_sample,
+                width_stride: comp.width_stride,
+                step: comp.width_stride * comp.vertical_sample * 8
+            });
+        }
+
+        // Component order within the scan (bitstream order).
+        let z_scans: Vec<usize> = self.z_order[..num_scans].to_vec();
+
+        // IDCT function pointers are `Copy` and can move into the tasks.
+        let idct_full = self.idct_func;
+        let idct_4x4 = self.idct_4x4_func;
+        let idct_1x1 = self.idct_1x1_func;
+
+        // Byte ranges of each segment relative to `raw`.
+        let mut seg_bounds: Vec<(usize, usize)> = Vec::with_capacity(expected_segments);
+        for s in 0..expected_segments {
+            let start = if s == 0 { 0 } else { offsets[s - 1] };
+            let end = if s < offsets.len() { offsets[s] } else { raw.len() };
+            seg_bounds.push((start, end));
+        }
+
+        // Decode all segments in parallel. The immutable borrow of `self`
+        // (the Huffman tables) is confined to this block.
+        let seg_results: Result<Vec<SegmentOut>, DecodeErrors> = {
+            let mut ctx: Vec<CompCtx> = Vec::with_capacity(num_scans);
+            for &k in &z_scans {
+                let comp = &self.components[k];
+                let dc = match self.dc_huffman_tables[comp.dc_huff_table % MAX_COMPONENTS].as_ref() {
+                    Some(t) => t,
+                    None => {
+                        let _ = self.stream.set_position(scan_start);
+                        return None;
+                    }
+                };
+                let ac = match self.ac_huffman_tables[comp.ac_huff_table % MAX_COMPONENTS].as_ref() {
+                    Some(t) => t,
+                    None => {
+                        let _ = self.stream.set_position(scan_start);
+                        return None;
+                    }
+                };
+                ctx.push(CompCtx {
+                    idx: k,
+                    dc,
+                    ac,
+                    qt: comp.quantization_table,
+                    v: comp.vertical_sample,
+                    h: comp.horizontal_sample
+                });
+            }
+
+            (0..expected_segments)
+                .into_par_iter()
+                .map(|s| {
+                    let (start, end) = seg_bounds[s];
+                    let m0 = s * ri;
+                    let m1 = core::cmp::min(m0 + ri, total_mcus);
+                    decode_rst_segment(
+                        &raw[start..end],
+                        m1 - m0,
+                        &ctx,
+                        sampled,
+                        num_comps,
+                        idct_full,
+                        idct_4x4,
+                        idct_1x1
+                    )
+                })
+                .collect()
+        };
+
+        let seg_results = match seg_results {
+            Ok(r) => r,
+            Err(e) => {
+                if self.options.strict_mode() {
+                    return Some(Err(e));
+                }
+                // Non-strict: fall back to the serial decoder for best effort.
+                let _ = self.stream.set_position(scan_start);
+                return None;
+            }
+        };
+
+        // Allocate full per-component sample planes (MCU-row stripe layout) and
+        // scatter the decoded blocks into them.
+        let mut planes: [Vec<i16>; MAX_COMPONENTS] = core::array::from_fn(|_| Vec::new());
+        for k in 0..num_comps {
+            planes[k] = vec![0i16; comp_infos[k].step * mcu_height];
+        }
+
+        for (s, seg) in seg_results.iter().enumerate() {
+            let m0 = s * ri;
+            let m1 = core::cmp::min(m0 + ri, total_mcus);
+            for &k in &z_scans {
+                let info = &comp_infos[k];
+                let bpm = if sampled { info.v * info.h } else { 1 };
+                let plane = &mut planes[k];
+                let src = &seg[k];
+                for m in m0..m1 {
+                    let mcu_row = m / mcu_width;
+                    let mcu_col = m % mcu_width;
+                    let row_base = mcu_row * info.step;
+                    for b in 0..bpm {
+                        let (v_samp, h_samp) =
+                            if sampled { (b / info.h, b % info.h) } else { (0, 0) };
+                        let idct_pos = row_base
+                            + info.width_stride * (v_samp * 8)
+                            + ((mcu_col * info.h) + h_samp) * 8;
+                        let src_off = ((m - m0) * bpm + b) * 64;
+                        for r in 0..8 {
+                            let d = idct_pos + r * info.width_stride;
+                            let s0 = src_off + r * 8;
+                            plane[d..d + 8].copy_from_slice(&src[s0..s0 + 8]);
+                        }
+                    }
+                }
+            }
+        }
+
+        let result = self.finish_baseline_decoding(&planes, mcu_width, pixels);
+        if result.is_ok() {
+            self.used_parallel_rst = true;
+        }
+        Some(result)
+    }
+
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub(crate) fn post_process(
         &mut self, pixels: &mut [u8], i: usize, mcu_height: usize, width: usize,
@@ -954,4 +1189,189 @@ enum McuContinuation {
     /// The caller should parse it and scan for the next SOS.
     InterScanMarker(Marker),
     Terminate
+}
+
+/// Per-component decode context shared (read-only) across parallel RST segment
+/// decoders.
+struct CompCtx<'a> {
+    /// Index of this component in `JpegDecoder::components`.
+    idx: usize,
+    dc: &'a HuffmanTable,
+    ac: &'a HuffmanTable,
+    qt: [i32; 64],
+    /// Vertical sampling factor (blocks per MCU in the vertical direction).
+    v: usize,
+    /// Horizontal sampling factor (blocks per MCU in the horizontal direction).
+    h: usize
+}
+
+/// Per-component immutable geometry used when scattering decoded blocks into the
+/// full per-component sample planes.
+struct CompInfo {
+    v: usize,
+    h: usize,
+    width_stride: usize,
+    /// Length of a single MCU-row stripe for this component.
+    step: usize
+}
+
+/// Output of decoding a single restart segment: one buffer per component,
+/// storing the segment's decoded 8x8 sample blocks contiguously (64 samples per
+/// block, stride 8), in `(mcu, v_samp, h_samp)` order.
+type SegmentOut = Vec<Vec<i16>>;
+
+/// Scan the raw entropy-coded scan bytes for restart marker positions.
+///
+/// Returns the byte offset immediately *after* each `0xFF 0xD0..=0xD7` (RST0-RST7)
+/// marker, i.e. the start of the following segment.
+///
+/// `0xFF 0x00` is byte stuffing (a literal `0xFF`) and `0xFF 0xFF` is a fill
+/// byte; both are skipped and do not start a new segment.
+fn scan_rst_offsets(data: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut i = 0;
+    while i < data.len().saturating_sub(1) {
+        if data[i] == 0xFF {
+            let next = data[i + 1];
+            if next == 0x00 || next == 0xFF {
+                // byte stuffing or fill byte, skip a single byte and continue
+                i += 1;
+                continue;
+            }
+            if (0xD0..=0xD7).contains(&next) {
+                offsets.push(i + 2);
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    offsets
+}
+
+/// Decode a single restart segment (`num_mcus` MCUs) independently.
+///
+/// The segment is entropy-coded data ending at (and including) its terminating
+/// RST/EOI marker, which the [`BitStream`] detects and stops at. DC predictors
+/// start at zero (the guarantee provided by restart markers).
+#[allow(clippy::too_many_arguments)]
+fn decode_rst_segment(
+    data: &[u8], num_mcus: usize, ctx: &[CompCtx], sampled: bool, num_comps: usize,
+    idct_full: IDCTPtr, idct_4x4: IDCTPtr, idct_1x1: IDCTPtr
+) -> Result<SegmentOut, DecodeErrors> {
+    let mut out: SegmentOut = (0..num_comps).map(|_| Vec::new()).collect();
+    for c in ctx {
+        let bpm = if sampled { c.v * c.h } else { 1 };
+        out[c.idx] = vec![0i16; num_mcus * bpm * 64];
+    }
+
+    let mut reader = ZReader::new(ZCursor::new(data));
+    let mut bs = BitStream::new();
+    let mut dc_pred = [0i32; MAX_COMPONENTS];
+    let mut tmp = [0i32; 64];
+
+    for m in 0..num_mcus {
+        for c in ctx {
+            let bpm = if sampled { c.v * c.h } else { 1 };
+            for b in 0..bpm {
+                // Fully zero the coefficient scratch: `decode_mcu_block` expects
+                // a zero-based array and the 4x4 IDCT requires all coefficients
+                // outside the 4x4 low-frequency block to be zero.
+                tmp = [0i32; 64];
+
+                let len = bs.decode_mcu_block(
+                    &mut reader,
+                    c.dc,
+                    c.ac,
+                    &c.qt,
+                    &mut tmp,
+                    &mut dc_pred[c.idx]
+                )?;
+
+                let dst_off = (m * bpm + b) * 64;
+                let block = &mut out[c.idx][dst_off..dst_off + 64];
+
+                if len <= 1 {
+                    idct_1x1(&mut tmp, block, 8);
+                } else if len <= 10 {
+                    idct_4x4(&mut tmp, block, 8);
+                } else {
+                    idct_full(&mut tmp, block, 8);
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod parallel_rst_tests {
+    use super::scan_rst_offsets;
+    use crate::jpeg_decode::JpegDecoder;
+    use crate::jpeg_decode_core::bytestream::ZCursor;
+    use crate::jpeg_decode_core::options::DecoderOptions;
+
+    #[test]
+    fn scan_rst_offsets_handles_stuffing_and_fill() {
+        // data:      FF00 (stuffed literal 0xFF)  ..  FFD0 (RST0)  ..  FFFF FFD1 (fill + RST1)  ..  FFD9(EOI, ignored)
+        let data = [
+            0x12, 0xFF, 0x00, 0x34, // stuffed 0xFF -> not a marker
+            0xFF, 0xD0, // RST0 at index 4, offset after = 6
+            0x56, 0x78, 0xFF, 0xFF, // fill byte
+            0xFF, 0xD1, // RST1 at index 10, offset after = 12
+            0x9A, 0xFF, 0xD9, // EOI -> not an RST
+        ];
+        let offsets = scan_rst_offsets(&data);
+        assert_eq!(offsets, alloc::vec![6, 12]);
+    }
+
+    fn decode(bytes: &[u8], force_serial: bool) -> (Vec<u8>, (usize, usize), bool) {
+        let mut decoder =
+            JpegDecoder::new_with_options(ZCursor::new(bytes), DecoderOptions::default());
+        decoder.force_serial_rst = force_serial;
+        decoder.decode_headers().unwrap();
+        let pixels = decoder.decode().unwrap();
+        let dims = decoder.dimensions().unwrap();
+        (pixels, dims, decoder.used_parallel_rst)
+    }
+
+    fn assert_parallel_matches_serial(bytes: &[u8], expect_parallel: bool) {
+        let (serial, dims_s, used_s) = decode(bytes, true);
+        let (parallel, dims_p, used_p) = decode(bytes, false);
+
+        assert!(!used_s, "forced-serial decode should not use the parallel path");
+        assert_eq!(dims_s, dims_p, "dimensions differ between paths");
+        assert_eq!(
+            serial.len(),
+            parallel.len(),
+            "output length differs between paths"
+        );
+        assert_eq!(
+            used_p, expect_parallel,
+            "parallel path taken={used_p}, expected={expect_parallel}"
+        );
+        assert!(
+            serial == parallel,
+            "parallel RST decode does not match serial decode (pixel mismatch)"
+        );
+    }
+
+    #[test]
+    fn parallel_rst_matches_serial_ycbcr_420() {
+        let bytes = include_bytes!("../../tests/data/rst_420.jpg");
+        assert_parallel_matches_serial(bytes, true);
+    }
+
+    #[test]
+    fn parallel_rst_matches_serial_ycbcr_444() {
+        let bytes = include_bytes!("../../tests/data/rst_444.jpg");
+        assert_parallel_matches_serial(bytes, true);
+    }
+
+    #[test]
+    fn parallel_rst_matches_serial_grayscale() {
+        let bytes = include_bytes!("../../tests/data/rst_gray.jpg");
+        assert_parallel_matches_serial(bytes, true);
+    }
 }
