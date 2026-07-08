@@ -1,6 +1,6 @@
 [package]
 name = "crabmagick-core"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Pure-Rust image processing pipeline for PHP — multi-format decode and JXL/JPEG/WebP/PNG/AVIF encode"
 license = "AGPL-3.0-or-later"
