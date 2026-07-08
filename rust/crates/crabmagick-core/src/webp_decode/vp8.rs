@@ -2319,12 +2319,64 @@ fn avg2(this: u8, right: u8) -> u8 {
 // Clippy suggests the clamp method, but it seems to optimize worse as of rustc 1.82.0 nightly.
 #[allow(clippy::manual_clamp)]
 fn add_residue(pblock: &mut [u8], rblock: &[i32; 16], y0: usize, x0: usize, stride: usize) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("sse4.1") {
+            // SAFETY: guarded by the runtime feature detection above.
+            unsafe {
+                add_residue_simd::add_residue_sse41(pblock, rblock, y0, x0, stride);
+            }
+            return;
+        }
+    }
+    add_residue_scalar(pblock, rblock, y0, x0, stride);
+}
+
+#[allow(clippy::manual_clamp)]
+fn add_residue_scalar(pblock: &mut [u8], rblock: &[i32; 16], y0: usize, x0: usize, stride: usize) {
     let mut pos = y0 * stride + x0;
     for row in rblock.chunks(4) {
         for (p, &a) in pblock[pos..][..4].iter_mut().zip(row.iter()) {
             *p = (a + i32::from(*p)).max(0).min(255) as u8;
         }
         pos += stride;
+    }
+}
+
+// SSE4.1 implementation of `add_residue`. Each of the 4 rows lives at a
+// `stride`-spaced offset, so we process one 4-wide row per iteration:
+// load 4 residual i32, zero-extend the 4 predicted `u8` to i32
+// (`_mm_cvtepu8_epi32`), add, then saturate back to `u8` via
+// `_mm_packs_epi32` (i32->i16) followed by `_mm_packus_epi16` (i16->u8).
+//
+// This replaces 16 scalar clamp-saturate operations per call (24 calls per
+// macroblock) with 4 vectorized adds + saturating packs.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod add_residue_simd {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "sse4.1")]
+    pub unsafe fn add_residue_sse41(
+        pblock: &mut [u8], rblock: &[i32; 16], y0: usize, x0: usize, stride: usize
+    ) {
+        let base = y0 * stride + x0;
+        for row in 0..4 {
+            let pos = base + row * stride;
+            // 4 residual coefficients for this row.
+            let res = _mm_loadu_si128(rblock.as_ptr().add(row * 4).cast());
+            // 4 predicted pixels, zero-extended u8 -> i32.
+            let bytes = u32::from_le_bytes(pblock[pos..pos + 4].try_into().unwrap());
+            let pred = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(bytes as i32));
+            let sum = _mm_add_epi32(res, pred);
+            // i32 -> i16 (signed sat) -> u8 (unsigned sat, clamps to 0..=255).
+            let packed16 = _mm_packs_epi32(sum, sum);
+            let packed8 = _mm_packus_epi16(packed16, packed16);
+            let out = _mm_cvtsi128_si32(packed8) as u32;
+            pblock[pos..pos + 4].copy_from_slice(&out.to_le_bytes());
+        }
     }
 }
 
@@ -2887,6 +2939,52 @@ mod tests {
 
         for (&e, &i) in expected.iter().zip(&pblock) {
             assert_eq!(e, i);
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn add_residue_sse41_matches_scalar() {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+
+        // Reproducible LCG, no external deps.
+        let mut state: u64 = 0xdead_beef_cafe_babe;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+
+        // Cover a range of strides / offsets used by luma (21) and chroma (9),
+        // plus a few edge geometries.
+        let cases = [(21usize, 1usize, 1usize), (9, 1, 1), (21, 5, 13), (9, 5, 5), (4, 0, 0)];
+
+        for &(stride, y0, x0) in &cases {
+            for _ in 0..5_000 {
+                // Enough backing storage for 4 rows at the given stride/offset.
+                let mut pblock_a = vec![0u8; y0 * stride + x0 + 3 * stride + 4];
+                for b in pblock_a.iter_mut() {
+                    *b = (next() & 0xff) as u8;
+                }
+                let mut pblock_b = pblock_a.clone();
+
+                let mut rblock = [0i32; 16];
+                for r in rblock.iter_mut() {
+                    // Residuals in a realistic dequantized range.
+                    *r = (next() % 1024 - 512) as i32;
+                }
+
+                add_residue_scalar(&mut pblock_a, &rblock, y0, x0, stride);
+                // SAFETY: guarded by the feature check above.
+                unsafe {
+                    add_residue_simd::add_residue_sse41(&mut pblock_b, &rblock, y0, x0, stride);
+                }
+
+                assert_eq!(pblock_a, pblock_b, "SSE4.1 add_residue mismatch");
+            }
         }
     }
 
