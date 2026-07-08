@@ -22,6 +22,12 @@ pub enum OutputFormat {
     Jxl,
     /// AVIF output encoded through `ravif` when the `avif` feature is enabled.
     Avif,
+    /// TIFF output encoded through the bundled `tiff` crate (LZW compressed).
+    Tiff,
+    /// GIF output encoded through the `image` crate (256-color quantized).
+    Gif,
+    /// BMP output encoded through the `image` crate (uncompressed BGR).
+    Bmp,
 }
 
 /// A rectangular crop request in source-image coordinates.

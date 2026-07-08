@@ -154,6 +154,33 @@ fn transform_dct(coeff: &mut MutableSubgrid<'_>) {
     super::dct::dct_2d_x86_64(coeff, DctDirection::Inverse);
 }
 
+/// Apply the inverse 8×8 DCT to a compact (stride=8) 64-float block in-place.
+///
+/// `block` must be exactly 64 elements. The 8×8 compact layout lets
+/// `dct_2d_x86_64` dispatch to `dct8x8_avx2` with stride-1 `__m256` access —
+/// all 64 floats stay in registers/L1 with no strided cache-line fetches.
+pub fn compact_idct_8x8(block: &mut [f32; 64]) {
+    // SAFETY: MutableSubgrid::from_buf only requires slice.len() >= width*height.
+    let mut grid = MutableSubgrid::from_buf(block.as_mut_slice(), 8, 8, 8);
+    super::dct::dct_2d_x86_64(&mut grid, DctDirection::Inverse);
+}
+
+/// Apply the inverse DCT to a compact (stride=block_w) block in-place.
+/// Uses SSE4.1 when available, falls back to SSE2.
+pub fn transform_single_block_compact(
+    block: &mut [f32],
+    block_w: usize,
+    block_h: usize,
+    dct_select: TransformType,
+) {
+    let mut grid = MutableSubgrid::from_buf(block, block_w, block_h, block_w);
+    if is_x86_feature_detected!("sse4.1") {
+        unsafe { transform_x86_64_sse41(&mut grid, dct_select); }
+    } else {
+        transform_x86_64_sse2(&mut grid, dct_select);
+    }
+}
+
 #[target_feature(enable = "sse4.1")]
 #[target_feature(enable = "sse3")]
 unsafe fn transform_x86_64_sse41(coeff: &mut MutableSubgrid<'_>, dct_select: TransformType) {

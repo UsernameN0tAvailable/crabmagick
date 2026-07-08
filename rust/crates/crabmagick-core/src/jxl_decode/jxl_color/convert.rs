@@ -178,6 +178,22 @@ pub struct ColorTransform {
     ops: Vec<ColorTransformOp>,
 }
 
+/// Parameters for the fused XYB→sRGB fast path, extracted from a [`ColorTransform`] whose op
+/// sequence is exactly `[XybToMixedLms, Matrix, TransferFunction(Srgb)]`.
+///
+/// Applying, in order, `XybToMixedLms(opsin_bias, intensity_target)`, the row-major 3×3
+/// `matrix`, then the sRGB transfer curve, is mathematically identical to running the full
+/// `ColorTransform` — allowing a single fused SIMD pass straight to packed u8 RGB.
+#[derive(Debug, Clone, Copy)]
+pub struct XybSrgbParams {
+    /// Opsin bias (absolute), one per XYB channel.
+    pub opsin_bias: [f32; 3],
+    /// Intensity target in nits used to derive the LMS scale.
+    pub intensity_target: f32,
+    /// Row-major 3×3 mixed-LMS→linear-sRGB matrix.
+    pub matrix: [f32; 9],
+}
+
 impl ColorTransform {
     /// Creates a new `ColorTransform` builder.
     pub fn builder() -> ColorTransformBuilder {
@@ -570,6 +586,47 @@ impl ColorTransform {
     #[inline]
     pub fn is_noop(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    /// Returns `true` when this transform is exactly the XYB→sRGB conversion, i.e. the op
+    /// sequence is `[XybToMixedLms, Matrix, TransferFunction(Srgb, forward)]` with 3 input
+    /// channels. Such a transform can be fused with u8 RGB packing in a single SIMD pass.
+    #[inline]
+    pub fn is_fuseable_xyb_to_srgb(&self) -> bool {
+        self.xyb_srgb_params().is_some()
+    }
+
+    /// Extracts the parameters needed to run the fused XYB→sRGB transform, if and only if
+    /// this transform matches that exact op sequence. Returns `None` otherwise, in which
+    /// case the caller must fall back to the generic per-op transform.
+    pub fn xyb_srgb_params(&self) -> Option<XybSrgbParams> {
+        if self.begin_channels != 3 || self.ops.len() != 3 {
+            return None;
+        }
+        let (opsin_bias, intensity_target) = match self.ops[0] {
+            ColorTransformOp::XybToMixedLms {
+                opsin_bias,
+                intensity_target,
+            } => (opsin_bias, intensity_target),
+            _ => return None,
+        };
+        let matrix = match self.ops[1] {
+            ColorTransformOp::Matrix(m) => m,
+            _ => return None,
+        };
+        match self.ops[2] {
+            ColorTransformOp::TransferFunction {
+                tf: TransferFunction::Srgb,
+                inverse: false,
+                ..
+            } => {}
+            _ => return None,
+        }
+        Some(XybSrgbParams {
+            opsin_bias,
+            intensity_target,
+            matrix,
+        })
     }
 
     #[inline]

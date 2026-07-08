@@ -4,6 +4,8 @@ use super::generic;
 
 mod dct;
 mod transform;
+pub use transform::compact_idct_8x8;
+pub use transform::transform_single_block_compact;
 pub use transform::transform_varblocks;
 
 pub fn adaptive_lf_smoothing_impl(

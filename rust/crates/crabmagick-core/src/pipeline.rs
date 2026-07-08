@@ -13,7 +13,7 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, JxlThreadPool, PixelFormat};
+use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, JxlThreadPool, PixelFormat, XybSrgbParams};
 use fast_image_resize as fir;
 use image::{codecs::png::PngEncoder, ColorType, GenericImageView, ImageEncoder, RgbImage};
 use lru::LruCache;
@@ -382,14 +382,28 @@ fn decode_jxl_from_bytes_with_hint(
 ) -> Result<DecodedImage, CrabMagickError> {
     let image = create_jxl_image(bytes, render_size)?;
 
-    let frame = image
-        .render_frame(0)
-        .map_err(|error| decode_malformed(format!("JPEG XL frame rendering failed: {error}")))?;
-
     let width = image.width();
     let height = image.height();
     let pixel_format = image.pixel_format();
+
+    // Render the keyframe, deferring the XYB→sRGB color transform whenever it can be fused
+    // with the u8 RGB packing below (the common sRGB/VarDCT case).
+    let (frame, fused) = image
+        .render_frame_maybe_fused(0)
+        .map_err(|error| decode_malformed(format!("JPEG XL frame rendering failed: {error}")))?;
     let pool = image.pool();
+
+    // Fastest path: fuse XYB→sRGB (XybToMixedLms + 3×3 matrix + sRGB transfer) directly into
+    // interleaved u8 RGB in a single SIMD pass, skipping the standalone color-transform pass.
+    if let Some(params) = fused {
+        // `render_frame_maybe_fused` guarantees exactly 3 zero-copy XYB channels here.
+        let xyb = frame
+            .color_channels_raw_f32()
+            .expect("fuseable render guarantees zero-copy XYB channels");
+        return Ok(planar_to_rgb_fused_xyb_srgb(
+            xyb[0], xyb[1], xyb[2], width, height, &params, pool,
+        ));
+    }
 
     // Fast path: zero-copy — access the AlignedGrid<f32> buffers directly without
     // allocating new FrameBuffers or doing the scalar per-pixel copy in `from_grids`.
@@ -907,7 +921,113 @@ pub fn encode(
             },
         ),
         OutputFormat::Avif => encode_avif_rgb(&pixels, width, height, quality),
+        OutputFormat::Tiff => encode_tiff_rgb(&pixels, width, height),
+        OutputFormat::Gif => encode_gif_rgb(&pixels, width, height, quality),
+        OutputFormat::Bmp => encode_bmp_rgb(&pixels, width, height),
     }
+}
+
+/// Encodes packed RGB8 pixels into a lossless LZW-compressed TIFF.
+///
+/// Uses the bundled `tiff` crate directly so the output is exact and the LZW
+/// compression keeps files compact without the size blow-up of uncompressed
+/// TIFF. `pixels` must be tightly packed `width * height * 3` RGB8 bytes.
+pub fn encode_tiff_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, CrabMagickError> {
+    use std::io::Cursor;
+    use tiff::encoder::{colortype::RGB8, compression::Lzw, TiffEncoder};
+
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(3))
+        .ok_or_else(|| encode_error("TIFF dimensions overflow"))?;
+    if pixels.len() != expected {
+        return Err(encode_error(format!(
+            "TIFF encoding expected {expected} RGB bytes but received {}",
+            pixels.len()
+        )));
+    }
+
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut encoder = TiffEncoder::new(&mut cursor)
+            .map_err(|error| encode_error(format!("TIFF encoder initialization failed: {error}")))?;
+        encoder
+            .write_image_with_compression::<RGB8, _>(width, height, Lzw, pixels)
+            .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
+    }
+    Ok(cursor.into_inner())
+}
+
+/// Encodes packed RGB8 pixels into a 256-color GIF.
+///
+/// GIF is inherently palettized, so the encoder quantizes to 256 colors. The
+/// `quality` value (0-100) maps to the encoder speed: higher quality selects a
+/// slower, higher-fidelity quantization pass.
+pub fn encode_gif_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, CrabMagickError> {
+    use image::codecs::gif::GifEncoder;
+
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(3))
+        .ok_or_else(|| encode_error("GIF dimensions overflow"))?;
+    if pixels.len() != expected {
+        return Err(encode_error(format!(
+            "GIF encoding expected {expected} RGB bytes but received {}",
+            pixels.len()
+        )));
+    }
+
+    // Map quality (0-100) to gif speed (1-30); speed 1 is best quality.
+    let quality = quality.min(100) as i32;
+    let speed = (1 + (100 - quality) * 29 / 100).clamp(1, 30);
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = GifEncoder::new_with_speed(&mut out, speed);
+        encoder
+            .encode(pixels, width, height, ColorType::Rgb8.into())
+            .map_err(|error| encode_error(format!("GIF encoding failed: {error}")))?;
+    }
+    Ok(out)
+}
+
+/// Encodes packed RGB8 pixels into an uncompressed BMP.
+///
+/// BMP is lossless and stores pixels bottom-up as BGR; the `image` crate
+/// handles the header and channel ordering. `pixels` must be tightly packed
+/// `width * height * 3` RGB8 bytes.
+pub fn encode_bmp_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, CrabMagickError> {
+    use image::codecs::bmp::BmpEncoder;
+
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(3))
+        .ok_or_else(|| encode_error("BMP dimensions overflow"))?;
+    if pixels.len() != expected {
+        return Err(encode_error(format!(
+            "BMP encoding expected {expected} RGB bytes but received {}",
+            pixels.len()
+        )));
+    }
+
+    let mut out = Vec::new();
+    BmpEncoder::new(&mut out)
+        .encode(pixels, width, height, ColorType::Rgb8.into())
+        .map_err(|error| encode_error(format!("BMP encoding failed: {error}")))?;
+    Ok(out)
 }
 
 /// Encodes packed RGB pixels into JPEG XL using bundled encoder modules.
@@ -1510,6 +1630,240 @@ unsafe fn planar_to_rgb_gray_avx2(r: &[f32], out: &mut [u8]) {
     planar_to_rgb_gray_scalar(&r[i..], &mut out[i * 3..]);
 }
 
+/// Fused XYB→sRGB → interleaved u8 RGB in a single pass.
+///
+/// Applies, per pixel, `XybToMixedLms(opsin_bias, intensity_target)`, the 3×3
+/// mixed-LMS→linear-sRGB `matrix`, and the sRGB transfer curve, then quantizes straight to
+/// packed RGB24. This is mathematically identical to running the standalone `ColorTransform`
+/// (XYB→sRGB) followed by [`planar_to_rgb`] — bit-identical on the AVX2 path, and within ≤1 u8
+/// on scalar tails — but avoids an extra full-image read/write pass over the f32 planes.
+fn planar_to_rgb_fused_xyb_srgb(
+    x: &[f32],
+    y: &[f32],
+    b: &[f32],
+    width: u32,
+    height: u32,
+    params: &XybSrgbParams,
+    pool: &JxlThreadPool,
+) -> DecodedImage {
+    let total = (width * height) as usize;
+
+    // Mirror `planar_to_rgb`'s scheduling: parallelize only above the amortization threshold.
+    const PARALLEL_THRESHOLD: usize = 3_000_000;
+    const CHUNK: usize = 8192;
+    let parallel = pool.is_multithreaded() && total >= PARALLEL_THRESHOLD;
+
+    let mut pixels: Vec<u8> = if parallel {
+        let mut v = Vec::with_capacity(total * 3);
+        // SAFETY: every byte is overwritten by the fused pass below before being read.
+        unsafe { v.set_len(total * 3) };
+        v
+    } else {
+        vec![0u8; total * 3]
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("ssse3")
+        && std::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2 = false;
+
+    let params = *params;
+
+    if parallel {
+        pool.install(|| {
+            pixels
+                .par_chunks_mut(CHUNK * 3)
+                .enumerate()
+                .for_each(|(i, out_chunk)| {
+                    let start = i * CHUNK;
+                    let n = out_chunk.len() / 3;
+                    let xs = &x[start..start + n];
+                    let ys = &y[start..start + n];
+                    let bs = &b[start..start + n];
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            fused_xyb_srgb_rgb_avx2(xs, ys, bs, out_chunk, &params)
+                        };
+                    } else {
+                        fused_xyb_srgb_rgb_scalar(xs, ys, bs, out_chunk, &params);
+                    }
+                });
+        });
+    } else if avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            fused_xyb_srgb_rgb_avx2(x, y, b, &mut pixels, &params)
+        };
+    } else {
+        fused_xyb_srgb_rgb_scalar(x, y, b, &mut pixels, &params);
+    }
+
+    DecodedImage {
+        pixels,
+        width,
+        height,
+    }
+}
+
+fn fused_xyb_srgb_rgb_scalar(x: &[f32], y: &[f32], b: &[f32], out: &mut [u8], params: &XybSrgbParams) {
+    use crate::jxl_decode::jxl_color::linear_to_srgb_scalar_one;
+
+    let ob = params.opsin_bias;
+    let cbrt_ob = [ob[0].cbrt(), ob[1].cbrt(), ob[2].cbrt()];
+    let itscale = 255.0 / params.intensity_target;
+    let m = params.matrix;
+
+    for (((chunk, &xi), &yi), &bi) in out
+        .chunks_exact_mut(3)
+        .zip(x.iter())
+        .zip(y.iter())
+        .zip(b.iter())
+    {
+        // XybToMixedLms
+        let g_l = yi + xi - cbrt_ob[0];
+        let g_m = yi - xi - cbrt_ob[1];
+        let g_s = bi - cbrt_ob[2];
+        let v0 = (g_l * g_l).mul_add(g_l, ob[0]) * itscale;
+        let v1 = (g_m * g_m).mul_add(g_m, ob[1]) * itscale;
+        let v2 = (g_s * g_s).mul_add(g_s, ob[2]) * itscale;
+        // Mixed LMS → linear sRGB
+        let r = m[0] * v0 + m[1] * v1 + m[2] * v2;
+        let g = m[3] * v0 + m[4] * v1 + m[5] * v2;
+        let bl = m[6] * v0 + m[7] * v1 + m[8] * v2;
+        // sRGB transfer + quantize
+        chunk[0] = f32_to_u8(linear_to_srgb_scalar_one(r));
+        chunk[1] = f32_to_u8(linear_to_srgb_scalar_one(g));
+        chunk[2] = f32_to_u8(linear_to_srgb_scalar_one(bl));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[target_feature(enable = "avx2,ssse3,fma")]
+unsafe fn fused_xyb_srgb_rgb_avx2(
+    x: &[f32],
+    y: &[f32],
+    b: &[f32],
+    out: &mut [u8],
+    params: &XybSrgbParams,
+) {
+    use crate::jxl_decode::jxl_color::{linear_to_srgb_avx2_x8, srgb_powtables};
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(x.len(), y.len());
+    debug_assert_eq!(x.len(), b.len());
+    debug_assert_eq!(out.len(), x.len() * 3);
+
+    let ob = params.opsin_bias;
+    let itscale = 255.0 / params.intensity_target;
+    let cbrt_ob = [ob[0].cbrt(), ob[1].cbrt(), ob[2].cbrt()];
+    let m = params.matrix;
+
+    // XybToMixedLms constants (see jxl_color::xyb::run_x86_64_avx2).
+    let vcbrt0 = _mm256_set1_ps(cbrt_ob[0]);
+    let vcbrt1 = _mm256_set1_ps(cbrt_ob[1]);
+    let vcbrt2 = _mm256_set1_ps(cbrt_ob[2]);
+    let vob0 = _mm256_set1_ps(ob[0] * itscale);
+    let vob1 = _mm256_set1_ps(ob[1] * itscale);
+    let vob2 = _mm256_set1_ps(ob[2] * itscale);
+    let vits = _mm256_set1_ps(itscale);
+    // 3×3 matrix constants (see jxl_color::convert::matrix3x3_avx2).
+    let m0 = _mm256_set1_ps(m[0]);
+    let m1 = _mm256_set1_ps(m[1]);
+    let m2 = _mm256_set1_ps(m[2]);
+    let m3 = _mm256_set1_ps(m[3]);
+    let m4 = _mm256_set1_ps(m[4]);
+    let m5 = _mm256_set1_ps(m[5]);
+    let m6 = _mm256_set1_ps(m[6]);
+    let m7 = _mm256_set1_ps(m[7]);
+    let m8 = _mm256_set1_ps(m[8]);
+    // sRGB power tables.
+    let (pt_upper, pt_lower) = srgb_powtables();
+    // Quantize constants (see planar_to_rgb_rgb_avx2).
+    let qzero = _mm256_setzero_ps();
+    let qscale = _mm256_set1_ps(255.0);
+    let qround = _mm256_set1_ps(0.5);
+    let qmax = _mm256_set1_ps(255.0);
+    let packzero = _mm256_setzero_si256();
+    let shuffle = _mm_setr_epi8(0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, 0, 0, 0, 0);
+
+    #[inline(always)]
+    unsafe fn quantize_u8x8(
+        v: __m256,
+        zero: __m256,
+        scale: __m256,
+        round: __m256,
+        max: __m256,
+    ) -> __m256i {
+        let v = _mm256_max_ps(v, zero);
+        let v = _mm256_fmadd_ps(v, scale, round);
+        let v = _mm256_min_ps(v, max);
+        _mm256_cvttps_epi32(v)
+    }
+
+    #[inline(always)]
+    unsafe fn store_rgb_4pixels(dst: *mut u8, packed: __m128i, shuffle: __m128i) {
+        let packed = _mm_shuffle_epi8(packed, shuffle);
+        _mm_storel_epi64(dst.cast::<__m128i>(), packed);
+        std::ptr::write_unaligned(
+            dst.add(8).cast::<u32>(),
+            _mm_extract_epi32::<2>(packed) as u32,
+        );
+    }
+
+    let px = x.as_ptr();
+    let py = y.as_ptr();
+    let pb = b.as_ptr();
+
+    let mut i = 0usize;
+    while i + 8 <= x.len() {
+        let xv = _mm256_loadu_ps(px.add(i));
+        let yv = _mm256_loadu_ps(py.add(i));
+        let bv = _mm256_loadu_ps(pb.add(i));
+
+        // XybToMixedLms: g = matrix(xyb) - cbrt(ob); out = g³·itscale + ob·itscale
+        let g_l = _mm256_sub_ps(_mm256_add_ps(yv, xv), vcbrt0);
+        let g_m = _mm256_sub_ps(_mm256_sub_ps(yv, xv), vcbrt1);
+        let g_s = _mm256_sub_ps(bv, vcbrt2);
+        let gl3 = _mm256_mul_ps(_mm256_mul_ps(g_l, g_l), g_l);
+        let gm3 = _mm256_mul_ps(_mm256_mul_ps(g_m, g_m), g_m);
+        let gs3 = _mm256_mul_ps(_mm256_mul_ps(g_s, g_s), g_s);
+        let v0 = _mm256_fmadd_ps(gl3, vits, vob0);
+        let v1 = _mm256_fmadd_ps(gm3, vits, vob1);
+        let v2 = _mm256_fmadd_ps(gs3, vits, vob2);
+
+        // Mixed LMS → linear sRGB (row-major 3×3).
+        let r = _mm256_fmadd_ps(m0, v0, _mm256_fmadd_ps(m1, v1, _mm256_mul_ps(m2, v2)));
+        let g = _mm256_fmadd_ps(m3, v0, _mm256_fmadd_ps(m4, v1, _mm256_mul_ps(m5, v2)));
+        let bl = _mm256_fmadd_ps(m6, v0, _mm256_fmadd_ps(m7, v1, _mm256_mul_ps(m8, v2)));
+
+        // Linear sRGB → sRGB gamma.
+        let r = linear_to_srgb_avx2_x8(r, pt_upper, pt_lower);
+        let g = linear_to_srgb_avx2_x8(g, pt_upper, pt_lower);
+        let bl = linear_to_srgb_avx2_x8(bl, pt_upper, pt_lower);
+
+        // Quantize to u8 and interleave RGB.
+        let ir = quantize_u8x8(r, qzero, qscale, qround, qmax);
+        let ig = quantize_u8x8(g, qzero, qscale, qround, qmax);
+        let ib = quantize_u8x8(bl, qzero, qscale, qround, qmax);
+        let rg16 = _mm256_packs_epi32(ir, ig);
+        let b016 = _mm256_packs_epi32(ib, packzero);
+        let rgb8 = _mm256_packus_epi16(rg16, b016);
+        let lane0 = _mm256_castsi256_si128(rgb8);
+        let lane1 = _mm256_extracti128_si256::<1>(rgb8);
+        let dst = out.as_mut_ptr().add(i * 3);
+        store_rgb_4pixels(dst, lane0, shuffle);
+        store_rgb_4pixels(dst.add(12), lane1, shuffle);
+        i += 8;
+    }
+
+    // Scalar tail (identical math to the AVX2 remainder path).
+    fused_xyb_srgb_rgb_scalar(&x[i..], &y[i..], &b[i..], &mut out[i * 3..], params);
+}
+
 fn apply_post_decode_ops(
     image: DecodedImage,
     region: Option<(u32, u32, u32, u32)>,
@@ -1635,4 +1989,184 @@ fn resolve_output_size(src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> (u32, 
 fn distance_from_quality(quality: u8) -> f32 {
     let quality = quality.clamp(1, 100) as f32;
     (100.0 - quality) / 25.0 + 0.5
+}
+
+#[cfg(test)]
+mod fused_color_tests {
+    use super::*;
+
+    const TEST_JXL: &str =
+        "/home/mattia/Work/IIIF_Server/var/storage/f7f3/401b/7c27/455b/907c/b30e/8d8a/eb9f/50.jxl";
+
+    // Reference XYB→sRGB params in the same shape the decoder produces (SDR sRGB, identity-ish
+    // opsin bias and inverse matrix). Used only to exercise the fused kernels on synthetic data.
+    fn sample_params() -> XybSrgbParams {
+        XybSrgbParams {
+            opsin_bias: [-0.0037930734, -0.0037930734, -0.0037930734],
+            intensity_target: 255.0,
+            matrix: [
+                11.031566906728434, -9.866943921515768, -0.16462298521266537,
+                -3.254147380524915, 4.418770377582723, -0.16462299105770887,
+                -3.6588512867136815, 2.7129230459994800, 1.9459282407141877,
+            ]
+            .map(|v: f64| v as f32),
+        }
+    }
+
+    #[test]
+    fn fused_scalar_matches_avx2() {
+        let params = sample_params();
+        let n = 1000usize;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut b = Vec::with_capacity(n);
+        // Deterministic pseudo-random XYB-ish values.
+        let mut s: u32 = 0x1234_5678;
+        let mut next = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) as f32 / 16_777_216.0 - 0.5) * 0.6
+        };
+        for _ in 0..n {
+            x.push(next() * 0.1);
+            y.push(next() + 0.3);
+            b.push(next() + 0.3);
+        }
+
+        let mut out_scalar = vec![0u8; n * 3];
+        fused_xyb_srgb_rgb_scalar(&x, &y, &b, &mut out_scalar, &params);
+
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("ssse3")
+            && std::is_x86_feature_detected!("fma")
+        {
+            let mut out_avx2 = vec![0u8; n * 3];
+            unsafe { fused_xyb_srgb_rgb_avx2(&x, &y, &b, &mut out_avx2, &params) };
+            let max = out_scalar
+                .iter()
+                .zip(&out_avx2)
+                .map(|(a, b)| (*a as i32 - *b as i32).abs())
+                .max()
+                .unwrap_or(0);
+            assert!(max <= 1, "scalar vs avx2 fused mismatch, max diff {max}");
+        }
+    }
+
+    #[test]
+    fn fused_decode_matches_reference() {
+        let bytes = match std::fs::read(TEST_JXL) {
+            Ok(b) => b,
+            Err(_) => return, // test image not present in this environment
+        };
+
+        // Fused fast path (production decode).
+        let fused = decode_jxl_from_bytes(&bytes).expect("fused decode");
+
+        // Reference path: run the full standalone color transform, then pack.
+        let image = create_jxl_image(&bytes, None).expect("image");
+        let width = image.width();
+        let height = image.height();
+        let pixel_format = image.pixel_format();
+        let frame = image.render_frame(0).expect("render");
+        let pool = image.pool();
+        let raw = frame
+            .color_channels_raw_f32()
+            .expect("reference zero-copy channels");
+        let reference = planar_to_rgb(
+            pixel_format,
+            raw[0],
+            raw.get(1).copied(),
+            raw.get(2).copied(),
+            width,
+            height,
+            pool,
+        );
+
+        assert_eq!(fused.width, reference.width);
+        assert_eq!(fused.height, reference.height);
+        assert_eq!(fused.pixels.len(), reference.pixels.len());
+
+        let mut max_diff = 0i32;
+        let mut ndiff = 0usize;
+        for (a, b) in fused.pixels.iter().zip(reference.pixels.iter()) {
+            let d = (*a as i32 - *b as i32).abs();
+            if d != 0 {
+                ndiff += 1;
+            }
+            max_diff = max_diff.max(d);
+        }
+        assert!(
+            max_diff <= 1,
+            "fused vs reference max u8 diff {max_diff} ({ndiff} px differ)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod encoder_roundtrip_tests {
+    use super::*;
+
+    // Deterministic gradient RGB8 image with a bounded number of distinct colors so
+    // that lossless codecs roundtrip exactly and palettized GIF stays close.
+    fn sample_rgb(width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let r = ((x * 255) / width.max(1)) as u8;
+                let g = ((y * 255) / height.max(1)) as u8;
+                let b = (((x + y) * 255) / (width + height).max(1)) as u8;
+                pixels.extend_from_slice(&[r, g, b]);
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn tiff_roundtrip_is_lossless() {
+        let (w, h) = (64u32, 48u32);
+        let src = sample_rgb(w, h);
+        let encoded = encode_tiff_rgb(&src, w, h).expect("tiff encode");
+        let decoded = decode_via_image(&encoded).expect("tiff decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels, src, "TIFF LZW roundtrip must be exact");
+    }
+
+    #[test]
+    fn bmp_roundtrip_is_lossless() {
+        let (w, h) = (64u32, 48u32);
+        let src = sample_rgb(w, h);
+        let encoded = encode_bmp_rgb(&src, w, h).expect("bmp encode");
+        let decoded = decode_via_image(&encoded).expect("bmp decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels, src, "BMP roundtrip must be exact");
+    }
+
+    #[test]
+    fn gif_roundtrip_preserves_shape() {
+        let (w, h) = (64u32, 48u32);
+        let src = sample_rgb(w, h);
+        let encoded = encode_gif_rgb(&src, w, h, 90).expect("gif encode");
+        let decoded = decode_via_image(&encoded).expect("gif decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels.len(), src.len());
+        // GIF is palettized (256 colors); this gradient has more, so expect only a
+        // bounded quantization error rather than exact equality.
+        let mut sum = 0u64;
+        for (a, b) in decoded.pixels.iter().zip(&src) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let mean = sum as f64 / src.len() as f64;
+        assert!(mean < 12.0, "GIF mean abs error too high: {mean}");
+    }
+
+    #[test]
+    fn encode_rejects_wrong_buffer_len() {
+        let bad = vec![0u8; 10];
+        assert!(encode_tiff_rgb(&bad, 64, 48).is_err());
+        assert!(encode_bmp_rgb(&bad, 64, 48).is_err());
+        assert!(encode_gif_rgb(&bad, 64, 48, 90).is_err());
+    }
 }

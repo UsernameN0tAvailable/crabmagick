@@ -197,3 +197,18 @@ pub fn transform_varblocks(
 
     generic::transform_varblocks(lf, coeff_out, shifts_cbycr, block_info);
 }
+
+/// Apply the inverse DCT to a compact (stride=block_w) block in-place.
+pub fn transform_single_block_compact(
+    block: &mut [f32],
+    block_w: usize,
+    block_h: usize,
+    dct_select: TransformType,
+) {
+    if is_aarch64_feature_detected!("neon") {
+        let mut grid = MutableSubgrid::from_buf(block, block_w, block_h, block_w);
+        unsafe { transform_aarch64_neon(&mut grid, dct_select); }
+    } else {
+        generic::transform_single_block_compact(block, block_w, block_h, dct_select);
+    }
+}

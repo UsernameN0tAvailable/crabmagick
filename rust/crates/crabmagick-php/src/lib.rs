@@ -184,6 +184,9 @@ fn parse_format(s: &str) -> PhpResult<OutputFormat> {
         "png" => Ok(OutputFormat::Png),
         "jxl" => Ok(OutputFormat::Jxl),
         "avif" => Ok(OutputFormat::Avif),
+        "tiff" | "tif" => Ok(OutputFormat::Tiff),
+        "gif" => Ok(OutputFormat::Gif),
+        "bmp" => Ok(OutputFormat::Bmp),
         other => Err(PhpException::default(format!("unknown format: {other}"))),
     }
 }

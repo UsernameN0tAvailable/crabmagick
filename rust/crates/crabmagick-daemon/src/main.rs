@@ -197,6 +197,9 @@ fn parse_format(s: &str) -> Result<OutputFormat, String> {
         "png" => Ok(OutputFormat::Png),
         "jxl" => Ok(OutputFormat::Jxl),
         "avif" => Ok(OutputFormat::Avif),
+        "tiff" | "tif" => Ok(OutputFormat::Tiff),
+        "gif" => Ok(OutputFormat::Gif),
+        "bmp" => Ok(OutputFormat::Bmp),
         other => Err(format!("unknown format: {other}")),
     }
 }

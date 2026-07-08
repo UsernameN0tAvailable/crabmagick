@@ -219,3 +219,90 @@ pub fn srgb_to_linear(samples: &mut [f32]) {
         .copysign(*x);
     }
 }
+
+/// Scalar linear→sRGB for a single value, matching the SIMD path bit-for-bit (uses FMA like
+/// the AVX2 tail). Exposed so fused decode pipelines can reuse the exact sRGB curve.
+#[inline(always)]
+pub fn linear_to_srgb_scalar_one(s: f32) -> f32 {
+    let v = s.to_bits() & 0x7fff_ffff;
+    let v_adj = f32::from_bits((v | 0x3e80_0000) & 0x3eff_ffff);
+    let pow = 0.059914046f32;
+    let pow = pow.mul_add(v_adj, -0.10889456);
+    let pow = pow.mul_add(v_adj, 0.107963754);
+    let pow = pow.mul_add(v_adj, 0.018092343);
+
+    let idx = (v >> 23).wrapping_sub(118) as usize & 0xf;
+    let mul = 0x4000_0000
+        | (u32::from(SRGB_POWTABLE_UPPER.0[idx]) << 18)
+        | (u32::from(SRGB_POWTABLE_LOWER.0[idx]) << 10);
+
+    let v = f32::from_bits(v);
+    let small = v * 12.92;
+    let acc = pow.mul_add(f32::from_bits(mul), -0.055);
+
+    if v <= 0.0031308 { small } else { acc }.copysign(s)
+}
+
+/// Builds the broadcast sRGB power tables used by [`linear_to_srgb_avx2_x8`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn srgb_powtables() -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
+    use std::arch::x86_64::*;
+    let powtable_upper = _mm256_castps_si256(_mm256_broadcast_ps(
+        &*(SRGB_POWTABLE_UPPER.0.as_ptr() as *const _),
+    ));
+    let powtable_lower = _mm256_castps_si256(_mm256_broadcast_ps(
+        &*(SRGB_POWTABLE_LOWER.0.as_ptr() as *const _),
+    ));
+    (powtable_upper, powtable_lower)
+}
+
+/// Linear→sRGB transfer for 8 lanes, operating entirely in registers. `powtable_upper` and
+/// `powtable_lower` must come from [`srgb_powtables`]. Bit-identical to the store/reload loop
+/// body in [`linear_to_srgb`], enabling fusion with other per-pixel SIMD stages.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+pub unsafe fn linear_to_srgb_avx2_x8(
+    v_in: std::arch::x86_64::__m256,
+    powtable_upper: std::arch::x86_64::__m256i,
+    powtable_lower: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    let sign_mask = _mm256_set1_ps(f32::from_bits(0x8000_0000));
+    let sign = _mm256_and_ps(sign_mask, v_in);
+    let v = _mm256_andnot_ps(sign_mask, v_in);
+
+    let v_adj = _mm256_and_ps(
+        _mm256_set1_ps(f32::from_bits(0x3eff_ffff)),
+        _mm256_or_ps(_mm256_set1_ps(f32::from_bits(0x3e80_0000)), v),
+    );
+    let pow = _mm256_set1_ps(0.059914046);
+    let pow = _mm256_fmadd_ps(pow, v_adj, _mm256_set1_ps(-0.10889456));
+    let pow = _mm256_fmadd_ps(pow, v_adj, _mm256_set1_ps(0.107963754));
+    let pow = _mm256_fmadd_ps(pow, v_adj, _mm256_set1_ps(0.018092343));
+
+    let exp_idx = _mm256_sub_epi32(
+        _mm256_srai_epi32::<23>(_mm256_castps_si256(v)),
+        _mm256_set1_epi32(118),
+    );
+    let pow_upper = _mm256_shuffle_epi8(powtable_upper, exp_idx);
+    let pow_lower = _mm256_shuffle_epi8(powtable_lower, exp_idx);
+    let mul = _mm256_or_si256(
+        _mm256_or_si256(
+            _mm256_slli_epi32::<18>(pow_upper),
+            _mm256_slli_epi32::<10>(pow_lower),
+        ),
+        _mm256_set1_epi32(0x4000_0000),
+    );
+    let mul = _mm256_castsi256_ps(mul);
+
+    let small = _mm256_mul_ps(v, _mm256_set1_ps(12.92));
+    let acc = _mm256_fmadd_ps(pow, mul, _mm256_set1_ps(-0.055));
+
+    let mask = _mm256_cmp_ps(v, _mm256_set1_ps(0.0031308), _CMP_LE_OS);
+    let ret = _mm256_blendv_ps(acc, small, mask);
+    _mm256_or_ps(ret, sign)
+}

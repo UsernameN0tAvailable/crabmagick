@@ -31,3 +31,7 @@ pub use cms::*;
 pub use convert::*;
 pub use error::*;
 pub use ycbcr::ycbcr_to_rgb;
+
+pub(crate) use tf::linear_to_srgb_scalar_one;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use tf::{linear_to_srgb_avx2_x8, srgb_powtables};

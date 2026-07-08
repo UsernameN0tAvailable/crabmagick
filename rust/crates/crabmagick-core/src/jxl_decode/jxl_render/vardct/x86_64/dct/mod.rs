@@ -1,5 +1,6 @@
 use std::arch::is_x86_feature_detected;
 use std::arch::x86_64::*;
+use std::cell::RefCell;
 
 use crate::jxl_decode::jxl_grid::{MutableSubgrid, SimdVector};
 
@@ -10,6 +11,10 @@ mod avx512;
 
 const LANE_SIZE: usize = 4;
 type Lane = __m128;
+
+thread_local! {
+    static DCT_SCRATCH_SSE2: RefCell<Vec<__m128>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Runtime-dispatched 2D DCT entry: prefers AVX-512, then AVX2+FMA, then SSE2.
 ///
@@ -59,11 +64,17 @@ pub(crate) fn dct_2d_x86_64_sse2(io: &mut MutableSubgrid<'_>, direction: DctDire
 
 fn dct_2d_lane(io: &mut MutableSubgrid<'_, Lane>, direction: DctDirection) {
     let scratch_size = io.height().max(io.width() * LANE_SIZE) * 2;
-    unsafe {
-        let mut scratch_lanes = vec![_mm_setzero_ps(); scratch_size];
-        column_dct_lane(io, &mut scratch_lanes, direction);
-        row_dct_lane(io, &mut scratch_lanes, direction);
-    }
+    DCT_SCRATCH_SSE2.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < scratch_size {
+            unsafe { scratch.resize(scratch_size, _mm_setzero_ps()) };
+        }
+        let scratch_lanes: &mut [Lane] = &mut scratch[..scratch_size];
+        unsafe {
+            column_dct_lane(io, scratch_lanes, direction);
+            row_dct_lane(io, scratch_lanes, direction);
+        }
+    });
 }
 
 #[inline]

@@ -256,3 +256,20 @@ pub fn transform_varblocks(
         );
     }
 }
+
+/// Apply the inverse 8×8 DCT to a compact (stride=8) 64-float block in-place.
+pub fn compact_idct_8x8(block: &mut [f32; 64]) {
+    let mut grid = MutableSubgrid::from_buf(block.as_mut_slice(), 8, 8, 8);
+    unsafe { super::dct::dct_2d(&mut grid, DctDirection::Inverse) };
+}
+
+/// Apply the inverse DCT to a compact (stride=block_w) block in-place.
+pub fn transform_single_block_compact(
+    block: &mut [f32],
+    block_w: usize,
+    block_h: usize,
+    dct_select: TransformType,
+) {
+    let mut grid = MutableSubgrid::from_buf(block, block_w, block_h, block_w);
+    transform(&mut grid, dct_select);
+}

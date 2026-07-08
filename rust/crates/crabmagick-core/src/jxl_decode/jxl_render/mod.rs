@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::jxl_decode::jxl_bitstream::Bitstream;
 use crate::jxl_decode::jxl_color::{
     ColorEncodingWithProfile, ColorManagementSystem, ColorTransform, ColourEncoding, ColourSpace,
-    EnumColourEncoding, RenderingIntent, TransferFunction,
+    EnumColourEncoding, RenderingIntent, TransferFunction, XybSrgbParams,
 };
 use crate::jxl_decode::jxl_frame::{Frame, FrameContext, header::FrameType};
 use crate::jxl_decode::jxl_grid::AllocTracker;
@@ -652,6 +652,75 @@ impl RenderContext {
 
         let result = self.postprocess_keyframe(frame, grid);
         result
+    }
+
+    /// Renders the keyframe **without** applying the output color transform.
+    ///
+    /// Returns the raw blended grid (still in the frame's native color space, e.g. XYB for
+    /// xyb-encoded VarDCT frames) together with [`XybSrgbParams`] when the pending color
+    /// transform is exactly XYB→sRGB and can therefore be fused with downstream u8 packing.
+    ///
+    /// When the returned params are `Some`, the grid is guaranteed to still need the color
+    /// transform (`ct_done() == false`), have at least 3 color channels, and not require a
+    /// YCbCr conversion. When they are `None`, the caller must finish the conversion via
+    /// [`RenderContext::postprocess_keyframe_grid`].
+    pub fn render_keyframe_unprocessed(
+        &self,
+        keyframe_idx: usize,
+    ) -> Result<(Arc<ImageWithRegion>, Option<XybSrgbParams>)> {
+        let idx = *self
+            .keyframes
+            .get(keyframe_idx)
+            .ok_or(Error::IncompleteFrame)?;
+        let frame = &*self.frames[idx];
+        let can_reference = frame.header().can_reference();
+
+        let grid = if self.narrow_modular() {
+            let handle = Arc::clone(&self.renders_narrow[idx]);
+            let grid = Arc::clone(&handle).run_with_image()?.blend(None, &self.pool)?;
+            if !can_reference { handle.release_blended_cache(); }
+            grid
+        } else {
+            let handle = Arc::clone(&self.renders_wide[idx]);
+            let grid = Arc::clone(&handle).run_with_image()?.blend(None, &self.pool)?;
+            if !can_reference { handle.release_blended_cache(); }
+            grid
+        };
+
+        let params = self.fuseable_xyb_srgb_params(frame, &grid)?;
+        Ok((grid, params))
+    }
+
+    /// Applies the output color transform to a previously obtained raw keyframe grid.
+    ///
+    /// Used to finish a render started with [`RenderContext::render_keyframe_unprocessed`]
+    /// when the fused fast path did not apply.
+    pub fn postprocess_keyframe_grid(
+        &self,
+        keyframe_idx: usize,
+        grid: Arc<ImageWithRegion>,
+    ) -> Result<Arc<ImageWithRegion>> {
+        let idx = *self
+            .keyframes
+            .get(keyframe_idx)
+            .ok_or(Error::IncompleteFrame)?;
+        let frame = &*self.frames[idx];
+        self.postprocess_keyframe(frame, grid)
+    }
+
+    /// Returns the fused XYB→sRGB parameters when the pending color transform for `frame`
+    /// exactly matches that op sequence and `grid` is eligible for the fused fast path.
+    fn fuseable_xyb_srgb_params(
+        &self,
+        frame: &IndexedFrame,
+        grid: &ImageWithRegion,
+    ) -> Result<Option<XybSrgbParams>> {
+        if frame.header().do_ycbcr || grid.ct_done() || grid.color_channels() < 3 {
+            return Ok(None);
+        }
+        self.cache_color_transform()?;
+        let transform = self.cached_transform.lock().unwrap();
+        Ok(transform.as_ref().and_then(|t| t.xyb_srgb_params()))
     }
 
     pub fn render_loading_keyframe(&mut self) -> Result<(&IndexedFrame, Arc<ImageWithRegion>)> {

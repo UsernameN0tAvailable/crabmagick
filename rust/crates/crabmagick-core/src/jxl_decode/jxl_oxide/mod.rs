@@ -158,7 +158,7 @@ use crate::jxl_decode::jxl_render::ImageWithRegion;
 use crate::jxl_decode::jxl_render::Region;
 use crate::jxl_decode::jxl_render::{IndexedFrame, RenderContext};
 
-pub use crate::jxl_decode::jxl_color::{ColorEncodingWithProfile, ColorManagementSystem, NullCms, PreparedTransform};
+pub use crate::jxl_decode::jxl_color::{ColorEncodingWithProfile, ColorManagementSystem, NullCms, PreparedTransform, XybSrgbParams};
 pub use crate::jxl_decode::jxl_frame::header as frame;
 pub use crate::jxl_decode::jxl_frame::{Frame, FrameHeader};
 pub use crate::jxl_decode::jxl_grid::{AlignedGrid, AllocTracker};
@@ -714,7 +714,47 @@ impl JxlImage {
     /// Renders the given keyframe with optional cropping region.
     pub fn render_frame_cropped(&self, keyframe_index: usize) -> Result<Render> {
         let image = self.ctx.render_keyframe(keyframe_index)?;
+        Ok(self.build_render(keyframe_index, image))
+    }
 
+    /// Renders the keyframe, deferring the output color transform when it can be fused with
+    /// downstream u8 RGB packing.
+    ///
+    /// Returns `(render, Some(params))` when the pending transform is exactly XYB→sRGB: the
+    /// returned `render` still holds the **raw XYB** grid, and `render.color_channels_raw_f32()`
+    /// is guaranteed to yield exactly 3 zero-copy channels that the caller must feed through the
+    /// fused XYB→sRGB packing routine described by `params`.
+    ///
+    /// Returns `(render, None)` otherwise, with the color transform already applied — the render
+    /// is then packed exactly like [`JxlImage::render_frame`] output.
+    pub fn render_frame_maybe_fused(
+        &self,
+        keyframe_index: usize,
+    ) -> Result<(Render, Option<XybSrgbParams>)> {
+        let (raw_grid, params) = self.ctx.render_keyframe_unprocessed(keyframe_index)?;
+        if let Some(params) = params {
+            let render = self.build_render(keyframe_index, raw_grid);
+            // Only commit to the fused path when the zero-copy XYB access is guaranteed to
+            // succeed for the caller; otherwise finish the normal transform so the raw XYB
+            // grid is never mistaken for already-converted sRGB.
+            if render
+                .color_channels_raw_f32()
+                .is_some_and(|channels| channels.len() == 3)
+            {
+                return Ok((render, Some(params)));
+            }
+            let processed = self
+                .ctx
+                .postprocess_keyframe_grid(keyframe_index, render.into_image())?;
+            return Ok((self.build_render(keyframe_index, processed), None));
+        }
+        let processed = self
+            .ctx
+            .postprocess_keyframe_grid(keyframe_index, raw_grid)?;
+        Ok((self.build_render(keyframe_index, processed), None))
+    }
+
+    fn build_render(&self, keyframe_index: usize, image: Arc<ImageWithRegion>) -> Render {
         let image_region = self
             .ctx
             .image_region()
@@ -724,7 +764,7 @@ impl JxlImage {
         let target_frame_region = image_region.translate(-frame_header.x0, -frame_header.y0);
 
         let is_cmyk = self.ctx.requested_color_encoding().is_cmyk();
-        let result = Render {
+        Render {
             keyframe_index,
             name: frame_header.name.clone(),
             duration: frame_header.duration,
@@ -735,8 +775,7 @@ impl JxlImage {
             color_bit_depth: self.image_header.metadata.bit_depth,
             is_cmyk,
             render_spot_color: self.render_spot_color,
-        };
-        Ok(result)
+        }
     }
 
     /// Renders the currently loading keyframe.
@@ -1106,6 +1145,12 @@ impl Render {
     #[inline]
     pub fn keyframe_index(&self) -> usize {
         self.keyframe_index
+    }
+
+    /// Consumes the render and returns the underlying image grid.
+    #[inline]
+    pub(crate) fn into_image(self) -> Arc<ImageWithRegion> {
+        self.image
     }
 
     /// Returns the name of the frame.

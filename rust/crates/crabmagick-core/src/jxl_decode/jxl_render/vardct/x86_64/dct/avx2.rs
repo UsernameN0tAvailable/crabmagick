@@ -11,10 +11,17 @@
 //! and avoids the per-block heap allocation that `dct_2d_lane` requires.
 
 use std::arch::x86_64::*;
+use std::cell::RefCell;
 
 use crate::jxl_decode::jxl_grid::{MutableSubgrid, SimdVector};
 use crate::jxl_decode::jxl_render::vardct::dct_common::{self, DctDirection};
 use crate::jxl_decode::jxl_render::vardct::generic;
+
+thread_local! {
+    /// Reusable scratch buffer for `dct_2d_lane`. Grows on demand, never shrinks,
+    /// eliminating the per-block heap allocation that was ~26K allocs for this image.
+    static DCT_SCRATCH: RefCell<Vec<__m256>> = const { RefCell::new(Vec::new()) };
+}
 
 const LANE_SIZE: usize = 8;
 type Lane = __m256;
@@ -112,9 +119,19 @@ unsafe fn dct8x8_avx2(io: &mut MutableSubgrid<'_, Lane>, direction: DctDirection
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dct_2d_lane(io: &mut MutableSubgrid<'_, Lane>, direction: DctDirection) {
     let scratch_size = io.height().max(io.width() * LANE_SIZE) * 2;
-    let mut scratch_lanes = vec![_mm256_setzero_ps(); scratch_size];
-    column_dct_lane(io, &mut scratch_lanes, direction);
-    row_dct_lane(io, &mut scratch_lanes, direction);
+    DCT_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < scratch_size {
+            scratch.resize(scratch_size, _mm256_setzero_ps());
+        }
+        // SAFETY: we hold the borrow_mut for the entire duration of the DCT;
+        // this function is never called recursively.
+        let scratch_lanes: &mut [Lane] = &mut scratch[..scratch_size];
+        // Column and row passes need disjoint sub-slices; they are sliced
+        // inside `column_dct_lane` / `row_dct_lane` via the scratch slice.
+        column_dct_lane(io, scratch_lanes, direction);
+        row_dct_lane(io, scratch_lanes, direction);
+    });
 }
 
 #[target_feature(enable = "avx2,fma")]

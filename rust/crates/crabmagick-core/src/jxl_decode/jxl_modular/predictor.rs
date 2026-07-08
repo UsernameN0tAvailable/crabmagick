@@ -374,10 +374,6 @@ impl SelfCorrectingPredictor {
             subpred_err_ne,
             ..
         } = *self;
-        let true_err_w = true_err_w as i64;
-        let true_err_nw = true_err_nw as i64;
-        let true_err_n = true_err_n as i64;
-        let true_err_ne = true_err_ne as i64;
 
         let n3 = (n as i64) << 3;
         let nw3 = (nw as i64) << 3;
@@ -385,13 +381,19 @@ impl SelfCorrectingPredictor {
         let w3 = (w as i64) << 3;
         let nn3 = (nn as i64) << 3;
 
+        // Widen true_err_* once for use in subpred multiplications.
+        let tew = true_err_w as i64;
+        let tenw = true_err_nw as i64;
+        let ten = true_err_n as i64;
+        let tene = true_err_ne as i64;
+
         let subpred = [
             w3 + ne3 - n3,
-            n3 - (((true_err_w + true_err_n + true_err_ne) * wp.wp_p1 as i64) >> 5),
-            w3 - (((true_err_w + true_err_n + true_err_nw) * wp.wp_p2 as i64) >> 5),
-            n3 - ((true_err_nw * wp.wp_p3a as i64
-                + true_err_n * wp.wp_p3b as i64
-                + true_err_ne * wp.wp_p3c as i64
+            n3 - (((tew + ten + tene) * wp.wp_p1 as i64) >> 5),
+            w3 - (((tew + ten + tenw) * wp.wp_p2 as i64) >> 5),
+            n3 - ((tenw * wp.wp_p3a as i64
+                + ten * wp.wp_p3b as i64
+                + tene * wp.wp_p3c as i64
                 + (nn3 - n3) * wp.wp_p3d as i64
                 + (nw3 - w3) * wp.wp_p3e as i64)
                 >> 5),
@@ -429,15 +431,19 @@ impl SelfCorrectingPredictor {
             let mut w = [0u32; 4];
             for i in 0..4 {
                 let err_sum = subpred_err_sum[i];
-                let x = (err_sum as u64).wrapping_add(1) >> 5;
-                let shift = if x == 0 { 0u32 } else { 63 - x.leading_zeros() };
+                // For all practical JXL images (≤16-bit samples), err_sum << u32::MAX.
+                // saturating_add handles the u32::MAX edge case: sat(u32::MAX)+1=u32::MAX,
+                // >>5=2^27-1, leading_zeros()=4, shift=27, idx≤63 — stays in-bounds.
+                let x = err_sum.saturating_add(1) >> 5;
+                let shift = if x == 0 { 0u32 } else { 31 - x.leading_zeros() };
                 w[i] = 4 + ((wp_wn[i] * DIV_LOOKUP[(err_sum >> shift) as usize + 1]) >> shift);
             }
             w
         };
 
         let sum_weights: u32 = weight[0] + weight[1] + weight[2] + weight[3];
-        let log_weight = (sum_weights as u64 >> 4).ilog2();
+        // sum_weights ≤ 4 × (4 + 15 × DIV_LOOKUP[1]) < u32::MAX — u32 ilog2 is safe.
+        let log_weight = (sum_weights >> 4).ilog2();
         let weight = [weight[0] >> log_weight, weight[1] >> log_weight,
                       weight[2] >> log_weight, weight[3] >> log_weight];
         let sum_weights: u32 = weight[0] + weight[1] + weight[2] + weight[3];
@@ -446,6 +452,7 @@ impl SelfCorrectingPredictor {
             s += sp * wt as i64;
         }
         let mut prediction = (s * DIV_LOOKUP[sum_weights as usize] as i64) >> 24;
+        // The XOR checks use i32 values directly (true_err_* are i32 fields).
         if (true_err_n ^ true_err_w) | (true_err_n ^ true_err_nw) <= 0 {
             let min = n3.min(w3).min(ne3);
             let max = n3.max(w3).max(ne3);
@@ -460,7 +467,7 @@ impl SelfCorrectingPredictor {
 
         PredictionResult {
             prediction,
-            max_error: max_error as i32,
+            max_error,
             subpred,
         }
     }

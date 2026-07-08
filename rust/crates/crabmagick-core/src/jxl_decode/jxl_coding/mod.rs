@@ -475,7 +475,7 @@ impl DecoderInner {
         (single_symbol < split).then_some(single_symbol)
     }
 
-    #[inline]
+    #[inline(always)]
     fn read_varint_with_multiplier_clustered(
         &mut self,
         bitstream: &mut Bitstream,
@@ -569,7 +569,7 @@ impl DecoderInner {
         Ok(r)
     }
 
-    #[inline]
+    #[inline(always)]
     fn read_uint_prefilled(
         &self,
         bitstream: &mut Bitstream,

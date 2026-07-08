@@ -183,3 +183,14 @@ pub fn transform_varblocks(
 ) {
     unsafe { transform_varblocks_wasm32_simd128(lf, coeff_out, shifts_cbycr, block_info) }
 }
+
+/// Apply the inverse DCT to a compact (stride=block_w) block in-place.
+pub fn transform_single_block_compact(
+    block: &mut [f32],
+    block_w: usize,
+    block_h: usize,
+    dct_select: TransformType,
+) {
+    let mut grid = MutableSubgrid::from_buf(block, block_w, block_h, block_w);
+    unsafe { transform_wasm32_simd128(&mut grid, dct_select); }
+}
