@@ -31,7 +31,7 @@ use resvg::{tiny_skia, usvg};
 use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
 
 use crate::jpeg_encode::encoder::{
-    ChromaSubsampling as JpegChromaSubsampling, EncoderConfig, ParallelEncoding,
+    ChromaSubsampling as JpegChromaSubsampling, EncoderConfig, HuffmanStrategy, ParallelEncoding,
     PixelLayout as ZenLayout, ProgressiveScanMode, Unstoppable,
 };
 use crate::jxl_encode::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
@@ -1286,7 +1286,9 @@ fn png_filter_type(filter: PngFilter) -> (png::FilterType, png::AdaptiveFilterTy
         PngFilter::Up => (png::FilterType::Up, png::AdaptiveFilterType::NonAdaptive),
         PngFilter::Avg => (png::FilterType::Avg, png::AdaptiveFilterType::NonAdaptive),
         PngFilter::Paeth => (png::FilterType::Paeth, png::AdaptiveFilterType::NonAdaptive),
-        PngFilter::All => (png::FilterType::Sub, png::AdaptiveFilterType::Adaptive),
+        // Adaptive filter selection degrades badly at low zlib compression levels.
+        // Paeth is near-optimal for most content and works well at all compression levels.
+        PngFilter::All => (png::FilterType::Paeth, png::AdaptiveFilterType::NonAdaptive),
     }
 }
 
@@ -1315,6 +1317,13 @@ fn encode_jpeg_rgb(
     let pixels = alpha.map_or_else(|| pixels.to_vec(), |alpha| composite_alpha_to_white(pixels, alpha));
 
     let quality = options.quality.clamp(1, 100);
+    // Progressive always requires Huffman optimization (two-pass).
+    // For baseline, respect the user's optimize_huffman flag; default is fast single-pass.
+    let huffman = if options.progressive || options.optimize_huffman {
+        HuffmanStrategy::Optimize
+    } else {
+        HuffmanStrategy::Fixed
+    };
     let config = EncoderConfig::ycbcr(
         quality,
         jpeg_subsampling(options.chroma_subsampling, quality),
@@ -1324,6 +1333,7 @@ fn encode_jpeg_rgb(
     } else {
         ProgressiveScanMode::Baseline
     })
+    .huffman(huffman)
     .restart_mcu_rows(options.restart_interval)
     .parallel(ParallelEncoding::Auto);
 

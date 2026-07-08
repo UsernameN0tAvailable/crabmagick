@@ -56,6 +56,10 @@ pub struct JpegEncodeOptions {
     pub chroma_subsampling: ChromaSubsampling,
     /// Restart interval in MCUs/rows, depending on the lower-level encoder mapping.
     pub restart_interval: u16,
+    /// Build optimal Huffman tables (two-pass, ~10% smaller files, ~1.5× slower encode).
+    /// When false, uses pre-built standard tables (single-pass, matches libjpeg-turbo speed).
+    /// Progressive mode always forces this to true.
+    pub optimize_huffman: bool,
 }
 
 impl Default for JpegEncodeOptions {
@@ -65,6 +69,7 @@ impl Default for JpegEncodeOptions {
             progressive: false,
             chroma_subsampling: ChromaSubsampling::Auto,
             restart_interval: 0,
+            optimize_huffman: false,
         }
     }
 }
