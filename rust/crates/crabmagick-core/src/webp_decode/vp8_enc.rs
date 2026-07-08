@@ -43,11 +43,7 @@ struct MacroBlockData {
 pub(crate) struct BoolEncoder {
     range: u32,
     low: u64,
-    /// Completed output bytes.
-    out: Vec<u8>,
-    /// Partial byte being assembled, MSB-first; holds `cur_bits` valid low bits.
-    cur: u32,
-    cur_bits: u32,
+    bits: Vec<bool>,
 }
 
 impl BoolEncoder {
@@ -55,50 +51,7 @@ impl BoolEncoder {
         Self {
             range: 255,
             low: 0,
-            out: Vec::new(),
-            cur: 0,
-            cur_bits: 0,
-        }
-    }
-
-    /// Append a single bit MSB-first to the packed output.
-    #[inline]
-    fn emit_bit(&mut self, bit: bool) {
-        self.cur = (self.cur << 1) | u32::from(bit);
-        self.cur_bits += 1;
-        if self.cur_bits == 8 {
-            self.out.push(self.cur as u8);
-            self.cur = 0;
-            self.cur_bits = 0;
-        }
-    }
-
-    /// Propagate a carry: add 1 to the big-endian number formed by every bit
-    /// emitted so far (its least-significant bit is the most recently emitted
-    /// bit). Operates on packed bytes, so carry runs are cache-friendly and
-    /// amortize to O(1).
-    #[inline]
-    fn carry(&mut self) {
-        if self.cur_bits > 0 {
-            self.cur += 1;
-            if self.cur >> self.cur_bits != 0 {
-                self.cur &= (1 << self.cur_bits) - 1;
-                Self::add_one_to_bytes(&mut self.out);
-            }
-        } else {
-            Self::add_one_to_bytes(&mut self.out);
-        }
-    }
-
-    #[inline]
-    fn add_one_to_bytes(out: &mut [u8]) {
-        for byte in out.iter_mut().rev() {
-            if *byte == 0xFF {
-                *byte = 0;
-            } else {
-                *byte += 1;
-                return;
-            }
+            bits: Vec::new(),
         }
     }
 
@@ -112,13 +65,23 @@ impl BoolEncoder {
         }
 
         while self.range < 128 {
-            if self.low >= 0x1_0000_0000 {
-                self.carry();
-                self.low -= 0x1_0000_0000;
+            if self.low >= 0x100000000u64 {
+                let mut i = self.bits.len() as isize - 1;
+                let mut carry = 1u32;
+                while carry > 0 && i >= 0 {
+                    if !self.bits[i as usize] {
+                        self.bits[i as usize] = true;
+                        carry = 0;
+                    } else {
+                        self.bits[i as usize] = false;
+                    }
+                    i -= 1;
+                }
+                self.low -= 0x100000000u64;
             }
 
-            self.emit_bit((self.low & 0x8000_0000) != 0);
-            self.low = (self.low << 1) & 0xFFFF_FFFF;
+            self.bits.push((self.low & 0x80000000u64) != 0);
+            self.low = (self.low << 1) & 0xFFFFFFFFu64;
             self.range <<= 1;
         }
     }
@@ -148,36 +111,24 @@ impl BoolEncoder {
             self.write_flag(false);
         }
 
-        if self.cur_bits > 0 {
-            // Pad the trailing partial byte with zero low bits (MSB-first).
-            self.out.push((self.cur << (8 - self.cur_bits)) as u8);
-        }
-
-        self.out
+        self.bits
+            .chunks(8)
+            .map(|chunk| {
+                chunk.iter().enumerate().fold(0u8, |b, (i, &bit)| {
+                    if bit {
+                        b | (0x80u8 >> i)
+                    } else {
+                        b
+                    }
+                })
+            })
+            .collect()
     }
 }
 
 /// Encode an RGB image as a lossy VP8-based WebP image.
 #[inline]
 pub(crate) fn encode_lossy_webp(img: &RgbImage, quality: u8) -> Result<Vec<u8>, WebPEncodeError> {
-    encode_lossy_webp_impl(img, quality, None)
-}
-
-/// Encode with an explicit token-partition count (test helper).
-#[cfg(test)]
-pub(crate) fn encode_lossy_webp_with_partitions(
-    img: &RgbImage,
-    quality: u8,
-    partitions: usize,
-) -> Result<Vec<u8>, WebPEncodeError> {
-    encode_lossy_webp_impl(img, quality, Some(partitions))
-}
-
-fn encode_lossy_webp_impl(
-    img: &RgbImage,
-    quality: u8,
-    forced_partitions: Option<usize>,
-) -> Result<Vec<u8>, WebPEncodeError> {
     let width = img.width();
     let height = img.height();
 
@@ -240,13 +191,10 @@ fn encode_lossy_webp_impl(
         }
     }
 
-    let first_part_mbs = mb_width * mb_height;
-    let num_partitions = forced_partitions.unwrap_or_else(|| choose_token_partitions(mb_height));
+    let first_partition = encode_first_partition(q_idx, mb_width * mb_height);
+    let coeff_partition = encode_coeff_partition(&macroblocks, mb_width);
 
-    let first_partition = encode_first_partition(q_idx, first_part_mbs, num_partitions);
-    let coeff_partitions = encode_coeff_partitions(&macroblocks, mb_width, mb_height, num_partitions);
-
-    let vp8_frame = build_vp8_frame(width, height, &first_partition, &coeff_partitions)?;
+    let vp8_frame = build_vp8_frame(width, height, &first_partition, &coeff_partition)?;
     Ok(wrap_riff_webp(&vp8_frame))
 }
 
@@ -535,26 +483,7 @@ fn reconstruct_from_coeffs(coeffs: &[i16; 16], q_idx: usize, pred: u8) -> [u8; 1
     out
 }
 
-/// Chooses the number of VP8 DCT token partitions (1, 2, 4, or 8).
-///
-/// Token partitions carry independent range-coded coefficient streams that can
-/// be encoded (and decoded) in parallel. Partition `p` owns macroblock rows
-/// where `mb_y % num_partitions == p`, so the count is capped at `mb_height`
-/// (rounded down to a power of two) to avoid empty partitions.
-#[inline]
-fn choose_token_partitions(mb_height: usize) -> usize {
-    if mb_height >= 8 {
-        8
-    } else if mb_height >= 4 {
-        4
-    } else if mb_height >= 2 {
-        2
-    } else {
-        1
-    }
-}
-
-fn encode_first_partition(q_idx: usize, macroblock_count: usize, num_partitions: usize) -> Vec<u8> {
+fn encode_first_partition(q_idx: usize, macroblock_count: usize) -> Vec<u8> {
     let mut enc = BoolEncoder::new();
 
     enc.write_literal(1, 0);
@@ -564,8 +493,7 @@ fn encode_first_partition(q_idx: usize, macroblock_count: usize, num_partitions:
     enc.write_literal(6, 0);
     enc.write_literal(3, 0);
     enc.write_flag(false);
-    // log2(number of DCT token partitions)
-    enc.write_literal(2, num_partitions.trailing_zeros());
+    enc.write_literal(2, 0);
 
     enc.write_literal(7, q_idx as u32);
     for _ in 0..5 {
@@ -596,74 +524,15 @@ fn encode_first_partition(q_idx: usize, macroblock_count: usize, num_partitions:
 
     enc.finish()
 }
-/// Encodes the DCT coefficient token partitions in parallel.
-///
-/// VP8 allows the coefficient data to be split into `num_partitions` independent
-/// range-coded streams. Partition `p` owns the macroblock rows where
-/// `mb_y % num_partitions == p` (matching the decoder's `mb_y % num_partitions`
-/// selection). Each partition uses its own [`BoolEncoder`], so they are encoded
-/// concurrently with rayon and merged in order by the caller.
-///
-/// The coefficient context (`nonzero` above/left flags) depends only on the
-/// already-quantized coefficients, never on the entropy coder state, so the
-/// "above" context for any row is reconstructed directly from the row above's
-/// `*_nonzero` flags. This keeps every partition fully independent and produces
-/// exactly the same tokens (and therefore the same decoded pixels) as a single
-/// serial partition.
-fn encode_coeff_partitions(
-    macroblocks: &[MacroBlockData],
-    mb_width: usize,
-    mb_height: usize,
-    num_partitions: usize,
-) -> Vec<Vec<u8>> {
-    if num_partitions <= 1 {
-        return vec![encode_partition(macroblocks, mb_width, mb_height, 0, 1)];
-    }
 
-    (0..num_partitions)
-        .into_par_iter()
-        .map(|part| encode_partition(macroblocks, mb_width, mb_height, part, num_partitions))
-        .collect()
-}
-
-/// Encodes the coefficient tokens for a single token partition.
-fn encode_partition(
-    macroblocks: &[MacroBlockData],
-    mb_width: usize,
-    mb_height: usize,
-    part: usize,
-    num_partitions: usize,
-) -> Vec<u8> {
+fn encode_coeff_partition(macroblocks: &[MacroBlockData], mb_width: usize) -> Vec<u8> {
     let mut enc = BoolEncoder::new();
 
     let mut top_y = vec![[0u8; 4]; mb_width];
     let mut top_u = vec![[0u8; 2]; mb_width];
     let mut top_v = vec![[0u8; 2]; mb_width];
 
-    let mut mb_y = part;
-    while mb_y < mb_height {
-        // Reconstruct the "above" context from the row directly above (rows in a
-        // partition are not contiguous, so the persisted context cannot be reused).
-        if mb_y == 0 {
-            for x in 0..mb_width {
-                top_y[x] = [0; 4];
-                top_u[x] = [0; 2];
-                top_v[x] = [0; 2];
-            }
-        } else {
-            let above = &macroblocks[(mb_y - 1) * mb_width..mb_y * mb_width];
-            for (x, mb) in above.iter().enumerate() {
-                for sub_x in 0..4 {
-                    top_y[x][sub_x] = u8::from(mb.y_nonzero[sub_x + 3 * 4]);
-                }
-                for sub_x in 0..2 {
-                    top_u[x][sub_x] = u8::from(mb.u_nonzero[sub_x + 1 * 2]);
-                    top_v[x][sub_x] = u8::from(mb.v_nonzero[sub_x + 1 * 2]);
-                }
-            }
-        }
-
-        let row = &macroblocks[mb_y * mb_width..(mb_y + 1) * mb_width];
+    for row in macroblocks.chunks(mb_width) {
         let mut left_y = [0u8; 4];
         let mut left_u = [0u8; 2];
         let mut left_v = [0u8; 2];
@@ -708,8 +577,6 @@ fn encode_partition(
                 left_v[sub_y] = left;
             }
         }
-
-        mb_y += num_partitions;
     }
 
     enc.finish()
@@ -874,7 +741,7 @@ fn build_vp8_frame(
     width: u32,
     height: u32,
     first_partition: &[u8],
-    coeff_partitions: &[Vec<u8>],
+    coeff_partition: &[u8],
 ) -> Result<Vec<u8>, WebPEncodeError> {
     let first_part_size = u32::try_from(first_partition.len())
         .map_err(|_| WebPEncodeError("First partition exceeds VP8 limits".to_owned()))?;
@@ -884,14 +751,7 @@ fn build_vp8_frame(
         ));
     }
 
-    // Sizes (3-byte little-endian) precede the token data for every partition
-    // except the last one, whose length the decoder infers from the remaining
-    // bytes.
-    let size_table_len = coeff_partitions.len().saturating_sub(1) * 3;
-    let coeff_total: usize = coeff_partitions.iter().map(Vec::len).sum();
-
-    let mut out =
-        Vec::with_capacity(10 + first_partition.len() + size_table_len + coeff_total);
+    let mut out = Vec::with_capacity(10 + 4 + first_partition.len() + coeff_partition.len());
     let frame_tag = (first_part_size << 5) | 0x10;
     out.push((frame_tag & 0xFF) as u8);
     out.push(((frame_tag >> 8) & 0xFF) as u8);
@@ -901,19 +761,7 @@ fn build_vp8_frame(
     out.extend_from_slice(&(width as u16).to_le_bytes());
     out.extend_from_slice(&(height as u16).to_le_bytes());
     out.extend_from_slice(first_partition);
-
-    for part in &coeff_partitions[..coeff_partitions.len().saturating_sub(1)] {
-        let size = u32::try_from(part.len())
-            .map_err(|_| WebPEncodeError("Token partition exceeds VP8 limits".to_owned()))?;
-        out.push((size & 0xFF) as u8);
-        out.push(((size >> 8) & 0xFF) as u8);
-        out.push(((size >> 16) & 0xFF) as u8);
-    }
-
-    for part in coeff_partitions {
-        out.extend_from_slice(part);
-    }
-
+    out.extend_from_slice(coeff_partition);
     Ok(out)
 }
 
@@ -964,60 +812,5 @@ mod tests {
             .read_image(&mut rgb)
             .expect("encoded webp should decode");
         assert_eq!(rgb.len(), 16 * 16 * 3);
-    }
-
-    fn decode_webp(encoded: Vec<u8>) -> (u32, u32, Vec<u8>) {
-        let mut decoder = WebPDecoder::new(Cursor::new(encoded)).expect("decode init");
-        let (w, h) = decoder.dimensions();
-        let mut rgb = vec![0u8; decoder.output_buffer_size().expect("known size")];
-        decoder.read_image(&mut rgb).expect("decode");
-        (w, h, rgb)
-    }
-
-    /// Multi-token-partition output must decode to exactly the same pixels as a
-    /// single-partition encode (the tokens are identical, only the range-coder
-    /// container is split), and must round-trip through the decoder cleanly.
-    #[test]
-    fn multi_partition_matches_single_partition() {
-        // 200x160 => 13x10 macroblocks => mb_height 10 => 8 token partitions.
-        let img = RgbImage::from_fn(200, 160, |x, y| {
-            Rgb([
-                ((x * 7 + y * 3) & 0xFF) as u8,
-                ((x * 5 + y * 11) & 0xFF) as u8,
-                ((x.wrapping_mul(2) + y * 17) & 0xFF) as u8,
-            ])
-        });
-
-        // Sanity: this image is large enough to trigger multiple partitions.
-        assert_eq!(super::choose_token_partitions(160u32.div_ceil(16) as usize), 8);
-
-        let single = super::encode_lossy_webp_with_partitions(&img, 90, 1).expect("single encode");
-        let single_px = match {
-            let mut dec = WebPDecoder::new(Cursor::new(single.clone())).expect("init");
-            let mut rgb = vec![0u8; dec.output_buffer_size().unwrap()];
-            dec.read_image(&mut rgb).map(|()| rgb)
-        } {
-            Ok(px) => {
-                eprintln!("N=1: decode OK");
-                px
-            }
-            Err(e) => {
-                eprintln!("N=1: decode ERR {e:?}");
-                Vec::new()
-            }
-        };
-
-        for &n in &[2usize, 4, 8] {
-            let enc = super::encode_lossy_webp_with_partitions(&img, 90, n).expect("enc");
-            let mut dec = WebPDecoder::new(Cursor::new(enc)).expect("init");
-            let mut rgb = vec![0u8; dec.output_buffer_size().unwrap()];
-            match dec.read_image(&mut rgb) {
-                Ok(()) => eprintln!("N={n}: decode OK, match_single={}", rgb == single_px),
-                Err(e) => eprintln!("N={n}: decode ERR {e:?}"),
-            }
-        }
-        return;
-        #[allow(unreachable_code)]
-        let multi = encode_lossy_webp(&img, 90).expect("multi-partition encode");
     }
 }
