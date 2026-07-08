@@ -1832,10 +1832,15 @@ impl<R: Read> Vp8Decoder<R> {
             self.left.complexity[0] = if n { 1 } else { 0 };
             self.top[mbx].complexity[0] = if n { 1 } else { 0 };
 
-            transform::iwht4x4(&mut block);
+            // When the Y2 block carries no coefficients the inverse WHT and the
+            // DC scatter both yield zeros, so we can skip them: `blocks` is
+            // already zero-initialized.
+            if n || block[0] != 0 {
+                transform::iwht4x4(&mut block);
 
-            for k in 0usize..16 {
-                blocks[16 * k] = block[k];
+                for k in 0usize..16 {
+                    blocks[16 * k] = block[k];
+                }
             }
 
             plane = 0;
