@@ -164,7 +164,7 @@ $info = (new \CrabMagick\Image($path))->getInfo();
 | WebP (lossy + lossless) | ✅ | ✅ |
 | JPEG XL | ✅ | ✅ |
 | AVIF   | ✅ | ✅ |
-| TIFF   | ✅ | ✅ (LZW) |
+| TIFF   | ✅ | ✅ (LZW, Deflate, Packbits; horizontal predictor) |
 | GIF    | ✅ | — |
 | BMP    | ✅ | — |
 | SVG    | ✅ | — |
@@ -204,13 +204,17 @@ Notes:
 | WebP Q90 | **204 ms** · 3.0 MB | 407 ms (libwebp/PIL) | **2× faster** |
 | PNG     | **39 ms** · 8.7 MB | 689 ms (PIL/libpng) | **18× faster** |
 | JXL d=1.0 effort=1 | **349 ms** · 1.0 MB | ~500 ms (cjxl effort=1) | comparable |
-| TIFF LZW | **330 ms** · 11 MB | — | — |
+| TIFF LZW+predictor | **comparable** · same size | — | — |
 
 †JPEG: crabmagick builds optimal Huffman tables (two-pass) + embeds RST restart
 markers. Encoding is ~1.75× slower than PIL's single-pass libjpeg-turbo, but output
 files are ~14% smaller and the RST markers allow subsequent decodes at **2× the
 normal speed** (parallel RST-segment decode), making the trade-off net-positive for
 IIIF servers that re-encode the same JXL source repeatedly.
+
+**Encoder options (all formats):** quality, progressive, chroma subsampling (JPEG);
+effort, lossless/near-lossless (WebP); distance, effort, lossless tier (JXL);
+compression level, filter (PNG); compression (LZW/Deflate/Packbits), predictor (TIFF).
 
 ### How performance is achieved (pure Rust, zero C)
 
