@@ -37,6 +37,8 @@ pub struct FrameEncoderOptions {
     pub lz77_method: Lz77Method,
     /// Use lossy delta palette for near-lossless modular encoding.
     pub lossy_palette: bool,
+    /// Auto-detect and use lossless palette transform for few-color images.
+    pub palette: bool,
     /// Encoder mode: Reference (match libjxl) or Experimental (own improvements).
     pub encoder_mode: crate::api::EncoderMode,
     /// Effort profile with all effort-derived parameters.
@@ -64,6 +66,7 @@ impl Default for FrameEncoderOptions {
             enable_lz77: false,
             lz77_method: Lz77Method::Rle,
             lossy_palette: false,
+            palette: false,
             encoder_mode: crate::api::EncoderMode::Reference,
             profile: crate::effort::EffortProfile::lossless(7, crate::api::EncoderMode::Reference),
             have_animation: false,
@@ -90,6 +93,26 @@ pub struct FrameEncoder {
 }
 
 impl FrameEncoder {
+    fn should_use_lossless_palette(image: &ModularImage) -> Option<(usize, usize)> {
+        let begin_c = 0;
+        let num_c = image.channels.len().min(3);
+        if num_c == 0 {
+            return None;
+        }
+
+        let analysis = super::palette::analyze_palette(
+            image,
+            begin_c,
+            num_c,
+            super::palette::MAX_PALETTE_COLORS,
+        );
+        if analysis.use_palette {
+            Some((begin_c, num_c))
+        } else {
+            None
+        }
+    }
+
     /// Creates a new frame encoder.
     pub fn new(width: usize, height: usize, options: FrameEncoderOptions) -> Self {
         Self {
@@ -185,6 +208,17 @@ impl FrameEncoder {
                     image.channels.len().min(3),
                     max_colors,
                 )?;
+            } else if self.options.palette
+                && !self.options.lossy_palette
+                && let Some((begin_c, num_c)) = Self::should_use_lossless_palette(image)
+            {
+                super::encode::write_modular_stream_with_palette(
+                    image,
+                    &mut section_writer,
+                    self.options.use_ans,
+                    begin_c,
+                    num_c,
+                )?;
             } else if has_squeeze && self.options.use_tree_learning && self.options.use_ans {
                 super::encode::write_modular_stream_with_squeeze_and_tree(
                     image,
@@ -224,8 +258,15 @@ impl FrameEncoder {
             Self::append_sections_after_toc(writer, [section_data.as_slice()])?;
         } else {
             // Multi-group with patches: patches section goes into LfGlobal.
-            // Squeeze + patches is not yet supported; use non-squeeze multi-group path.
-            self.encode_modular_multi_group_inner(image, writer, Some(patches))?;
+            if self.options.palette
+                && !self.options.lossy_palette
+                && Self::should_use_lossless_palette(image).is_some()
+            {
+                self.encode_modular_multi_group_palette(image, writer, Some(patches))?;
+            } else {
+                // Squeeze + patches is not yet supported; use non-squeeze multi-group path.
+                self.encode_modular_multi_group_inner(image, writer, Some(patches))?;
+            }
         }
 
         Ok(())
@@ -284,6 +325,17 @@ impl FrameEncoder {
                     image.channels.len().min(3),
                     max_colors,
                 )?;
+            } else if self.options.palette
+                && !self.options.lossy_palette
+                && let Some((begin_c, num_c)) = Self::should_use_lossless_palette(image)
+            {
+                super::encode::write_modular_stream_with_palette(
+                    image,
+                    &mut section_writer,
+                    self.options.use_ans,
+                    begin_c,
+                    num_c,
+                )?;
             } else if has_squeeze && self.options.use_tree_learning && self.options.use_ans {
                 // Combined squeeze + tree learning: best compression
                 super::encode::write_modular_stream_with_squeeze_and_tree(
@@ -330,6 +382,11 @@ impl FrameEncoder {
 
             // Append section data (already byte-aligned)
             Self::append_sections_after_toc(writer, [section_data.as_slice()])?;
+        } else if self.options.palette
+            && !self.options.lossy_palette
+            && Self::should_use_lossless_palette(image).is_some()
+        {
+            self.encode_modular_multi_group_palette(image, writer, None)?;
         } else if self.options.lossy_palette && image.channels.len() >= 3 {
             // Multi-group lossy palette: palette meta in LfGlobal, index across groups
             self.encode_modular_multi_group_lossy_palette(image, writer)?;
@@ -982,6 +1039,229 @@ impl FrameEncoder {
         self.write_toc_multi(writer, &section_sizes)?;
 
         // Write all section data in same order
+        Self::append_sections_after_toc(
+            writer,
+            core::iter::once(lf_global_data.as_slice())
+                .chain(lf_group_data.iter().map(Vec::as_slice))
+                .chain(core::iter::once(hf_global_data.as_slice()))
+                .chain(pass_group_data.iter().map(Vec::as_slice)),
+        )?;
+
+        Ok(())
+    }
+
+    /// Encodes a modular image using multi-group format with an exact palette transform.
+    fn encode_modular_multi_group_palette(
+        &self,
+        image: &ModularImage,
+        writer: &mut BitWriter,
+        patches: Option<&crate::vardct::patches::PatchesData>,
+    ) -> Result<()> {
+        use super::encode::{
+            write_gradient_tree_tokens, write_hybrid_data_histogram,
+            write_tree_histogram_for_gradient,
+        };
+        use super::encode_transforms::write_palette_transform;
+        use super::predictor::pack_signed;
+        use crate::entropy_coding::encode::{build_entropy_code_ans, write_tokens_ans};
+        use crate::entropy_coding::hybrid_uint::HybridUintConfig;
+        use crate::entropy_coding::token::Token as AnsToken;
+
+        const MODULAR_HYBRID_UINT: HybridUintConfig = HybridUintConfig {
+            split_exponent: 4,
+            split: 16,
+            msb_in_token: 2,
+            lsb_in_token: 0,
+        };
+
+        let Some((begin_c, num_c)) = Self::should_use_lossless_palette(image) else {
+            return self.encode_modular_multi_group_inner(image, writer, patches);
+        };
+
+        let num_groups = self.num_groups();
+        let num_lf_groups = self.num_lf_groups();
+        let analysis = super::palette::analyze_palette(
+            image,
+            begin_c,
+            num_c,
+            super::palette::MAX_PALETTE_COLORS,
+        );
+        let (transformed, nb_colors) =
+            super::palette::apply_palette_from_ref(image, begin_c, num_c, &analysis)?;
+
+        crate::trace::debug_eprintln!(
+            "LOSSLESS_PALETTE_MULTI: {} colors, {} → {} channels, {}x{}",
+            nb_colors,
+            image.channels.len(),
+            transformed.channels.len(),
+            self.width,
+            self.height,
+        );
+
+        let palette_meta = transformed.channels[0].clone();
+        let spatial_image = ModularImage {
+            channels: transformed.channels[1..].to_vec(),
+            bit_depth: transformed.bit_depth,
+            is_grayscale: transformed.is_grayscale,
+            has_alpha: image.has_alpha,
+        };
+
+        let mut group_images: Vec<ModularImage> = Vec::with_capacity(num_groups);
+        for group_idx in 0..num_groups {
+            let (x_start, y_start, x_end, y_end) = self.group_bounds(group_idx);
+            let group_image = spatial_image.extract_region(x_start, y_start, x_end, y_end)?;
+            group_images.push(group_image);
+        }
+
+        let predict_gradient = |left: i32, top: i32, topleft: i32| -> i32 {
+            let grad = left + top - topleft;
+            grad.clamp(left.min(top), left.max(top))
+        };
+
+        let collect_channel_residuals = |channel: &super::channel::Channel| -> Vec<u32> {
+            let w = channel.width();
+            let h = channel.height();
+            let mut residuals = Vec::with_capacity(w * h);
+            for y in 0..h {
+                for x in 0..w {
+                    let pixel = channel.get(x, y);
+                    let left = if x > 0 { channel.get(x - 1, y) } else { 0 };
+                    let top = if y > 0 { channel.get(x, y - 1) } else { left };
+                    let topleft = if x > 0 && y > 0 {
+                        channel.get(x - 1, y - 1)
+                    } else {
+                        left
+                    };
+                    let prediction = predict_gradient(left, top, topleft);
+                    residuals.push(pack_signed(pixel - prediction));
+                }
+            }
+            residuals
+        };
+
+        let palette_residuals = collect_channel_residuals(&palette_meta);
+        let mut all_residuals = palette_residuals.clone();
+        for group_image in &group_images {
+            for channel in &group_image.channels {
+                all_residuals.extend(collect_channel_residuals(channel));
+            }
+        }
+
+        let mut max_token: u32 = 0;
+        for &r in &all_residuals {
+            let (token, _, _) = MODULAR_HYBRID_UINT.encode(r);
+            max_token = max_token.max(token);
+        }
+
+        let mut lf_global_writer = BitWriter::new();
+        if let Some(pd) = patches {
+            crate::vardct::patches::encode_patches_section(
+                pd,
+                self.options.use_ans,
+                &mut lf_global_writer,
+            )?;
+        }
+
+        lf_global_writer.write(1, 1)?;
+        lf_global_writer.write(1, 1)?;
+
+        let (tree_depths, tree_codes) = write_tree_histogram_for_gradient(&mut lf_global_writer)?;
+        write_gradient_tree_tokens(&mut lf_global_writer, &tree_depths, &tree_codes)?;
+
+        enum EntropyState {
+            Huffman {
+                depths: Vec<u8>,
+                codes: Vec<u16>,
+            },
+            Ans {
+                code: crate::entropy_coding::encode::OwnedAnsEntropyCode,
+            },
+        }
+
+        let entropy_state = if self.options.use_ans {
+            let tokens: Vec<AnsToken> =
+                all_residuals.iter().map(|&r| AnsToken::new(0, r)).collect();
+            let code = build_entropy_code_ans(&tokens, 1);
+            super::section::write_ans_modular_header(&mut lf_global_writer, &code)?;
+            EntropyState::Ans { code }
+        } else {
+            let histogram_size = (max_token + 1) as usize;
+            let mut histogram = vec![0u32; histogram_size];
+            for &r in &all_residuals {
+                let (token, _, _) = MODULAR_HYBRID_UINT.encode(r);
+                histogram[token as usize] += 1;
+            }
+            let (depths, codes) =
+                write_hybrid_data_histogram(&mut lf_global_writer, &histogram, max_token)?;
+            EntropyState::Huffman { depths, codes }
+        };
+
+        lf_global_writer.write(1, 1)?;
+        lf_global_writer.write(1, 1)?;
+        lf_global_writer.write(2, 1)?;
+        write_palette_transform(&mut lf_global_writer, begin_c, num_c, nb_colors, 0, 0)?;
+
+        let encode_residuals =
+            |residuals: &[u32], writer: &mut BitWriter, state: &EntropyState| -> Result<()> {
+                match state {
+                    EntropyState::Huffman { depths, codes } => {
+                        for &r in residuals {
+                            let (token, extra_bits, num_extra) = MODULAR_HYBRID_UINT.encode(r);
+                            let depth = depths.get(token as usize).copied().unwrap_or(0);
+                            let code = codes.get(token as usize).copied().unwrap_or(0);
+                            if depth > 0 {
+                                writer.write(depth as usize, code as u64)?;
+                            }
+                            if num_extra > 0 {
+                                writer.write(num_extra as usize, extra_bits as u64)?;
+                            }
+                        }
+                    }
+                    EntropyState::Ans { code } => {
+                        let tokens: Vec<AnsToken> =
+                            residuals.iter().map(|&r| AnsToken::new(0, r)).collect();
+                        write_tokens_ans(&tokens, code, None, writer)?;
+                    }
+                }
+                Ok(())
+            };
+
+        encode_residuals(&palette_residuals, &mut lf_global_writer, &entropy_state)?;
+        lf_global_writer.zero_pad_to_byte();
+        let lf_global_data = lf_global_writer.finish();
+
+        let hf_global_data: Vec<u8> = Vec::new();
+        let lf_group_data: Vec<Vec<u8>> = (0..num_lf_groups).map(|_| Vec::new()).collect();
+
+        let pass_group_data: Vec<Vec<u8>> =
+            crate::parallel::parallel_map_result(num_groups, |g| {
+                let group_image = &group_images[g];
+                let mut group_writer = BitWriter::new();
+                group_writer.write(1, 1)?;
+                group_writer.write(1, 1)?;
+                group_writer.write(2, 0)?;
+
+                let mut section_residuals: Vec<u32> = Vec::new();
+                for channel in &group_image.channels {
+                    section_residuals.extend(collect_channel_residuals(channel));
+                }
+                encode_residuals(&section_residuals, &mut group_writer, &entropy_state)?;
+
+                group_writer.zero_pad_to_byte();
+                Ok(group_writer.finish())
+            })?;
+
+        let mut section_sizes = Vec::with_capacity(2 + num_lf_groups + num_groups);
+        section_sizes.push(lf_global_data.len());
+        for data in &lf_group_data {
+            section_sizes.push(data.len());
+        }
+        section_sizes.push(hf_global_data.len());
+        for data in &pass_group_data {
+            section_sizes.push(data.len());
+        }
+
+        self.write_toc_multi(writer, &section_sizes)?;
         Self::append_sections_after_toc(
             writer,
             core::iter::once(lf_global_data.as_slice())

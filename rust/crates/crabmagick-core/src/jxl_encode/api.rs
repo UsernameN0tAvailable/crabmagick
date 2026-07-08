@@ -96,7 +96,9 @@ impl From<crate::jxl_encode::error::Error> for EncodeError {
             } => Self::InvalidInput {
                 message: format!("dimension overflow: {width}x{height}x{channels} exceeds usize"),
             },
-            crate::jxl_encode::error::Error::InvalidInput(msg) => Self::InvalidInput { message: msg },
+            crate::jxl_encode::error::Error::InvalidInput(msg) => {
+                Self::InvalidInput { message: msg }
+            }
             crate::jxl_encode::error::Error::OutOfMemory(e) => Self::Oom(e),
             #[cfg(feature = "std")]
             crate::jxl_encode::error::Error::IoError(e) => Self::Io(e),
@@ -668,6 +670,7 @@ pub struct LosslessConfig {
     lz77_method: Lz77Method,
     patches: bool,
     lossy_palette: bool,
+    palette: bool,
     threads: usize,
     /// Sweep / picker hook: when set, replaces the effort+mode-derived
     /// `EffortProfile` everywhere the encoder asks for one. See
@@ -683,7 +686,8 @@ impl Default for LosslessConfig {
 
 impl LosslessConfig {
     fn with_effort_level(effort: u8) -> Self {
-        let profile = crate::jxl_encode::effort::EffortProfile::lossless(effort, EncoderMode::Reference);
+        let profile =
+            crate::jxl_encode::effort::EffortProfile::lossless(effort, EncoderMode::Reference);
         Self {
             effort: profile.effort,
             mode: EncoderMode::Reference,
@@ -698,6 +702,7 @@ impl LosslessConfig {
             lz77_method: profile.lz77_method,
             patches: profile.patches,
             lossy_palette: false,
+            palette: effort >= 3,
             threads: 0,
             profile_override: None,
         }
@@ -706,9 +711,9 @@ impl LosslessConfig {
     /// Resolve the effective [`EffortProfile`]: the override if set,
     /// otherwise the standard profile derived from effort + mode.
     pub(crate) fn effective_profile(&self) -> crate::jxl_encode::effort::EffortProfile {
-        self.profile_override
-            .clone()
-            .unwrap_or_else(|| crate::jxl_encode::effort::EffortProfile::lossless(self.effort, self.mode))
+        self.profile_override.clone().unwrap_or_else(|| {
+            crate::jxl_encode::effort::EffortProfile::lossless(self.effort, self.mode)
+        })
     }
 
     /// Apply picker / sweep override knobs scoped to the **lossless
@@ -729,8 +734,12 @@ impl LosslessConfig {
     /// minor versions.
     #[cfg(feature = "__expert")]
     #[doc(hidden)]
-    pub fn with_internal_params(mut self, params: crate::jxl_encode::effort::LosslessInternalParams) -> Self {
-        let mut profile = crate::jxl_encode::effort::EffortProfile::lossless(self.effort, self.mode);
+    pub fn with_internal_params(
+        mut self,
+        params: crate::jxl_encode::effort::LosslessInternalParams,
+    ) -> Self {
+        let mut profile =
+            crate::jxl_encode::effort::EffortProfile::lossless(self.effort, self.mode);
         params.apply_to(&mut profile);
         self.profile_override = Some(profile);
         self
@@ -826,6 +835,12 @@ impl LosslessConfig {
     /// Matching libjxl's modular lossy palette mode.
     pub fn with_lossy_palette(mut self, enable: bool) -> Self {
         self.lossy_palette = enable;
+        self
+    }
+
+    /// Enable/disable lossless palette transform auto-detection (default: true at effort >= 3).
+    pub fn with_palette(mut self, enable: bool) -> Self {
+        self.palette = enable;
         self
     }
 
@@ -1089,7 +1104,8 @@ impl LossyConfig {
     }
 
     fn new_with_effort(distance: f32, effort: u8) -> Self {
-        let profile = crate::jxl_encode::effort::EffortProfile::lossy(effort, EncoderMode::Reference);
+        let profile =
+            crate::jxl_encode::effort::EffortProfile::lossy(effort, EncoderMode::Reference);
         Self {
             distance,
             effort: profile.effort,
@@ -1132,9 +1148,9 @@ impl LossyConfig {
     /// Resolve the effective [`EffortProfile`]: the override if set,
     /// otherwise the standard profile derived from effort + mode.
     pub(crate) fn effective_profile(&self) -> crate::jxl_encode::effort::EffortProfile {
-        self.profile_override
-            .clone()
-            .unwrap_or_else(|| crate::jxl_encode::effort::EffortProfile::lossy(self.effort, self.mode))
+        self.profile_override.clone().unwrap_or_else(|| {
+            crate::jxl_encode::effort::EffortProfile::lossy(self.effort, self.mode)
+        })
     }
 
     /// Apply picker / sweep override knobs scoped to the **lossy (VarDCT)**
@@ -1155,7 +1171,10 @@ impl LossyConfig {
     /// minor versions.
     #[cfg(feature = "__expert")]
     #[doc(hidden)]
-    pub fn with_internal_params(mut self, params: crate::jxl_encode::effort::LossyInternalParams) -> Self {
+    pub fn with_internal_params(
+        mut self,
+        params: crate::jxl_encode::effort::LossyInternalParams,
+    ) -> Self {
         let mut profile = crate::jxl_encode::effort::EffortProfile::lossy(self.effort, self.mode);
         params.apply_to(&mut profile);
         self.profile_override = Some(profile);
@@ -1448,7 +1467,10 @@ impl LossyConfig {
     /// They encode thin features (power lines, horizons) efficiently.
     /// The encoder subtracts splines from XYB before VarDCT; the decoder
     /// adds them back after reconstruction. Default: `None`.
-    pub fn with_splines(mut self, splines: Vec<crate::jxl_encode::vardct::splines::Spline>) -> Self {
+    pub fn with_splines(
+        mut self,
+        splines: Vec<crate::jxl_encode::vardct::splines::Spline>,
+    ) -> Self {
         self.splines = Some(splines);
         self
     }
@@ -1999,7 +2021,8 @@ impl<'a> EncodeRequest<'a> {
             FileHeader::new_rgb(self.width, self.height)
         };
         if image.bit_depth == 16 {
-            file_header.metadata.bit_depth = crate::jxl_encode::headers::file_header::BitDepth::uint16();
+            file_header.metadata.bit_depth =
+                crate::jxl_encode::headers::file_header::BitDepth::uint16();
             for ec in &mut file_header.metadata.extra_channels {
                 ec.bit_depth = crate::jxl_encode::headers::file_header::BitDepth::uint16();
             }
@@ -2061,6 +2084,7 @@ impl<'a> EncodeRequest<'a> {
                 enable_lz77: cfg.lz77,
                 lz77_method: cfg.lz77_method,
                 lossy_palette: cfg.lossy_palette,
+                palette: cfg.palette,
                 encoder_mode: cfg.mode,
                 profile: cfg.effective_profile(),
                 have_animation: false,
@@ -2874,25 +2898,22 @@ impl LossyConfig {
         let has_alpha = layout.has_alpha();
         let alpha = if has_alpha {
             let mut v = Vec::new();
-            v.try_reserve(w * h)
-                .map_err(|e| {
-                    at(EncodeError::from(
-                        crate::jxl_encode::error::Error::OutOfMemory(e),
-                    ))
-                })?;
+            v.try_reserve(w * h).map_err(|e| {
+                at(EncodeError::from(
+                    crate::jxl_encode::error::Error::OutOfMemory(e),
+                ))
+            })?;
             Some(v)
         } else {
             None
         };
 
         let mut linear_rgb = Vec::new();
-        linear_rgb
-            .try_reserve(rgb_capacity)
-            .map_err(|e| {
-                at(EncodeError::from(
-                    crate::jxl_encode::error::Error::OutOfMemory(e),
-                ))
-            })?;
+        linear_rgb.try_reserve(rgb_capacity).map_err(|e| {
+            at(EncodeError::from(
+                crate::jxl_encode::error::Error::OutOfMemory(e),
+            ))
+        })?;
 
         Ok(LossyEncoder {
             cfg: self.clone(),
@@ -3265,7 +3286,8 @@ impl LosslessEncoder {
                 FileHeader::new_rgb(self.width, self.height)
             };
             if image.bit_depth == 16 {
-                file_header.metadata.bit_depth = crate::jxl_encode::headers::file_header::BitDepth::uint16();
+                file_header.metadata.bit_depth =
+                    crate::jxl_encode::headers::file_header::BitDepth::uint16();
                 for ec in &mut file_header.metadata.extra_channels {
                     ec.bit_depth = crate::jxl_encode::headers::file_header::BitDepth::uint16();
                 }
@@ -3317,6 +3339,7 @@ impl LosslessEncoder {
                     enable_lz77: cfg.lz77,
                     lz77_method: cfg.lz77_method,
                     lossy_palette: cfg.lossy_palette,
+                    palette: cfg.palette,
                     encoder_mode: cfg.mode,
                     profile: cfg.effective_profile(),
                     have_animation: false,
@@ -3555,7 +3578,8 @@ fn encode_animation_lossless(
         FileHeader::new_rgb(width, height)
     };
     if sample_image.bit_depth == 16 {
-        file_header.metadata.bit_depth = crate::jxl_encode::headers::file_header::BitDepth::uint16();
+        file_header.metadata.bit_depth =
+            crate::jxl_encode::headers::file_header::BitDepth::uint16();
         for ec in &mut file_header.metadata.extra_channels {
             ec.bit_depth = crate::jxl_encode::headers::file_header::BitDepth::uint16();
         }
@@ -3649,6 +3673,7 @@ fn encode_animation_lossless(
                 enable_lz77: cfg.lz77,
                 lz77_method: cfg.lz77_method,
                 lossy_palette: cfg.lossy_palette,
+                palette: cfg.palette,
                 encoder_mode: cfg.mode,
                 profile: cfg.effective_profile(),
                 have_animation: true,
@@ -4680,7 +4705,8 @@ mod tests {
         }
 
         // Verify jxl-rs can decode it
-        let decoded = crate::jxl_encode::test_helpers::decode_with_jxl_rs(&jxl).expect("jxl-rs decode failed");
+        let decoded = crate::jxl_encode::test_helpers::decode_with_jxl_rs(&jxl)
+            .expect("jxl-rs decode failed");
         assert_eq!(decoded.width, 300);
         assert_eq!(decoded.height, 300);
         assert_eq!(decoded.channels, 3);
@@ -4735,7 +4761,8 @@ mod tests {
         let jxl = cfg
             .encode(&pixels, 32, 32, PixelLayout::Rgb8)
             .expect("palette 256-colors encode");
-        let decoded = crate::jxl_encode::test_helpers::decode_with_jxl_rs(&jxl).expect("jxl-rs decode failed");
+        let decoded = crate::jxl_encode::test_helpers::decode_with_jxl_rs(&jxl)
+            .expect("jxl-rs decode failed");
         for (i, (&orig, &dec)) in pixels.iter().zip(decoded.pixels.iter()).enumerate() {
             let dec_u8 = (dec * 255.0).round().clamp(0.0, 255.0) as u8;
             assert_eq!(
@@ -4926,7 +4953,8 @@ mod tests {
             W,
             H
         );
-        let decoded = crate::jxl_encode::test_helpers::decode_with_jxl_rs(&jxl).expect("jxl-rs decode failed");
+        let decoded = crate::jxl_encode::test_helpers::decode_with_jxl_rs(&jxl)
+            .expect("jxl-rs decode failed");
         assert_eq!(decoded.width, W as usize);
         assert_eq!(decoded.height, H as usize);
         let mut max_err = 0i32;

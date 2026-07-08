@@ -665,6 +665,7 @@ pub struct LosslessConfig {
     lz77_method: Lz77Method,
     patches: bool,
     lossy_palette: bool,
+    palette: bool,
     threads: usize,
     /// Sweep / picker hook: when set, replaces the effort+mode-derived
     /// `EffortProfile` everywhere the encoder asks for one. See
@@ -695,6 +696,7 @@ impl LosslessConfig {
             lz77_method: profile.lz77_method,
             patches: profile.patches,
             lossy_palette: false,
+            palette: effort >= 3,
             threads: 0,
             profile_override: None,
         }
@@ -820,6 +822,12 @@ impl LosslessConfig {
     /// Matching libjxl's modular lossy palette mode.
     pub fn with_lossy_palette(mut self, enable: bool) -> Self {
         self.lossy_palette = enable;
+        self
+    }
+
+    /// Enable/disable lossless palette transform auto-detection (default: true at effort >= 3).
+    pub fn with_palette(mut self, enable: bool) -> Self {
+        self.palette = enable;
         self
     }
 
@@ -2046,6 +2054,7 @@ impl<'a> EncodeRequest<'a> {
                 enable_lz77: cfg.lz77,
                 lz77_method: cfg.lz77_method,
                 lossy_palette: cfg.lossy_palette,
+                palette: cfg.palette,
                 encoder_mode: cfg.mode,
                 profile: cfg.effective_profile(),
                 have_animation: false,
@@ -3294,6 +3303,7 @@ impl LosslessEncoder {
                     enable_lz77: cfg.lz77,
                     lz77_method: cfg.lz77_method,
                     lossy_palette: cfg.lossy_palette,
+                    palette: cfg.palette,
                     encoder_mode: cfg.mode,
                     profile: cfg.effective_profile(),
                     have_animation: false,
@@ -3626,6 +3636,7 @@ fn encode_animation_lossless(
                 enable_lz77: cfg.lz77,
                 lz77_method: cfg.lz77_method,
                 lossy_palette: cfg.lossy_palette,
+                palette: cfg.palette,
                 encoder_mode: cfg.mode,
                 profile: cfg.effective_profile(),
                 have_animation: true,
