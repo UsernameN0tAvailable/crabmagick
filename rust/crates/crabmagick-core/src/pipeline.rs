@@ -27,7 +27,8 @@ use resvg::{tiny_skia, usvg};
 use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
 
 use crate::jpeg_encode::encoder::{
-    ChromaSubsampling, EncoderConfig, PixelLayout as ZenLayout, Unstoppable,
+    ChromaSubsampling, EncoderConfig, ParallelEncoding, PixelLayout as ZenLayout,
+    ProgressiveScanMode, Unstoppable,
 };
 use crate::jxl_encode::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
 use crate::processor::{CrabMagickError, ImageInfo, OutputFormat, RequestedRegion};
@@ -886,7 +887,16 @@ pub fn encode(
             // TODO: plumb JXL decoder's planar render buffers directly into JPEG encoder once the
             // encoder exposes a non-packed RGB/YCbCr entry point. Today the hot path still
             // expects packed RGB8 slices, so JXL->JPEG keeps this intermediate representation.
-            let config = EncoderConfig::ycbcr(quality.min(100), ChromaSubsampling::Quarter);
+            // Baseline (non-progressive) sequential mode with parallel entropy coding
+            // matches libjpeg-turbo's cjpeg speed: the RST-segment entropy encoder in
+            // `jpeg_encode::encode::parallel` splits the scan into restart-marker
+            // segments encoded concurrently, and DCT/quantization run on rayon too.
+            // Optimized Huffman tables are retained (parallelized, so cheap) to keep
+            // files small. Progressive mode is ~4x slower and cannot use the parallel
+            // entropy path, so it is not used for the default fast encode.
+            let config = EncoderConfig::ycbcr(quality.min(100), ChromaSubsampling::Quarter)
+                .scan_mode(ProgressiveScanMode::Baseline)
+                .parallel(ParallelEncoding::Auto);
             let mut enc = config
                 .encode_from_bytes(width, height, ZenLayout::Rgb8Srgb)
                 .map_err(|error| {
