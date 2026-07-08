@@ -523,6 +523,7 @@ dependencies = [
  "moxcms",
  "once_cell",
  "pdfium-render",
+ "png 0.17.16",
  "quick-error",
  "rand 0.8.6",
  "ravif 0.11.20",

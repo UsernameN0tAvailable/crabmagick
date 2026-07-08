@@ -7,6 +7,7 @@
     clippy::chunks_exact_to_as_chunks
 )]
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
 use std::num::NonZeroUsize;
@@ -15,12 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, JxlThreadPool, PixelFormat, XybSrgbParams};
 use fast_image_resize as fir;
-use image::{
-    ColorType, GenericImageView, ImageEncoder,
-    codecs::png::{
-        CompressionType as ImagePngCompressionType, FilterType as ImagePngFilter, PngEncoder,
-    },
-};
+use image::{ColorType, GenericImageView};
 use lru::LruCache;
 use memmap2::Mmap;
 #[cfg(feature = "pdf")]
@@ -28,6 +24,7 @@ use pdfium_render::prelude::*;
 #[cfg(feature = "avif")]
 use ravif::{
     ColorModel as AvifColorModel, Encoder as AvifEncoder, Img as AvifImg, RGB8 as AvifRgb8,
+    RGBA8 as AvifRgba8,
 };
 use rayon::prelude::*;
 use resvg::{tiny_skia, usvg};
@@ -48,8 +45,14 @@ use crate::processor::{
 /// Owned RGB pixel data produced by the decoding pipeline.
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
-    /// Packed `RGBRGB...` pixel bytes.
+    /// Packed `RGBRGB...` pixel bytes (always RGB, no alpha).
     pub pixels: Vec<u8>,
+    /// Separate alpha channel (one byte per pixel, same spatial dims). None = fully opaque.
+    pub alpha: Option<Vec<u8>>,
+    /// Raw ICC profile bytes extracted from the source image.
+    pub icc: Option<Vec<u8>>,
+    /// Raw EXIF bytes extracted from the source image (without the "Exif\\0\\0" prefix).
+    pub exif: Option<Vec<u8>>,
     /// Image width in pixels.
     pub width: u32,
     /// Image height in pixels.
@@ -118,7 +121,10 @@ impl DecodedImageCache {
             return;
         }
 
-        let bytes = image.pixels.len();
+        let bytes = image.pixels.len()
+            + image.alpha.as_ref().map_or(0, Vec::len)
+            + image.icc.as_ref().map_or(0, Vec::len)
+            + image.exif.as_ref().map_or(0, Vec::len);
         if bytes > self.bytes_limit {
             return;
         }
@@ -389,6 +395,27 @@ pub fn decode_jxl_from_bytes(bytes: &[u8]) -> Result<DecodedImage, CrabMagickErr
     decode_jxl_from_bytes_with_hint(bytes, None)
 }
 
+fn extract_jxl_alpha(
+    frame: &crate::jxl_decode::jxl_oxide::Render,
+    pixel_format: PixelFormat,
+) -> Option<Vec<u8>> {
+    if !pixel_format.has_alpha() {
+        return None;
+    }
+
+    let mut stream = frame.stream();
+    let channels = stream.channels() as usize;
+    let mut data = vec![0u8; stream.width() as usize * stream.height() as usize * channels];
+    let written = stream.write_to_buffer(&mut data);
+    debug_assert_eq!(written, data.len());
+
+    let alpha = data
+        .chunks_exact(channels)
+        .map(|pixel| pixel[channels - 1])
+        .collect();
+    maybe_some_alpha(alpha)
+}
+
 fn decode_jxl_from_bytes_with_hint(
     bytes: &[u8],
     render_size: Option<(u32, u32)>,
@@ -398,6 +425,7 @@ fn decode_jxl_from_bytes_with_hint(
     let width = image.width();
     let height = image.height();
     let pixel_format = image.pixel_format();
+    let icc = image.original_icc().map(|profile| profile.to_vec());
 
     // Render the keyframe, deferring the XYB→sRGB color transform whenever it can be fused
     // with the u8 RGB packing below (the common sRGB/VarDCT case).
@@ -405,6 +433,7 @@ fn decode_jxl_from_bytes_with_hint(
         .render_frame_maybe_fused(0)
         .map_err(|error| decode_malformed(format!("JPEG XL frame rendering failed: {error}")))?;
     let pool = image.pool();
+    let alpha = extract_jxl_alpha(&frame, pixel_format);
 
     // Fastest path: fuse XYB→sRGB (XybToMixedLms + 3×3 matrix + sRGB transfer) directly into
     // interleaved u8 RGB in a single SIMD pass, skipping the standalone color-transform pass.
@@ -413,15 +442,19 @@ fn decode_jxl_from_bytes_with_hint(
         let xyb = frame
             .color_channels_raw_f32()
             .expect("fuseable render guarantees zero-copy XYB channels");
-        return Ok(planar_to_rgb_fused_xyb_srgb(
+        let mut decoded = planar_to_rgb_fused_xyb_srgb(
             xyb[0], xyb[1], xyb[2], width, height, &params, pool,
-        ));
+        );
+        decoded.alpha = alpha;
+        decoded.icc = icc;
+        decoded.exif = None;
+        return Ok(decoded);
     }
 
     // Fast path: zero-copy — access the AlignedGrid<f32> buffers directly without
     // allocating new FrameBuffers or doing the scalar per-pixel copy in `from_grids`.
     if let Some(raw) = frame.color_channels_raw_f32() {
-        return Ok(planar_to_rgb(
+        let mut decoded = planar_to_rgb(
             pixel_format,
             raw[0],
             raw.get(1).copied(),
@@ -429,12 +462,16 @@ fn decode_jxl_from_bytes_with_hint(
             width,
             height,
             pool,
-        ));
+        );
+        decoded.alpha = alpha;
+        decoded.icc = icc;
+        decoded.exif = None;
+        return Ok(decoded);
     }
 
     // Slow path: orientation != 1 or non-f32 channels
     let planes = frame.image_planar();
-    Ok(planar_to_rgb(
+    let mut decoded = planar_to_rgb(
         pixel_format,
         planes[0].buf(),
         planes.get(1).map(|plane| plane.buf()),
@@ -442,7 +479,11 @@ fn decode_jxl_from_bytes_with_hint(
         width,
         height,
         pool,
-    ))
+    );
+    decoded.alpha = alpha;
+    decoded.icc = icc;
+    decoded.exif = None;
+    Ok(decoded)
 }
 
 /// Decodes a rectangular JPEG XL region from disk into packed RGB pixels.
@@ -485,6 +526,8 @@ fn decode_jxl_region_from_bytes_with_hint(
     render_size: Option<(u32, u32)>,
 ) -> Result<DecodedImage, CrabMagickError> {
     let mut image = create_jxl_image(bytes, render_size)?;
+    let pixel_format = image.pixel_format();
+    let icc = image.original_icc().map(|profile| profile.to_vec());
     let image_info = ImageInfo {
         width: image.width(),
         height: image.height(),
@@ -503,6 +546,7 @@ fn decode_jxl_region_from_bytes_with_hint(
         .render_frame(0)
         .map_err(|error| decode_malformed(format!("JPEG XL region rendering failed: {error}")))?;
     let pool = image.pool();
+    let alpha = extract_jxl_alpha(&frame, pixel_format);
     if let Some(raw) = frame.color_channels_raw_f32() {
         if raw.is_empty() {
             return Err(decode_malformed(
@@ -517,15 +561,19 @@ fn decode_jxl_region_from_bytes_with_hint(
         } else {
             0
         };
-        return Ok(planar_to_rgb(
-            image.pixel_format(),
+        let mut decoded = planar_to_rgb(
+            pixel_format,
             raw[0],
             raw.get(1).copied(),
             raw.get(2).copied(),
             rendered_w,
             rendered_h,
             pool,
-        ));
+        );
+        decoded.alpha = alpha;
+        decoded.icc = icc;
+        decoded.exif = None;
+        return Ok(decoded);
     }
 
     let planes = frame.image_planar();
@@ -535,15 +583,19 @@ fn decode_jxl_region_from_bytes_with_hint(
         ));
     }
 
-    Ok(planar_to_rgb(
-        image.pixel_format(),
+    let mut decoded = planar_to_rgb(
+        pixel_format,
         planes[0].buf(),
         planes.get(1).map(|plane| plane.buf()),
         planes.get(2).map(|plane| plane.buf()),
         planes[0].width() as u32,
         planes[0].height() as u32,
         pool,
-    ))
+    );
+    decoded.alpha = alpha;
+    decoded.icc = icc;
+    decoded.exif = None;
+    Ok(decoded)
 }
 
 /// Returns JPEG XL dimensions without fully rasterizing the image.
@@ -694,7 +746,14 @@ pub fn decode_any_with_options(
             let decoded = decode_jpeg_fast(&bytes).or_else(|_| decode_via_image(&bytes))?;
             apply_post_decode_ops(decoded, region, square)?
         }
-        SourceFormat::Png | SourceFormat::Gif | SourceFormat::Bmp => {
+        SourceFormat::Png => {
+            apply_post_decode_ops(
+                decode_png_fast(&bytes).or_else(|_| decode_via_image(&bytes))?,
+                region,
+                square,
+            )?
+        }
+        SourceFormat::Gif | SourceFormat::Bmp => {
             apply_post_decode_ops(decode_via_image(&bytes)?, region, square)?
         }
         SourceFormat::Webp => apply_post_decode_ops(decode_webp_fast(&bytes)?, region, square)?,
@@ -752,6 +811,84 @@ pub fn decode_any_with_options(
 ///
 /// Uses `fast_image_resize` with a downscale-friendly filter choice and avoids
 /// work when the output size matches the input size.
+fn resize_channel_u8(
+    channel: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let source = fir::images::Image::from_vec_u8(src_w, src_h, channel.to_vec(), fir::PixelType::U8)
+        .expect("validated grayscale buffer");
+    let mut destination = fir::images::Image::new(dst_w, dst_h, fir::PixelType::U8);
+    let filter = if dst_w < src_w / 2 || dst_h < src_h / 2 {
+        fir::FilterType::Bilinear
+    } else {
+        fir::FilterType::CatmullRom
+    };
+    let options = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(filter));
+    fir::Resizer::new()
+        .resize(&source, &mut destination, Some(&options))
+        .expect("resize should succeed for grayscale buffers");
+    destination.buffer().to_vec()
+}
+
+fn rotate_plane_u8(channel: &[u8], width: u32, height: u32, degrees: u16) -> Vec<u8> {
+    match degrees % 360 {
+        0 => channel.to_vec(),
+        180 => {
+            let stride = width as usize;
+            let src_height = height as usize;
+            let mut out = vec![0u8; channel.len()];
+            out.par_chunks_mut(stride).enumerate().for_each(|(row, dst)| {
+                let src = &channel[(src_height - 1 - row) * stride..][..stride];
+                for col in 0..stride {
+                    dst[col] = src[stride - 1 - col];
+                }
+            });
+            out
+        }
+        90 => {
+            let (ow, oh) = (width as usize, height as usize);
+            let mut out = vec![0u8; channel.len()];
+            out.par_chunks_mut(oh).enumerate().for_each(|(dst_row, dst_chunk)| {
+                for (dst_col, value) in dst_chunk.iter_mut().enumerate() {
+                    let src_row = oh - 1 - dst_col;
+                    let src_col = dst_row;
+                    *value = channel[src_row * ow + src_col];
+                }
+            });
+            out
+        }
+        270 => {
+            let (ow, oh) = (width as usize, height as usize);
+            let mut out = vec![0u8; channel.len()];
+            out.par_chunks_mut(oh).enumerate().for_each(|(dst_row, dst_chunk)| {
+                for (dst_col, value) in dst_chunk.iter_mut().enumerate() {
+                    let src_row = dst_col;
+                    let src_col = ow - 1 - dst_row;
+                    *value = channel[src_row * ow + src_col];
+                }
+            });
+            out
+        }
+        _ => channel.to_vec(),
+    }
+}
+
+fn crop_plane_u8(channel: &[u8], source_width: u32, region: RequestedRegion) -> Vec<u8> {
+    let source_stride = source_width as usize;
+    let destination_stride = region.width as usize;
+    let mut out = vec![0u8; (region.width * region.height) as usize];
+    for row in 0..region.height as usize {
+        let src_offset = (region.top as usize + row) * source_stride + region.left as usize;
+        let dst_offset = row * destination_stride;
+        out[dst_offset..dst_offset + destination_stride]
+            .copy_from_slice(&channel[src_offset..src_offset + destination_stride]);
+    }
+    out
+}
+
 #[inline]
 #[must_use]
 pub fn resize_rgb(image: DecodedImage, output_width: u32, output_height: u32) -> DecodedImage {
@@ -771,12 +908,16 @@ pub fn resize_rgb(image: DecodedImage, output_width: u32, output_height: u32) ->
         fir::FilterType::CatmullRom
     };
 
-    let source = fir::images::Image::from_vec_u8(
-        image.width,
-        image.height,
-        image.pixels,
-        fir::PixelType::U8x3,
-    )
+    let DecodedImage {
+        pixels,
+        alpha,
+        icc,
+        exif,
+        width,
+        height,
+    } = image;
+
+    let source = fir::images::Image::from_vec_u8(width, height, pixels, fir::PixelType::U8x3)
     .expect("validated RGB buffer");
     let mut destination =
         fir::images::Image::new(target_width, target_height, fir::PixelType::U8x3);
@@ -788,6 +929,9 @@ pub fn resize_rgb(image: DecodedImage, output_width: u32, output_height: u32) ->
 
     DecodedImage {
         pixels: destination.buffer().to_vec(),
+        alpha: alpha.map(|channel| resize_channel_u8(&channel, width, height, target_width, target_height)),
+        icc,
+        exif,
         width: target_width,
         height: target_height,
     }
@@ -804,10 +948,15 @@ pub fn rotate_rgb(image: DecodedImage, degrees: u16) -> DecodedImage {
     match degrees % 360 {
         0 => image,
         180 => {
-            let width = image.width;
-            let height = image.height;
+            let DecodedImage {
+                pixels: src_pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            } = image;
             let stride = width as usize * 3;
-            let src_pixels = image.pixels;
             let src_height = height as usize;
             let src_width = width as usize;
             let mut pixels = vec![0u8; src_pixels.len()];
@@ -823,15 +972,23 @@ pub fn rotate_rgb(image: DecodedImage, degrees: u16) -> DecodedImage {
                 });
             DecodedImage {
                 pixels,
+                alpha: alpha.map(|channel| rotate_plane_u8(&channel, width, height, 180)),
+                icc,
+                exif,
                 width,
                 height,
             }
         }
         90 => {
-            let width = image.width;
-            let height = image.height;
+            let DecodedImage {
+                pixels: src_pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            } = image;
             let (ow, oh) = (width as usize, height as usize);
-            let src_pixels = image.pixels;
             let mut pixels = vec![0u8; src_pixels.len()];
             pixels
                 .par_chunks_mut(oh * 3)
@@ -846,15 +1003,23 @@ pub fn rotate_rgb(image: DecodedImage, degrees: u16) -> DecodedImage {
                 });
             DecodedImage {
                 pixels,
+                alpha: alpha.map(|channel| rotate_plane_u8(&channel, width, height, 90)),
+                icc,
+                exif,
                 width: height,
                 height: width,
             }
         }
         270 => {
-            let width = image.width;
-            let height = image.height;
+            let DecodedImage {
+                pixels: src_pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            } = image;
             let (ow, oh) = (width as usize, height as usize);
-            let src_pixels = image.pixels;
             let mut pixels = vec![0u8; src_pixels.len()];
             pixels
                 .par_chunks_mut(oh * 3)
@@ -869,6 +1034,9 @@ pub fn rotate_rgb(image: DecodedImage, degrees: u16) -> DecodedImage {
                 });
             DecodedImage {
                 pixels,
+                alpha: alpha.map(|channel| rotate_plane_u8(&channel, width, height, 270)),
+                icc,
+                exif,
                 width: height,
                 height: width,
             }
@@ -890,15 +1058,23 @@ pub fn rotate_rgb(image: DecodedImage, degrees: u16) -> DecodedImage {
 pub fn encode(image: DecodedImage, options: &EncodeOptions) -> Result<Vec<u8>, CrabMagickError> {
     let DecodedImage {
         pixels,
+        alpha,
+        icc,
+        exif,
         width,
         height,
     } = image;
+    let alpha = alpha.as_deref();
+    let icc = icc.as_deref();
+    let exif = exif.as_deref();
 
     match options {
-        EncodeOptions::Jpeg(options) => encode_jpeg_rgb(&pixels, width, height, options),
-        EncodeOptions::Webp(options) => encode_webp_rgb(&pixels, width, height, options),
-        EncodeOptions::Png(options) => encode_png_rgb(&pixels, width, height, options),
-        EncodeOptions::Jxl(options) => encode_jxl_rgb(
+        EncodeOptions::Jpeg(options) => {
+            encode_jpeg_rgb(&pixels, width, height, options, alpha, icc, exif)
+        }
+        EncodeOptions::Webp(options) => encode_webp_rgb(&pixels, width, height, options, alpha),
+        EncodeOptions::Png(options) => encode_png_rgb(&pixels, width, height, options, alpha, icc, exif),
+        EncodeOptions::Jxl(options) => encode_jxl_with_alpha(
             &pixels,
             width,
             height,
@@ -913,11 +1089,12 @@ pub fn encode(image: DecodedImage, options: &EncodeOptions) -> Result<Vec<u8>, C
                 tier: options.tier.min(4),
                 ..JxlEncodeOptions::default()
             },
+            alpha,
         ),
-        EncodeOptions::Avif(options) => encode_avif_rgb(&pixels, width, height, options),
-        EncodeOptions::Tiff(options) => encode_tiff_rgb(&pixels, width, height, options),
-        EncodeOptions::Gif(options) => encode_gif_rgb(&pixels, width, height, options),
-        EncodeOptions::Bmp => encode_bmp_rgb(&pixels, width, height),
+        EncodeOptions::Avif(options) => encode_avif_rgb(&pixels, width, height, options, alpha),
+        EncodeOptions::Tiff(options) => encode_tiff_with_alpha(&pixels, width, height, options, alpha),
+        EncodeOptions::Gif(options) => encode_gif_with_alpha(&pixels, width, height, options, alpha),
+        EncodeOptions::Bmp => encode_bmp_with_alpha(&pixels, width, height, alpha),
     }
 }
 
@@ -940,6 +1117,151 @@ fn validate_rgb8_buffer(
     Ok(())
 }
 
+fn validate_alpha8_buffer(
+    alpha: &[u8],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(), CrabMagickError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| encode_error(format!("{label} dimensions overflow")))?;
+    if alpha.len() != expected {
+        return Err(encode_error(format!(
+            "{label} encoding expected {expected} alpha bytes but received {}",
+            alpha.len()
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn maybe_some_alpha(alpha: Vec<u8>) -> Option<Vec<u8>> {
+    if alpha.iter().all(|&value| value == 255) {
+        None
+    } else {
+        Some(alpha)
+    }
+}
+
+#[inline]
+fn split_rgba_to_rgb_alpha(rgba: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let mut pixels = Vec::with_capacity(rgba.len() / 4 * 3);
+    let mut alpha = Vec::with_capacity(rgba.len() / 4);
+    for chunk in rgba.chunks_exact(4) {
+        pixels.extend_from_slice(&chunk[..3]);
+        alpha.push(chunk[3]);
+    }
+    (pixels, maybe_some_alpha(alpha))
+}
+
+#[inline]
+fn split_ga_to_rgb_alpha(ga: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let mut pixels = Vec::with_capacity(ga.len() / 2 * 3);
+    let mut alpha = Vec::with_capacity(ga.len() / 2);
+    for chunk in ga.chunks_exact(2) {
+        pixels.extend_from_slice(&[chunk[0], chunk[0], chunk[0]]);
+        alpha.push(chunk[1]);
+    }
+    (pixels, maybe_some_alpha(alpha))
+}
+
+#[inline]
+fn interleave_rgba(pixels: &[u8], alpha: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(alpha.len() * 4);
+    for (rgb, &a) in pixels.chunks_exact(3).zip(alpha.iter()) {
+        out.extend_from_slice(rgb);
+        out.push(a);
+    }
+    out
+}
+
+#[inline]
+fn composite_alpha_to_white(pixels: &[u8], alpha: &[u8]) -> Vec<u8> {
+    pixels
+        .chunks_exact(3)
+        .zip(alpha.iter())
+        .flat_map(|(rgb, &a)| {
+            let a = a as u32;
+            let inv = 255 - a;
+            [
+                ((rgb[0] as u32 * a + 255 * inv) / 255) as u8,
+                ((rgb[1] as u32 * a + 255 * inv) / 255) as u8,
+                ((rgb[2] as u32 * a + 255 * inv) / 255) as u8,
+            ]
+        })
+        .collect()
+}
+
+fn extract_jpeg_exif(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+
+    let mut i = 2usize;
+    while i + 3 < bytes.len() {
+        if bytes[i] != 0xFF {
+            break;
+        }
+        let marker = bytes[i + 1];
+        let length = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        if length < 2 {
+            break;
+        }
+        let data_end = i + 2 + length;
+        if data_end > bytes.len() {
+            break;
+        }
+        if marker == 0xE1 && i + 10 <= data_end && &bytes[i + 4..i + 10] == b"Exif\0\0" {
+            return Some(bytes[i + 10..data_end].to_vec());
+        }
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        i += 2 + length;
+    }
+
+    None
+}
+
+fn inject_jpeg_metadata(jpeg: Vec<u8>, icc: Option<&[u8]>, exif: Option<&[u8]>) -> Vec<u8> {
+    if icc.is_none() && exif.is_none() {
+        return jpeg;
+    }
+    if jpeg.len() < 2 || jpeg[..2] != [0xFF, 0xD8] {
+        return jpeg;
+    }
+
+    let extra_capacity = icc.map_or(0, |data| data.len() + 32) + exif.map_or(0, |data| data.len() + 16);
+    let mut out = Vec::with_capacity(jpeg.len() + extra_capacity);
+    out.extend_from_slice(&jpeg[..2]);
+
+    if let Some(exif_data) = exif.filter(|data| data.len() <= u16::MAX as usize - 8) {
+        let segment_len = exif_data.len() + 8;
+        out.extend_from_slice(&[0xFF, 0xE1, (segment_len >> 8) as u8, segment_len as u8]);
+        out.extend_from_slice(b"Exif\0\0");
+        out.extend_from_slice(exif_data);
+    }
+
+    if let Some(icc_data) = icc {
+        const MAX_CHUNK: usize = 65_519;
+        let total_chunks = icc_data.len().div_ceil(MAX_CHUNK);
+        if total_chunks <= u8::MAX as usize {
+            for (idx, chunk) in icc_data.chunks(MAX_CHUNK).enumerate() {
+                let segment_len = chunk.len() + 16;
+                out.extend_from_slice(&[0xFF, 0xE2, (segment_len >> 8) as u8, segment_len as u8]);
+                out.extend_from_slice(b"ICC_PROFILE\0");
+                out.push((idx + 1) as u8);
+                out.push(total_chunks as u8);
+                out.extend_from_slice(chunk);
+            }
+        }
+    }
+
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
 fn jpeg_subsampling(mode: ChromaSubsampling, quality: u8) -> JpegChromaSubsampling {
     match mode {
         ChromaSubsampling::Auto if quality < 90 => JpegChromaSubsampling::Quarter,
@@ -949,28 +1271,28 @@ fn jpeg_subsampling(mode: ChromaSubsampling, quality: u8) -> JpegChromaSubsampli
     }
 }
 
-fn png_compression_type(level: u8) -> ImagePngCompressionType {
+fn png_compression_type(level: u8) -> png::Compression {
     match level {
-        0 => ImagePngCompressionType::Fast,
-        1..=3 => ImagePngCompressionType::Default,
-        _ => ImagePngCompressionType::Best,
+        0..=2 => png::Compression::Fast,
+        3..=6 => png::Compression::Default,
+        _ => png::Compression::Best,
     }
 }
 
-fn png_filter_type(filter: PngFilter) -> ImagePngFilter {
+fn png_filter_type(filter: PngFilter) -> (png::FilterType, png::AdaptiveFilterType) {
     match filter {
-        PngFilter::None => ImagePngFilter::NoFilter,
-        PngFilter::Sub => ImagePngFilter::Sub,
-        PngFilter::Up => ImagePngFilter::Up,
-        PngFilter::Avg => ImagePngFilter::Avg,
-        PngFilter::Paeth => ImagePngFilter::Paeth,
-        PngFilter::All => ImagePngFilter::Adaptive,
+        PngFilter::None => (png::FilterType::NoFilter, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::Sub => (png::FilterType::Sub, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::Up => (png::FilterType::Up, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::Avg => (png::FilterType::Avg, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::Paeth => (png::FilterType::Paeth, png::AdaptiveFilterType::NonAdaptive),
+        PngFilter::All => (png::FilterType::Sub, png::AdaptiveFilterType::Adaptive),
     }
 }
 
-fn expand_rgb8_to_rgb16_native_endian(pixels: &[u8]) -> Vec<u8> {
-    let mut expanded = Vec::with_capacity(pixels.len() * 2);
-    for &value in pixels {
+fn expand_u8_to_u16_native_endian(samples: &[u8]) -> Vec<u8> {
+    let mut expanded = Vec::with_capacity(samples.len() * 2);
+    for &value in samples {
         let widened = ((value as u16) << 8) | value as u16;
         expanded.extend_from_slice(&widened.to_ne_bytes());
     }
@@ -982,8 +1304,15 @@ fn encode_jpeg_rgb(
     width: u32,
     height: u32,
     options: &crate::processor::JpegEncodeOptions,
+    alpha: Option<&[u8]>,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
 ) -> Result<Vec<u8>, CrabMagickError> {
     validate_rgb8_buffer(pixels, width, height, "JPEG")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "JPEG")?;
+    }
+    let pixels = alpha.map_or_else(|| pixels.to_vec(), |alpha| composite_alpha_to_white(pixels, alpha));
 
     let quality = options.quality.clamp(1, 100);
     let config = EncoderConfig::ycbcr(
@@ -1002,10 +1331,11 @@ fn encode_jpeg_rgb(
         .encode_from_bytes(width, height, ZenLayout::Rgb8Srgb)
         .map_err(|error| encode_error(format!("JPEG encoder initialization failed: {error}")))?;
     encoder
-        .push_packed(pixels, Unstoppable)
+        .push_packed(&pixels, Unstoppable)
         .map_err(|error| encode_error(format!("JPEG pixel upload failed: {error}")))?;
     encoder
         .finish()
+        .map(|jpeg| inject_jpeg_metadata(jpeg, icc, exif))
         .map_err(|error| encode_error(format!("JPEG finalization failed: {error}")))
 }
 
@@ -1014,14 +1344,47 @@ fn encode_webp_rgb(
     width: u32,
     height: u32,
     options: &crate::processor::WebpEncodeOptions,
+    alpha: Option<&[u8]>,
 ) -> Result<Vec<u8>, CrabMagickError> {
     validate_rgb8_buffer(pixels, width, height, "WebP")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "WebP")?;
+    }
 
-    if options.lossless || options.near_lossless {
-        let _ = (options.effort, options.alpha_quality, options.quality);
+    if options.near_lossless {
+        let mut config = webp::WebPConfig::new().map_err(|error| {
+            encode_error(format!("WebP config initialization failed: {error:?}"))
+        })?;
+        config.lossless = 1;
+        config.near_lossless = options.quality.min(100) as i32;
+        config.quality = 100.0;
+        config.method = options.effort.min(6) as i32;
+        config.alpha_quality = options.alpha_quality.min(100) as i32;
+
+        return if let Some(alpha) = alpha {
+            let rgba = interleave_rgba(pixels, alpha);
+            webp::Encoder::from_rgba(&rgba, width, height)
+                .encode_advanced(&config)
+                .map(|encoded| encoded.to_vec())
+                .map_err(|error| encode_error(format!("near-lossless WebP encoding failed: {error:?}")))
+        } else {
+            webp::Encoder::from_rgb(pixels, width, height)
+                .encode_advanced(&config)
+                .map(|encoded| encoded.to_vec())
+                .map_err(|error| encode_error(format!("near-lossless WebP encoding failed: {error:?}")))
+        };
+    }
+
+    if options.lossless {
         let mut out = Vec::new();
+        let rgba = alpha.map(|alpha| interleave_rgba(pixels, alpha));
+        let (pixels_to_encode, color_type) = if let Some(rgba) = rgba.as_ref() {
+            (rgba.as_slice(), crate::webp_decode::ColorType::Rgba8)
+        } else {
+            (pixels, crate::webp_decode::ColorType::Rgb8)
+        };
         crate::webp_decode::WebPEncoder::new(&mut out)
-            .encode(pixels, width, height, crate::webp_decode::ColorType::Rgb8)
+            .encode(pixels_to_encode, width, height, color_type)
             .map_err(|error| encode_error(format!("lossless WebP encoding failed: {error}")))?;
         Ok(out)
     } else {
@@ -1033,10 +1396,18 @@ fn encode_webp_rgb(
         config.method = options.effort.min(6) as i32;
         config.alpha_quality = options.alpha_quality.min(100) as i32;
 
-        webp::Encoder::from_rgb(pixels, width, height)
-            .encode_advanced(&config)
-            .map(|encoded| encoded.to_vec())
-            .map_err(|error| encode_error(format!("WebP encoding failed: {error:?}")))
+        if let Some(alpha) = alpha {
+            let rgba = interleave_rgba(pixels, alpha);
+            webp::Encoder::from_rgba(&rgba, width, height)
+                .encode_advanced(&config)
+                .map(|encoded| encoded.to_vec())
+                .map_err(|error| encode_error(format!("WebP encoding failed: {error:?}")))
+        } else {
+            webp::Encoder::from_rgb(pixels, width, height)
+                .encode_advanced(&config)
+                .map(|encoded| encoded.to_vec())
+                .map_err(|error| encode_error(format!("WebP encoding failed: {error:?}")))
+        }
     }
 }
 
@@ -1045,28 +1416,57 @@ fn encode_png_rgb(
     width: u32,
     height: u32,
     options: &crate::processor::PngEncodeOptions,
+    alpha: Option<&[u8]>,
+    icc: Option<&[u8]>,
+    exif: Option<&[u8]>,
 ) -> Result<Vec<u8>, CrabMagickError> {
     validate_rgb8_buffer(pixels, width, height, "PNG")?;
-
-    let mut out = Vec::new();
-    let encoder = PngEncoder::new_with_quality(
-        &mut out,
-        png_compression_type(options.compression.min(9)),
-        png_filter_type(options.filter),
-    );
-    if options.progressive {
-        // The `image` crate encoder does not currently expose Adam7 interlacing.
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "PNG")?;
     }
 
-    if options.bitdepth == 16 {
-        let expanded = expand_rgb8_to_rgb16_native_endian(pixels);
-        encoder
-            .write_image(&expanded, width, height, ColorType::Rgb16.into())
-            .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
+    let mut out = Vec::new();
+    let mut info = png::Info::with_size(width, height);
+    info.bit_depth = if options.bitdepth == 16 {
+        png::BitDepth::Sixteen
     } else {
-        encoder
-            .write_image(pixels, width, height, ColorType::Rgb8.into())
-            .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
+        png::BitDepth::Eight
+    };
+    info.color_type = if alpha.is_some() {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    };
+    info.interlaced = options.progressive;
+    info.icc_profile = icc.map(|profile| Cow::Owned(profile.to_vec()));
+    info.exif_metadata = exif.map(|metadata| Cow::Owned(metadata.to_vec()));
+
+    {
+        let mut encoder = png::Encoder::with_info(&mut out, info)
+            .map_err(|error| encode_error(format!("PNG encoder initialization failed: {error}")))?;
+        encoder.set_compression(png_compression_type(options.compression.min(9)));
+        let (filter, adaptive_filter) = png_filter_type(options.filter);
+        encoder.set_filter(filter);
+        encoder.set_adaptive_filter(adaptive_filter);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| encode_error(format!("PNG header encoding failed: {error}")))?;
+
+        let image_data = if let Some(alpha) = alpha {
+            interleave_rgba(pixels, alpha)
+        } else {
+            pixels.to_vec()
+        };
+
+        if options.bitdepth == 16 {
+            writer
+                .write_image_data(&expand_u8_to_u16_native_endian(&image_data))
+                .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
+        } else {
+            writer
+                .write_image_data(&image_data)
+                .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
+        }
     }
     Ok(out)
 }
@@ -1078,12 +1478,26 @@ pub fn encode_tiff_rgb(
     height: u32,
     options: &crate::processor::TiffEncodeOptions,
 ) -> Result<Vec<u8>, CrabMagickError> {
+    encode_tiff_with_alpha(pixels, width, height, options, None)
+}
+
+fn encode_tiff_with_alpha(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::TiffEncodeOptions,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
     use std::io::Cursor;
     use tiff::encoder::{
-        colortype::RGB8, Compression, Predictor, TiffEncoder,
+        colortype::{RGB8, RGBA8},
+        Compression, Predictor, TiffEncoder,
     };
 
     validate_rgb8_buffer(pixels, width, height, "TIFF")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "TIFF")?;
+    }
     let _ = (options.tiled, options.tile_width, options.tile_height, options.quality);
 
     let compression = match options.compression {
@@ -1116,9 +1530,16 @@ pub fn encode_tiff_rgb(
             .map_err(|error| encode_error(format!("TIFF encoder init failed: {error}")))?
             .with_compression(compression)
             .with_predictor(predictor);
-        encoder
-            .write_image::<RGB8>(width, height, pixels)
-            .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
+        if let Some(alpha) = alpha {
+            let rgba = interleave_rgba(pixels, alpha);
+            encoder
+                .write_image::<RGBA8>(width, height, &rgba)
+                .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
+        } else {
+            encoder
+                .write_image::<RGB8>(width, height, pixels)
+                .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
+        }
     }
     Ok(cursor.into_inner())
 }
@@ -1134,18 +1555,32 @@ pub fn encode_gif_rgb(
     height: u32,
     options: &crate::processor::GifEncodeOptions,
 ) -> Result<Vec<u8>, CrabMagickError> {
+    encode_gif_with_alpha(pixels, width, height, options, None)
+}
+
+fn encode_gif_with_alpha(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::GifEncodeOptions,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
     use image::codecs::gif::GifEncoder;
 
     validate_rgb8_buffer(pixels, width, height, "GIF")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "GIF")?;
+    }
     let _ = (options.dither, options.bitdepth);
     let effort = options.effort.clamp(1, 10) as i32;
     let speed = (30 - ((effort - 1) * 29 / 9)).clamp(1, 30);
+    let pixels = alpha.map_or_else(|| pixels.to_vec(), |alpha| composite_alpha_to_white(pixels, alpha));
 
     let mut out = Vec::new();
     {
         let mut encoder = GifEncoder::new_with_speed(&mut out, speed);
         encoder
-            .encode(pixels, width, height, ColorType::Rgb8.into())
+            .encode(&pixels, width, height, ColorType::Rgb8.into())
             .map_err(|error| encode_error(format!("GIF encoding failed: {error}")))?;
     }
     Ok(out)
@@ -1157,22 +1592,26 @@ pub fn encode_gif_rgb(
 /// handles the header and channel ordering. `pixels` must be tightly packed
 /// `width * height * 3` RGB8 bytes.
 pub fn encode_bmp_rgb(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CrabMagickError> {
+    encode_bmp_with_alpha(pixels, width, height, None)
+}
+
+fn encode_bmp_with_alpha(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
     use image::codecs::bmp::BmpEncoder;
 
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|wh| wh.checked_mul(3))
-        .ok_or_else(|| encode_error("BMP dimensions overflow"))?;
-    if pixels.len() != expected {
-        return Err(encode_error(format!(
-            "BMP encoding expected {expected} RGB bytes but received {}",
-            pixels.len()
-        )));
+    validate_rgb8_buffer(pixels, width, height, "BMP")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "BMP")?;
     }
+    let pixels = alpha.map_or_else(|| pixels.to_vec(), |alpha| composite_alpha_to_white(pixels, alpha));
 
     let mut out = Vec::new();
     BmpEncoder::new(&mut out)
-        .encode(pixels, width, height, ColorType::Rgb8.into())
+        .encode(&pixels, width, height, ColorType::Rgb8.into())
         .map_err(|error| encode_error(format!("BMP encoding failed: {error}")))?;
     Ok(out)
 }
@@ -1192,7 +1631,28 @@ pub fn encode_jxl_rgb(
     height: u32,
     options: &JxlEncodeOptions,
 ) -> Result<Vec<u8>, CrabMagickError> {
+    encode_jxl_with_alpha(pixels, width, height, options, None)
+}
+
+fn encode_jxl_with_alpha(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &JxlEncodeOptions,
+    alpha: Option<&[u8]>,
+) -> Result<Vec<u8>, CrabMagickError> {
     let _ = options.tier;
+    validate_rgb8_buffer(pixels, width, height, "JPEG XL")?;
+    if let Some(alpha) = alpha {
+        validate_alpha8_buffer(alpha, width, height, "JPEG XL")?;
+    }
+    let jxl_pixels = alpha.map(|alpha| interleave_rgba(pixels, alpha));
+    let (pixels, layout) = if let Some(pixels) = jxl_pixels.as_ref() {
+        (pixels.as_slice(), JxlLayout::Rgba8)
+    } else {
+        (pixels, JxlLayout::Rgb8)
+    };
+
     if options.lossless {
         let mut config = LosslessConfig::new()
             .with_effort(options.effort)
@@ -1211,7 +1671,7 @@ pub fn encode_jxl_rgb(
             config = config.with_squeeze(v);
         }
         config
-            .encode(pixels, width, height, JxlLayout::Rgb8)
+            .encode(pixels, width, height, layout)
             .map_err(|error| encode_error(format!("lossless JPEG XL encoding failed: {error}")))
     } else {
         let mut config = LossyConfig::new(options.distance.unwrap_or(1.0))
@@ -1264,20 +1724,35 @@ pub fn encode_jxl_rgb(
             config = config.with_optimize_codes(v);
         }
         config
-            .encode(pixels, width, height, JxlLayout::Rgb8)
+            .encode(pixels, width, height, layout)
             .map_err(|error| encode_error(format!("lossy JPEG XL encoding failed: {error}")))
+    }
+}
+
+fn dynamic_image_to_decoded(
+    image: image::DynamicImage,
+    icc: Option<Vec<u8>>,
+    exif: Option<Vec<u8>>,
+) -> DecodedImage {
+    let rgba = image.into_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let raw = rgba.into_raw();
+    let (pixels, alpha) = split_rgba_to_rgb_alpha(&raw);
+    DecodedImage {
+        pixels,
+        alpha,
+        icc,
+        exif,
+        width,
+        height,
     }
 }
 
 fn decode_via_image(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
     let image = image::load_from_memory(bytes)
         .map_err(|error| decode_malformed(format!("generic image decode failed: {error}")))?;
-    let rgb = image.to_rgb8();
-    Ok(DecodedImage {
-        width: rgb.width(),
-        height: rgb.height(),
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynamic_image_to_decoded(image, None, None))
 }
 
 #[inline]
@@ -1295,11 +1770,15 @@ fn decode_jpeg_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
     let pixels = decoder
         .decode()
         .map_err(|e| decode_malformed(format!("JPEG decode: {e}")))?;
+    let icc = decoder.icc_profile();
     let (width, height) = decoder
         .dimensions()
         .ok_or_else(|| decode_malformed("JPEG: no dimensions after decode"))?;
     Ok(DecodedImage {
         pixels,
+        alpha: None,
+        icc,
+        exif: extract_jpeg_exif(bytes),
         width: width as u32,
         height: height as u32,
     })
@@ -1324,22 +1803,155 @@ fn decode_webp_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
     decoder
         .read_image(&mut decoded)
         .map_err(|error| decode_malformed(format!("WebP pixel decode failed: {error}")))?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let exif = decoder.exif_metadata().ok().flatten();
 
-    let pixels = if has_alpha {
-        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
-        for rgba in decoded.chunks_exact(4) {
-            rgb.extend_from_slice(&rgba[..3]);
-        }
-        rgb
+    let (pixels, alpha) = if has_alpha {
+        split_rgba_to_rgb_alpha(&decoded)
     } else {
-        decoded
+        (decoded, None)
     };
 
     Ok(DecodedImage {
         pixels,
+        alpha,
+        icc,
+        exif,
         width,
         height,
     })
+}
+
+fn decode_png_fast(bytes: &[u8]) -> Result<DecodedImage, CrabMagickError> {
+    use png::{BitDepth, ColorType, Decoder};
+
+    let decoder = Decoder::new(bytes);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| decode_malformed(format!("PNG: {error}")))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader
+        .next_frame(&mut buf)
+        .map_err(|error| decode_malformed(format!("PNG: {error}")))?;
+    let info = reader.info();
+    let icc = info.icc_profile.as_ref().map(|profile| profile.to_vec());
+    let exif = info.exif_metadata.as_ref().map(|metadata| metadata.to_vec());
+    let width = info.width;
+    let height = info.height;
+
+    match (frame.color_type, frame.bit_depth) {
+        (ColorType::Rgb, BitDepth::Eight) => Ok(DecodedImage {
+            pixels: buf[..frame.buffer_size()].to_vec(),
+            alpha: None,
+            icc,
+            exif,
+            width,
+            height,
+        }),
+        (ColorType::Rgba, BitDepth::Eight) => {
+            let (pixels, alpha) = split_rgba_to_rgb_alpha(&buf[..frame.buffer_size()]);
+            Ok(DecodedImage {
+                pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::Grayscale, BitDepth::Eight) => {
+            let data = &buf[..frame.buffer_size()];
+            let pixels = data.iter().flat_map(|&gray| [gray, gray, gray]).collect();
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::GrayscaleAlpha, BitDepth::Eight) => {
+            let (pixels, alpha) = split_ga_to_rgb_alpha(&buf[..frame.buffer_size()]);
+            Ok(DecodedImage {
+                pixels,
+                alpha,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::Rgb, BitDepth::Sixteen) => {
+            let data = &buf[..frame.buffer_size()];
+            let pixels = data
+                .chunks_exact(6)
+                .flat_map(|pixel| [pixel[0], pixel[2], pixel[4]])
+                .collect();
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::Rgba, BitDepth::Sixteen) => {
+            let data = &buf[..frame.buffer_size()];
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            let mut alpha = Vec::with_capacity((width * height) as usize);
+            for pixel in data.chunks_exact(8) {
+                pixels.extend_from_slice(&[pixel[0], pixel[2], pixel[4]]);
+                alpha.push(pixel[6]);
+            }
+            Ok(DecodedImage {
+                pixels,
+                alpha: maybe_some_alpha(alpha),
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::Grayscale, BitDepth::Sixteen) => {
+            let data = &buf[..frame.buffer_size()];
+            let pixels = data
+                .chunks_exact(2)
+                .flat_map(|sample| [sample[0], sample[0], sample[0]])
+                .collect();
+            Ok(DecodedImage {
+                pixels,
+                alpha: None,
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        (ColorType::GrayscaleAlpha, BitDepth::Sixteen) => {
+            let data = &buf[..frame.buffer_size()];
+            let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            let mut alpha = Vec::with_capacity((width * height) as usize);
+            for pixel in data.chunks_exact(4) {
+                pixels.extend_from_slice(&[pixel[0], pixel[0], pixel[0]]);
+                alpha.push(pixel[2]);
+            }
+            Ok(DecodedImage {
+                pixels,
+                alpha: maybe_some_alpha(alpha),
+                icc,
+                exif,
+                width,
+                height,
+            })
+        }
+        _ => {
+            let image = image::load_from_memory(bytes)
+                .map_err(|error| decode_malformed(format!("generic image decode failed: {error}")))?;
+            Ok(dynamic_image_to_decoded(image, icc, exif))
+        }
+    }
 }
 
 fn decode_svg(bytes: &[u8], out_w: u32, out_h: u32) -> Result<DecodedImage, CrabMagickError> {
@@ -1358,8 +1970,10 @@ fn decode_svg(bytes: &[u8], out_w: u32, out_h: u32) -> Result<DecodedImage, Crab
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+    let mut alpha = Vec::with_capacity((width * height) as usize);
     for rgba in pixmap.data().chunks_exact(4) {
         let a = rgba[3] as u32;
+        alpha.push(rgba[3]);
         if a == 0 {
             pixels.extend_from_slice(&[0, 0, 0]);
             continue;
@@ -1372,6 +1986,9 @@ fn decode_svg(bytes: &[u8], out_w: u32, out_h: u32) -> Result<DecodedImage, Crab
 
     Ok(DecodedImage {
         pixels,
+        alpha: maybe_some_alpha(alpha),
+        icc: None,
+        exif: None,
         width,
         height,
     })
@@ -1416,12 +2033,7 @@ fn decode_pdf_page(
         .render_with_config(&config)
         .map_err(|error| decode_malformed(format!("PDF rasterization failed: {error}")))?
         .as_image();
-    let rgb = image.to_rgb8();
-    Ok(DecodedImage {
-        width: rgb.width(),
-        height: rgb.height(),
-        pixels: rgb.into_raw(),
-    })
+    Ok(dynamic_image_to_decoded(image, None, None))
 }
 
 fn decode_tiff_page(bytes: &[u8], page: u32) -> Result<DecodedImage, CrabMagickError> {
@@ -1470,6 +2082,9 @@ fn tiff_to_rgb(
             }
             Ok(DecodedImage {
                 pixels,
+                alpha: None,
+                icc: None,
+                exif: None,
                 width,
                 height,
             })
@@ -1482,12 +2097,18 @@ fn tiff_to_rgb(
             }
             Ok(DecodedImage {
                 pixels,
+                alpha: None,
+                icc: None,
+                exif: None,
                 width,
                 height,
             })
         }
         (DecodingResult::U8(data), tiff::ColorType::RGB(8)) => Ok(DecodedImage {
             pixels: data,
+            alpha: None,
+            icc: None,
+            exif: None,
             width,
             height,
         }),
@@ -1495,32 +2116,45 @@ fn tiff_to_rgb(
             let pixels = data.into_iter().map(|v| (v >> 8) as u8).collect();
             Ok(DecodedImage {
                 pixels,
+                alpha: None,
+                icc: None,
+                exif: None,
                 width,
                 height,
             })
         }
         (DecodingResult::U8(data), tiff::ColorType::RGBA(8)) => {
             let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            let mut alpha = Vec::with_capacity((width * height) as usize);
             for rgba in data.chunks_exact(4) {
                 pixels.extend_from_slice(&rgba[..3]);
+                alpha.push(rgba[3]);
             }
             Ok(DecodedImage {
                 pixels,
+                alpha: maybe_some_alpha(alpha),
+                icc: None,
+                exif: None,
                 width,
                 height,
             })
         }
         (DecodingResult::U16(data), tiff::ColorType::RGBA(16)) => {
             let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+            let mut alpha = Vec::with_capacity((width * height) as usize);
             for rgba in data.chunks_exact(4) {
                 pixels.extend_from_slice(&[
                     (rgba[0] >> 8) as u8,
                     (rgba[1] >> 8) as u8,
                     (rgba[2] >> 8) as u8,
                 ]);
+                alpha.push((rgba[3] >> 8) as u8);
             }
             Ok(DecodedImage {
                 pixels,
+                alpha: maybe_some_alpha(alpha),
+                icc: None,
+                exif: None,
                 width,
                 height,
             })
@@ -1636,6 +2270,9 @@ fn planar_to_rgb(
 
     DecodedImage {
         pixels,
+        alpha: None,
+        icc: None,
+        exif: None,
         width,
         height,
     }
@@ -1857,6 +2494,9 @@ fn planar_to_rgb_fused_xyb_srgb(
 
     DecodedImage {
         pixels,
+        alpha: None,
+        icc: None,
+        exif: None,
         width,
         height,
     }
@@ -2081,8 +2721,16 @@ fn apply_region(image: DecodedImage, region: RequestedRegion) -> DecodedImage {
             .copy_from_slice(&image.pixels[src_offset..src_offset + destination_stride]);
     }
 
+    let alpha = image
+        .alpha
+        .as_ref()
+        .map(|channel| crop_plane_u8(channel, image.width, region));
+
     DecodedImage {
         pixels,
+        alpha,
+        icc: image.icc,
+        exif: image.exif,
         width: region.width,
         height: region.height,
     }
@@ -2104,14 +2752,14 @@ fn encode_avif_rgb(
     width: u32,
     height: u32,
     options: &crate::processor::AvifEncodeOptions,
+    alpha: Option<&[u8]>,
 ) -> Result<Vec<u8>, CrabMagickError> {
     #[cfg(feature = "avif")]
     {
         validate_rgb8_buffer(pixels, width, height, "AVIF")?;
-        let pixels: Vec<AvifRgb8> = pixels
-            .chunks_exact(3)
-            .map(|chunk| AvifRgb8::new(chunk[0], chunk[1], chunk[2]))
-            .collect();
+        if let Some(alpha) = alpha {
+            validate_alpha8_buffer(alpha, width, height, "AVIF")?;
+        }
         let quality = if options.lossless {
             100.0
         } else {
@@ -2124,18 +2772,37 @@ fn encode_avif_rgb(
         if options.lossless {
             encoder = encoder.with_internal_color_model(AvifColorModel::RGB);
         }
-        let encoded = encoder
-            .encode_rgb(AvifImg::new(
-                pixels.as_slice(),
-                width as usize,
-                height as usize,
-            ))
-            .map_err(|error| encode_error(format!("AVIF encoding failed: {error}")))?;
+        let encoded = if let Some(alpha) = alpha {
+            let pixels: Vec<AvifRgba8> = pixels
+                .chunks_exact(3)
+                .zip(alpha.iter())
+                .map(|(chunk, &a)| AvifRgba8::new(chunk[0], chunk[1], chunk[2], a))
+                .collect();
+            encoder
+                .encode_rgba(AvifImg::new(
+                    pixels.as_slice(),
+                    width as usize,
+                    height as usize,
+                ))
+                .map_err(|error| encode_error(format!("AVIF encoding failed: {error}")))?
+        } else {
+            let pixels: Vec<AvifRgb8> = pixels
+                .chunks_exact(3)
+                .map(|chunk| AvifRgb8::new(chunk[0], chunk[1], chunk[2]))
+                .collect();
+            encoder
+                .encode_rgb(AvifImg::new(
+                    pixels.as_slice(),
+                    width as usize,
+                    height as usize,
+                ))
+                .map_err(|error| encode_error(format!("AVIF encoding failed: {error}")))?
+        };
         Ok(encoded.avif_file)
     }
     #[cfg(not(feature = "avif"))]
     {
-        let _ = (pixels, width, height, options);
+        let _ = (pixels, width, height, options, alpha);
         Err(encode_error(
             "AVIF output is unavailable in this build; enable the `avif` feature",
         ))
@@ -2282,6 +2949,7 @@ mod fused_color_tests {
 #[cfg(test)]
 mod encoder_roundtrip_tests {
     use super::*;
+    use image::{ImageEncoder, codecs::png::PngEncoder};
 
     // Deterministic gradient RGB8 image with a bounded number of distinct colors so
     // that lossless codecs roundtrip exactly and palettized GIF stays close.

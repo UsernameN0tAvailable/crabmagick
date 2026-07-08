@@ -9,7 +9,14 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 }
 fn rt(w:u32,h:u32,cs:ChromaSubsampling)->f64{
     let px:Vec<u8>=(0..w*h).flat_map(|i|{let x=i%w;let y=i/w;[(x*3^y*5)as u8,(x*7^y*11)as u8,(x*13^y*17)as u8]}).collect();
-    let enc=encode(DecodedImage{pixels:px.clone(),width:w,height:h},
+    let enc=encode(DecodedImage {
+            pixels: px.clone(),
+            alpha: None,
+            icc: None,
+            exif: None,
+            width: w,
+            height: h,
+        },
         &EncodeOptions::Jpeg(JpegEncodeOptions{quality:85,chroma_subsampling:cs,..Default::default()})).unwrap();
     let mut f=tempfile::NamedTempFile::new().unwrap();f.write_all(&enc).unwrap();
     match decode_any_with_options(f.path().to_str().unwrap(),None,false,0,None){Ok(d)=>psnr(&px,&d.pixels),Err(_)=>-1.0}

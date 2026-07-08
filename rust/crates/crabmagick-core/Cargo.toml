@@ -34,6 +34,7 @@ memmap2 = "0.9"
 moxcms = { version = "0.8", optional = true }
 once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
 pdfium-render = { version = "0.8", features = ["static"], optional = true }
+png = "0.17"
 quick-error = "2.0.1"
 ravif = { version = "0.11", default-features = false, features = ["threading"], optional = true }
 rayon = "1.10"

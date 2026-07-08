@@ -130,6 +130,9 @@ fn encode_roundtrip(
     let encoded = encode(
         DecodedImage {
             pixels: pixels.clone(),
+            alpha: None,
+            icc: None,
+            exif: None,
             width,
             height,
         },
@@ -396,6 +399,9 @@ fn webp_effort6_roundtrip() {
     let fast = encode(
         DecodedImage {
             pixels: original.clone(),
+            alpha: None,
+            icc: None,
+            exif: None,
             width: w,
             height: h,
         },
@@ -466,6 +472,9 @@ fn png_compress1_roundtrip() {
     let encoded9 = encode(
         DecodedImage {
             pixels: original.clone(),
+            alpha: None,
+            icc: None,
+            exif: None,
             width: w,
             height: h,
         },
@@ -617,6 +626,9 @@ fn tiff_none_exact_roundtrip() {
     let lzw = encode(
         DecodedImage {
             pixels: original.clone(),
+            alpha: None,
+            icc: None,
+            exif: None,
             width: w,
             height: h,
         },

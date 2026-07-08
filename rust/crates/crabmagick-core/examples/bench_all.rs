@@ -384,6 +384,9 @@ fn main() {
             "photo",
             DecodedImage {
                 pixels: synthetic_photo(800, 600),
+                alpha: None,
+                icc: None,
+                exif: None,
                 width: 800,
                 height: 600,
             },
@@ -392,6 +395,9 @@ fn main() {
             "document",
             DecodedImage {
                 pixels: document_pattern(800, 600),
+                alpha: None,
+                icc: None,
+                exif: None,
                 width: 800,
                 height: 600,
             },
@@ -400,6 +406,9 @@ fn main() {
             "gradient",
             DecodedImage {
                 pixels: gradient(800, 600),
+                alpha: None,
+                icc: None,
+                exif: None,
                 width: 800,
                 height: 600,
             },
