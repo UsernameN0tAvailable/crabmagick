@@ -1080,47 +1080,45 @@ pub fn encode_tiff_rgb(
 ) -> Result<Vec<u8>, CrabMagickError> {
     use std::io::Cursor;
     use tiff::encoder::{
-        colortype::RGB8,
-        compression::{Deflate, Lzw, Packbits, Uncompressed},
-        TiffEncoder,
+        colortype::RGB8, Compression, Predictor, TiffEncoder,
     };
 
     validate_rgb8_buffer(pixels, width, height, "TIFF")?;
-    let _ = (
-        options.predictor,
-        options.tiled,
-        options.tile_width,
-        options.tile_height,
-        options.quality,
-    );
+    let _ = (options.tiled, options.tile_width, options.tile_height, options.quality);
+
+    let compression = match options.compression {
+        TiffCompression::None     => Compression::Uncompressed,
+        TiffCompression::Lzw      => Compression::Lzw,
+        TiffCompression::Deflate  => Compression::Deflate(Default::default()),
+        TiffCompression::Packbits => Compression::Packbits,
+        TiffCompression::Jpeg     => {
+            eprintln!(
+                "[crabmagick-core] TIFF JPEG compression unavailable in tiff-rs; using Deflate"
+            );
+            Compression::Deflate(Default::default())
+        }
+    };
+
+    // Horizontal differencing predictor dramatically improves LZW/deflate ratios
+    // (same as libvips default). Only compatible with integer colour types — always
+    // safe for RGB8.
+    let predictor = if options.predictor
+        && !matches!(options.compression, TiffCompression::None | TiffCompression::Packbits)
+    {
+        Predictor::Horizontal
+    } else {
+        Predictor::None
+    };
 
     let mut cursor = Cursor::new(Vec::new());
     {
-        let mut encoder = TiffEncoder::new(&mut cursor).map_err(|error| {
-            encode_error(format!("TIFF encoder initialization failed: {error}"))
-        })?;
-        match options.compression {
-            TiffCompression::None => encoder
-                .write_image_with_compression::<RGB8, _>(width, height, Uncompressed, pixels),
-            TiffCompression::Lzw => encoder
-                .write_image_with_compression::<RGB8, _>(width, height, Lzw, pixels),
-            TiffCompression::Deflate => encoder
-                .write_image_with_compression::<RGB8, _>(width, height, Deflate::default(), pixels),
-            TiffCompression::Packbits => encoder
-                .write_image_with_compression::<RGB8, _>(width, height, Packbits, pixels),
-            TiffCompression::Jpeg => {
-                eprintln!(
-                    "[crabmagick-core] TIFF JPEG compression is unavailable in tiff-rs; falling back to Deflate"
-                );
-                encoder.write_image_with_compression::<RGB8, _>(
-                    width,
-                    height,
-                    Deflate::default(),
-                    pixels,
-                )
-            }
-        }
-        .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
+        let mut encoder = TiffEncoder::new(&mut cursor)
+            .map_err(|error| encode_error(format!("TIFF encoder init failed: {error}")))?
+            .with_compression(compression)
+            .with_predictor(predictor);
+        encoder
+            .write_image::<RGB8>(width, height, pixels)
+            .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
     }
     Ok(cursor.into_inner())
 }

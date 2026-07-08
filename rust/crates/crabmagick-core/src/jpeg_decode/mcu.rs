@@ -452,13 +452,6 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         let z_order = self.z_order;
         let z_scans = &z_order[..usize::from(self.num_scans)];
 
-        // How much of the head of `tmp` was written by the last MCU decoding? We only check for
-        // two different cases and not all possible outcomes as this is only used to optimize the
-        // bytes written in `fill`. Since the clobber happens in UNZIGZAG order we'd be straddling
-        // most cache lines anyways even if we did a partial write with the exact length of the
-        // coefficient data which was written into `tmp`.
-        let mut clobber_more_than_4x4 = true;
-
         // For non-interleaved scans (PROGRESSIVE=true), each scan contains a single component
         // and we iterate over that component's actual data unit count, not the interleaved MCU
         // width multiplied by sampling factor.
@@ -534,16 +527,11 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     for h_samp in h_step {
                         let result = if component_samples_needed {
                             // Fill the array with zeroes, decode_mcu_block expects
-                            // a zero based array. Clobber is in zig-zag order though.
-                            // Writing consecutive entries is basically free in terms
-                            // of memory throughput so we opt for a larger power of
-                            // two which lets the compiler turn this into a repeated
-                            // write of a zeroed vector register, which does not have
-                            // any branches, instead of a more difficult pattern where
-                            // we attempt to overwrite exactly one coefficient.
-                            let clobber_len = if !clobber_more_than_4x4 { 32 } else { 64 };
-
-                            tmp[..clobber_len].fill(0);
+                            // a zero based array for every block. Reusing partially
+                            // zeroed state leaves stale high-frequency coefficients
+                            // behind when a short block is followed by one that needs
+                            // the full 8x8 IDCT, which corrupts baseline output.
+                            tmp.fill(0);
 
                             stream.decode_mcu_block(
                                 &mut self.stream,
@@ -578,9 +566,6 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         };
 
                         if component_samples_needed {
-                            // tmp was only written partially, note that len is in ZigZag order.
-                            clobber_more_than_4x4 = len > 10;
-
                             let idct_position = if PROGRESSIVE {
                                 // For non-interleaved, j indexes data units directly
                                 j * 8
