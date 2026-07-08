@@ -200,15 +200,17 @@ Notes:
 
 | Format | crabmagick | Reference | Speedup |
 |--------|-----------|-----------|---------|
-| JPEG Q90 | **24 ms** · 1.1 MB | 15 ms · 1.0 MB (cjpeg) | comparable† |
-| WebP Q90 | **221 ms** · 3.0 MB | 462 ms (libwebp/PIL) | **2× faster** |
-| PNG     | **39 ms** · 8.7 MB | 780 ms (pnmtopng/libpng) | **20× faster** |
+| JPEG Q90 | **21 ms** · 1.1 MB | 12 ms · 1.3 MB (PIL/libjpeg-turbo) | 1.75× slower† |
+| WebP Q90 | **204 ms** · 3.0 MB | 407 ms (libwebp/PIL) | **2× faster** |
+| PNG     | **39 ms** · 8.7 MB | 689 ms (PIL/libpng) | **18× faster** |
 | JXL d=1.0 effort=1 | **349 ms** · 1.0 MB | ~500 ms (cjxl effort=1) | comparable |
 | TIFF LZW | **330 ms** · 11 MB | — | — |
 
-†JPEG: crabmagick builds optimal Huffman tables (two-pass) + parallel RST entropy
-coding, giving slightly smaller files than libjpeg-turbo's standard ITU-T Annex K
-tables. Both produce fully standards-compliant output.
+†JPEG: crabmagick builds optimal Huffman tables (two-pass) + embeds RST restart
+markers. Encoding is ~1.75× slower than PIL's single-pass libjpeg-turbo, but output
+files are ~14% smaller and the RST markers allow subsequent decodes at **2× the
+normal speed** (parallel RST-segment decode), making the trade-off net-positive for
+IIIF servers that re-encode the same JXL source repeatedly.
 
 ### How performance is achieved (pure Rust, zero C)
 
