@@ -286,14 +286,20 @@ impl ArithmeticDecoder {
         let split = 1 + (((self.state.range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << self.state.bit_count;
 
-        let retval = if let Some(new_value) = self.state.value.checked_sub(bigsplit) {
-            self.state.range -= split;
-            self.state.value = new_value;
-            true
-        } else {
-            self.state.range = split;
-            false
-        };
+        // Branchless update: avoids ~50% branch mispredictions in the hot loop.
+        // above == 1 when value >= bigsplit (the "true" branch), else 0.
+        let above = u32::from(self.state.value >= bigsplit);
+        // Subtract bigsplit only when above == 1 (mask is all-ones), else no-op.
+        self.state.value -= bigsplit & 0u64.wrapping_sub(u64::from(above));
+        // range = split + (range - 2*split) * above:
+        //   above=0 -> range = split ; above=1 -> range = range - split.
+        self.state.range = split.wrapping_add(
+            self.state
+                .range
+                .wrapping_sub(split.wrapping_mul(2))
+                .wrapping_mul(above),
+        );
+        let retval = above != 0;
         debug_assert!(self.state.range > 0);
 
         // Compute shift required to satisfy `self.state.range >= 128`.
@@ -452,14 +458,19 @@ impl FastDecoder<'_> {
         let split = 1 + (((range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << bit_count;
 
-        let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
-            range -= split;
-            value = new_value;
-            true
-        } else {
-            range = split;
-            false
-        };
+        // Branchless update: avoids ~50% branch mispredictions in the hot loop.
+        // above == 1 when value >= bigsplit (the "true" branch), else 0.
+        let above = u32::from(value >= bigsplit);
+        // Subtract bigsplit only when above == 1 (mask is all-ones), else no-op.
+        value -= bigsplit & 0u64.wrapping_sub(u64::from(above));
+        // range = split + (range - 2*split) * above:
+        //   above=0 -> range = split ; above=1 -> range = range - split.
+        range = split.wrapping_add(
+            range
+                .wrapping_sub(split.wrapping_mul(2))
+                .wrapping_mul(above),
+        );
+        let retval = above != 0;
         debug_assert!(range > 0);
 
         // Compute shift required to satisfy `range >= 128`.
@@ -508,14 +519,15 @@ impl FastDecoder<'_> {
         let split = range - half_range;
         let bigsplit = u64::from(split) << bit_count;
 
-        let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
-            range = half_range;
-            value = new_value;
-            true
-        } else {
-            range = split;
-            false
-        };
+        // Branchless update: avoids ~50% branch mispredictions in the hot loop.
+        // above == 1 when value >= bigsplit (the "true" branch), else 0.
+        let above = u32::from(value >= bigsplit);
+        // Subtract bigsplit only when above == 1 (mask is all-ones), else no-op.
+        value -= bigsplit & 0u64.wrapping_sub(u64::from(above));
+        // range = split + (half_range - split) * above:
+        //   above=0 -> range = split ; above=1 -> range = half_range.
+        range = split.wrapping_add(half_range.wrapping_sub(split).wrapping_mul(above));
+        let retval = above != 0;
         debug_assert!(range > 0);
 
         // Compute shift required to satisfy `range >= 128`.
