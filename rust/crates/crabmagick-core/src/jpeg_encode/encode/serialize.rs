@@ -532,13 +532,13 @@ impl ComputedConfig {
     }
 
     /// Writes restart interval.
-    pub(crate) fn write_restart_interval(&self, output: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn write_restart_interval(&self, output: &mut Vec<u8>, interval: u16) -> Result<()> {
         output.push(0xFF);
         output.push(MARKER_DRI);
         output.push(0x00);
         output.push(0x04); // Length
-        output.push((self.restart_interval >> 8) as u8);
-        output.push(self.restart_interval as u8);
+        output.push((interval >> 8) as u8);
+        output.push(interval as u8);
         Ok(())
     }
 

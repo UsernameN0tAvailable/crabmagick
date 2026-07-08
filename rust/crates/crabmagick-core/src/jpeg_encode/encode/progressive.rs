@@ -548,7 +548,7 @@ impl ComputedConfig {
         )?;
 
         if self.restart_interval > 0 {
-            self.write_restart_interval(output)?;
+            self.write_restart_interval(output, self.restart_interval)?;
         }
 
         // Track which AC cluster is currently loaded in each JPEG slot (0-3).

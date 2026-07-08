@@ -261,6 +261,35 @@ fn jpeg_progressive_roundtrip() {
 }
 
 #[test]
+fn jpeg_baseline_roundtrip_wide_mcu_rows() {
+    let original_444 = synthetic_photo(80, 80);
+    let (_, decoded_444) = encode_roundtrip(
+        original_444.clone(),
+        80,
+        80,
+        &EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: 85,
+            chroma_subsampling: ChromaSubsampling::Cs444,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original_444, &decoded_444) > 22.0);
+
+    let original_420 = synthetic_photo(144, 144);
+    let (_, decoded_420) = encode_roundtrip(
+        original_420.clone(),
+        144,
+        144,
+        &EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: 85,
+            chroma_subsampling: ChromaSubsampling::Auto,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original_420, &decoded_420) > 18.0);
+}
+
+#[test]
 fn jpeg_444_roundtrip() {
     let (w, h) = (64, 64);
     let original = lossy_test_image(w, h);

@@ -103,6 +103,19 @@ pub(crate) struct StreamingEncoder {
 }
 
 impl StreamingEncoder {
+    #[inline]
+    fn effective_sequential_restart_interval(config: &ComputedConfig) -> u16 {
+        #[cfg(feature = "parallel")]
+        if config.parallel && config.restart_interval == 0 {
+            // The parallel sequential entropy path auto-splits the scan into
+            // 64-MCU restart segments, so the header must advertise the same
+            // interval or decoders will treat the RST markers as corrupt data.
+            return 64;
+        }
+
+        config.restart_interval
+    }
+
     /// Creates a new streaming encoder builder with the given dimensions.
     ///
     /// Use the builder methods to configure quality, subsampling, etc.
@@ -363,7 +376,7 @@ impl StreamingEncoder {
             config.write_frame_header_ex(&mut header, is_extended)?;
             config.write_huffman_tables_optimized(&mut header, &tables)?;
             if config.restart_interval > 0 {
-                config.write_restart_interval(&mut header)?;
+                config.write_restart_interval(&mut header, config.restart_interval)?;
             }
             config.write_scan_header(&mut header)?;
 
@@ -1285,8 +1298,9 @@ impl StreamingEncoder {
 
             config.write_huffman_tables_xyb_optimized(output, &dc_table, &ac_table);
 
-            if config.restart_interval > 0 {
-                config.write_restart_interval(output)?;
+            let restart_interval = Self::effective_sequential_restart_interval(config);
+            if restart_interval > 0 {
+                config.write_restart_interval(output, restart_interval)?;
             }
             config.write_scan_header_xyb(output)?;
 
@@ -1302,8 +1316,9 @@ impl StreamingEncoder {
             // Custom tables: XYB uses dc_luma/ac_luma as the shared pair.
             config.write_huffman_tables_xyb_optimized(output, &tables.dc_luma, &tables.ac_luma);
 
-            if config.restart_interval > 0 {
-                config.write_restart_interval(output)?;
+            let restart_interval = Self::effective_sequential_restart_interval(config);
+            if restart_interval > 0 {
+                config.write_restart_interval(output, restart_interval)?;
             }
             config.write_scan_header_xyb(output)?;
 
@@ -1324,8 +1339,9 @@ impl StreamingEncoder {
             );
             config.write_huffman_tables_xyb_optimized(output, &tables.dc_luma, &tables.ac_luma);
 
-            if config.restart_interval > 0 {
-                config.write_restart_interval(output)?;
+            let restart_interval = Self::effective_sequential_restart_interval(config);
+            if restart_interval > 0 {
+                config.write_restart_interval(output, restart_interval)?;
             }
             config.write_scan_header_xyb(output)?;
 
@@ -1390,8 +1406,9 @@ impl StreamingEncoder {
 
             config.write_huffman_tables_optimized(output, &tables)?;
 
-            if config.restart_interval > 0 {
-                config.write_restart_interval(output)?;
+            let restart_interval = Self::effective_sequential_restart_interval(config);
+            if restart_interval > 0 {
+                config.write_restart_interval(output, restart_interval)?;
             }
             config.write_scan_header(output)?;
 
@@ -1406,8 +1423,9 @@ impl StreamingEncoder {
         } else if let HuffmanStrategy::Custom(ref tables) = config.huffman {
             config.write_huffman_tables_optimized(output, tables)?;
 
-            if config.restart_interval > 0 {
-                config.write_restart_interval(output)?;
+            let restart_interval = Self::effective_sequential_restart_interval(config);
+            if restart_interval > 0 {
+                config.write_restart_interval(output, restart_interval)?;
             }
             config.write_scan_header(output)?;
 
@@ -1428,8 +1446,9 @@ impl StreamingEncoder {
             );
             config.write_huffman_tables_optimized(output, &tables)?;
 
-            if config.restart_interval > 0 {
-                config.write_restart_interval(output)?;
+            let restart_interval = Self::effective_sequential_restart_interval(config);
+            if restart_interval > 0 {
+                config.write_restart_interval(output, restart_interval)?;
             }
             config.write_scan_header(output)?;
 
