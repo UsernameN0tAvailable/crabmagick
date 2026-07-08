@@ -677,3 +677,34 @@ fn avif_q80_roundtrip() {
     );
     assert!(psnr(&original, &decoded) > 30.0);
 }
+
+#[test]
+fn jpeg_quality_psnr_ordering() {
+    // PSNR must increase with quality for same image
+    let (w, h) = (800u32, 600u32);
+    let mut px = vec![255u8; (w*h*3) as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let tb = (y / 7) % 2 == 0;
+            let gl = ((x / 5) + (y / 11)) % 9 < 4;
+            let mg = x > 18 && x + 18 < w as usize && y > 18 && y + 18 < h as usize;
+            if tb && gl && mg { let i = (y*w as usize+x)*3; px[i]=0; px[i+1]=0; px[i+2]=0; }
+        }
+    }
+    let opts_75 = EncodeOptions::Jpeg(JpegEncodeOptions { quality: 75, ..Default::default() });
+    let opts_85 = EncodeOptions::Jpeg(JpegEncodeOptions { quality: 85, ..Default::default() });
+    let opts_95 = EncodeOptions::Jpeg(JpegEncodeOptions { quality: 95, ..Default::default() });
+    let (_, dec75) = encode_roundtrip(px.clone(), w, h, &opts_75);
+    let (_, dec85) = encode_roundtrip(px.clone(), w, h, &opts_85);
+    let (_, dec95) = encode_roundtrip(px.clone(), w, h, &opts_95);
+    let p75 = psnr(&px, &dec75);
+    let p85 = psnr(&px, &dec85);
+    let p95 = psnr(&px, &dec95);
+    eprintln!("PSNR: Q75={p75:.1}  Q85={p85:.1}  Q95={p95:.1}");
+    assert!(p75 > 20.0, "Q75 PSNR {p75:.1} < 20 dB");
+    assert!(p85 > 20.0, "Q85 PSNR {p85:.1} < 20 dB");
+    assert!(p95 > 30.0, "Q95 PSNR {p95:.1} < 30 dB");
+    // Quality ordering
+    assert!(p95 >= p85, "Q95 ({p95:.1}) should be >= Q85 ({p85:.1})");
+    assert!(p85 >= p75, "Q85 ({p85:.1}) should be >= Q75 ({p75:.1})");
+}

@@ -245,6 +245,23 @@ impl ComputedConfig {
         (self.width + mcu_w - 1) / mcu_w
     }
 
+    /// Returns the restart interval that the parallel entropy encoder will
+    /// actually use at runtime.
+    ///
+    /// When `parallel=true` and no explicit restart interval is set the
+    /// parallel entropy path hard-codes a 64-MCU interval.  The Huffman
+    /// frequency scan and the DRI header must use the same value or the
+    /// resulting JPEG will be invalid (bad Huffman codes for content with
+    /// many uniform blocks such as documents / charts).
+    #[inline]
+    pub(crate) fn effective_parallel_restart_interval(&self) -> usize {
+        #[cfg(feature = "parallel")]
+        if self.parallel && self.restart_interval == 0 {
+            return 64;
+        }
+        self.restart_interval as usize
+    }
+
     /// Round a restart interval down to the nearest MCU row boundary.
     ///
     /// Non-row-aligned restart intervals break the fused chroma upsample +

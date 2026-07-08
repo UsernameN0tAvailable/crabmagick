@@ -125,8 +125,11 @@ impl ComputedConfig {
             let mut prev_cb_dc: i16 = 0;
             let mut prev_cr_dc: i16 = 0;
 
-            // Restart interval tracking (must match encoder behavior exactly)
-            let restart_interval = self.restart_interval as usize;
+            // Restart interval tracking (must match encoder behavior exactly).
+            // When parallel encoding is active the encoder defaults to 64-MCU
+            // restart segments even when the caller passed restart_interval=0,
+            // so the frequency scan must use the same effective value.
+            let restart_interval = self.effective_parallel_restart_interval();
             let total_mcus = y_blocks.len();
 
             for (i, y_block) in y_blocks.iter().enumerate() {
@@ -180,8 +183,9 @@ impl ComputedConfig {
             let mut prev_cb_dc: i16 = 0;
             let mut prev_cr_dc: i16 = 0;
 
-            // Restart interval tracking (must match encoder behavior exactly)
-            let restart_interval = self.restart_interval as usize;
+            // Restart interval tracking (must match encoder behavior exactly).
+            // See effective_parallel_restart_interval for rationale.
+            let restart_interval = self.effective_parallel_restart_interval();
             let total_mcus = mcu_h * mcu_v;
             let mut mcu_idx = 0;
 
