@@ -174,9 +174,26 @@ $info = (new \CrabMagick\Image($path))->getInfo();
 
 ## Performance
 
-All numbers are **median wall-clock time** on a 1680×2446 image, Intel Core Ultra 7 155H
-(AVX2, 22 threads), compared against the canonical C reference implementation.
-"Faster" means lower decode/encode latency — image quality and file sizes are equivalent.
+All numbers are **median wall-clock time** on an 800×600 synthetic image, Intel Core Ultra 7 155H
+(AVX2, 22 threads), compared against libvips (the industry-standard C image processing library).
+
+### Encoders vs libvips
+
+| Format | crabmagick | libvips | Speedup | Our size | vips size |
+|--------|-----------|---------|---------|----------|-----------|
+| JPEG Q75 | **5 ms** | 4 ms | at parity† | 209 KB | 204 KB |
+| JPEG Q85 progressive | **10 ms** | 14 ms | **1.4× faster** | 237 KB | 246 KB |
+| WebP Q80 effort=4 | **50 ms** | 56 ms | **1.1× faster** | 231 KB | 231 KB |
+| WebP lossless | **2 ms** | 183 ms | **80× faster** | 12 KB | 20 KB |
+| PNG (default) | **9 ms** | 12 ms | **1.3× faster** | 89 KB | 461 KB |
+| JXL lossless (document) | **8 ms** | 22 ms | **2.7× faster** | 3 KB | 3 KB |
+| JXL d=2.0 effort=3 | 19 ms | 16 ms | at parity | 218 KB | 214 KB |
+| TIFF LZW+predictor | 22 ms | 14 ms | ~1.5× slower‡ | 448 KB | 448 KB |
+| TIFF Deflate | **7 ms** | 9 ms | **1.3× faster** | 55 KB | 55 KB |
+
+†JPEG baseline: single-pass with built-in tables (matches libjpeg-turbo speed). Enable
+`optimize_huffman=true` for a two-pass build that produces ~8% smaller files.
+‡TIFF LZW uses tiff-rs (weezl encoder); known gap vs libvips's hand-tuned LZW.
 
 ### Decoders
 
@@ -188,34 +205,6 @@ All numbers are **median wall-clock time** on a 1680×2446 image, Intel Core Ult
 | WebP   | **111 ms** | 90 ms (libwebp) | at parity |
 | JXL    | **35 ms** | 47 ms (libjxl full RGB decode) | 1.3× faster |
 
-Notes:
-- JPEG RST decode: restart-marker segments are decoded in parallel with rayon.
-  Files encoded with RST markers (one per MCU row) achieve 2× libjpeg-turbo speed.
-- JXL reference is `djxl` writing to a tmpfs PPM (full XYB→sRGB pixel decode).
-  The commonly cited `djxl /dev/null` time (~8 ms) skips pixel output and is not comparable.
-- WebP uses an AVX2 fast path for YUV→RGB conversion and a branchless VP8 arithmetic
-  decoder. Parity with libwebp's hand-optimised C on this image size.
-
-### Encoders
-
-| Format | crabmagick | Reference | Speedup |
-|--------|-----------|-----------|---------|
-| JPEG Q90 | **21 ms** · 1.1 MB | 12 ms · 1.3 MB (PIL/libjpeg-turbo) | 1.75× slower† |
-| WebP Q90 | **204 ms** · 3.0 MB | 407 ms (libwebp/PIL) | **2× faster** |
-| PNG     | **39 ms** · 8.7 MB | 689 ms (PIL/libpng) | **18× faster** |
-| JXL d=1.0 effort=1 | **349 ms** · 1.0 MB | ~500 ms (cjxl effort=1) | comparable |
-| TIFF LZW+predictor | **comparable** · same size | — | — |
-
-†JPEG: crabmagick builds optimal Huffman tables (two-pass) + embeds RST restart
-markers. Encoding is ~1.75× slower than PIL's single-pass libjpeg-turbo, but output
-files are ~14% smaller and the RST markers allow subsequent decodes at **2× the
-normal speed** (parallel RST-segment decode), making the trade-off net-positive for
-IIIF servers that re-encode the same JXL source repeatedly.
-
-**Encoder options (all formats):** quality, progressive, chroma subsampling (JPEG);
-effort, lossless/near-lossless (WebP); distance, effort, lossless tier (JXL);
-compression level, filter (PNG); compression (LZW/Deflate/Packbits), predictor (TIFF).
-
 ### How performance is achieved (pure Rust, zero C)
 
 | Technique | Applied to |
@@ -224,9 +213,27 @@ compression level, filter (PNG); compression (LZW/Deflate/Packbits), predictor (
 | SSE4.1 SIMD | WebP IDCT 4×4, WebP residual add |
 | Rayon parallel decode | JPEG RST segments, JXL pass-groups (70 groups/image) |
 | Rayon parallel encode | JPEG RST entropy, WebP token partitions |
+| JXL lossless palette | Auto-detected for ≤256-color images; matches libjxl's 1-bit/palette path |
 | Branchless arithmetic | VP8 boolean decoder (cmov-friendly, eliminates 50% branch mispredictions) |
 | 11-bit Huffman lookahead | JPEG: 2048-entry tables, decodes most symbols in 1 table lookup |
 | Thread-local scratch buffers | JXL DCT: eliminates per-block heap allocations (~26K allocs/image) |
+
+### Feature parity with libvips
+
+| Feature | Status |
+|---------|--------|
+| Alpha channel (PNG, WebP, JXL, AVIF, TIFF) | ✅ Preserved end-to-end |
+| ICC color profile | ✅ Extracted on decode, embedded on encode |
+| EXIF metadata | ✅ Extracted from JPEG/WebP, re-embedded on JPEG encode |
+| JXL lossless (natural images) | ✅ At parity |
+| JXL lossless (palette/binary) | ✅ Auto-detected, 2.7× faster than libjxl |
+| WebP near-lossless | ✅ Full libwebp near_lossless support |
+| TIFF LZW/Deflate/Packbits + predictor | ✅ Same output size as libvips |
+| TIFF tiled output | ⚠️ Not yet implemented (tiff-rs limitation) |
+
+**Encoder options (all formats):** quality, progressive, optimize_huffman, chroma subsampling (JPEG);
+effort, lossless, near-lossless, alpha quality (WebP); distance, effort, lossless, tier (JXL);
+compression, filter, bit depth (PNG); compression, predictor (TIFF).
 
 ---
 
