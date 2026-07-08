@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use crabmagick_core::{init, pipeline};
-use libvips::{ops, VipsApp, VipsImage};
+use libvips::{VipsApp, VipsImage, ops};
 
 fn vips_rgb(path: &str) -> (u32, u32, Vec<u8>) {
     let img = VipsImage::new_from_file(path).expect("vips load");
@@ -37,7 +37,9 @@ fn vips_rgb(path: &str) -> (u32, u32, Vec<u8>) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: verify_ref <image-path>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: verify_ref <image-path>");
     init(0, 0);
     let _app = VipsApp::new("crabmagick-verify-ref", false).expect("vips init");
 
@@ -49,8 +51,16 @@ fn main() {
     let (vw, vh, vpix) = vips_rgb(&path);
     let vips_ms = t1.elapsed().as_secs_f64() * 1e3;
 
-    assert_eq!((ours.width, ours.height), (vw, vh), "dimension mismatch vs libvips");
-    assert_eq!(ours.pixels.len(), vpix.len(), "pixel buffer length mismatch vs libvips");
+    assert_eq!(
+        (ours.width, ours.height),
+        (vw, vh),
+        "dimension mismatch vs libvips"
+    );
+    assert_eq!(
+        ours.pixels.len(),
+        vpix.len(),
+        "pixel buffer length mismatch vs libvips"
+    );
 
     let mut max_diff = 0u8;
     let mut sum: u64 = 0;
@@ -70,6 +80,9 @@ fn main() {
         "{path}\n  dims {vw}x{vh}  crabmagick={ours_ms:.1}ms  libvips={vips_ms:.1}ms\n  max_diff={max_diff} mean_diff={mean:.4} within±2={pct_within2:.3}%"
     );
     assert!(mean < 3.0, "mean pixel diff vs libvips too high: {mean}");
-    assert!(pct_within2 > 95.0, "too many pixels diverge from libvips: {pct_within2:.2}% within ±2");
+    assert!(
+        pct_within2 > 95.0,
+        "too many pixels diverge from libvips: {pct_within2:.2}% within ±2"
+    );
     println!("  OK");
 }

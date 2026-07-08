@@ -23,9 +23,9 @@ fn bench(label: &str, path: &str) {
 
 fn main() {
     let images = [
-        ("/tmp/test_bench.jpg",  "JPEG  (1680x2446 Q90)"),
+        ("/tmp/test_bench.jpg", "JPEG  (1680x2446 Q90)"),
         ("/tmp/test_bench.webp", "WebP  (1680x2446 Q90)"),
-        ("/tmp/test_bench.png",  "PNG   (1680x2446 lossless)"),
+        ("/tmp/test_bench.png", "PNG   (1680x2446 lossless)"),
     ];
     for (path, label) in &images {
         if std::path::Path::new(path).exists() {

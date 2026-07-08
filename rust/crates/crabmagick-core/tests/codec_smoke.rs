@@ -6,8 +6,8 @@
 //! `jxl_coding::ans`), the modular decoder, or the render pipeline shows up as either a decode
 //! error, a dimension mismatch, or a non-zero pixel difference.
 
-use crabmagick_core::pipeline::{decode_jxl_from_bytes, encode_jxl_rgb};
 use crabmagick_core::JxlEncodeOptions;
+use crabmagick_core::pipeline::{decode_jxl_from_bytes, encode_jxl_rgb};
 
 /// Builds a deterministic `width * height` RGB image with per-channel gradients plus a small
 /// high-frequency component so the entropy coder has non-trivial content to round-trip.
