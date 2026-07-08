@@ -3,8 +3,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
 
-use crabmagick_core::processor::{get_info, process_image, OutputFormat, ProcessRequest};
-use serde::Deserialize;
+use crabmagick_core::processor::{
+    get_info, process_image, AvifEncodeOptions, ChromaSubsampling, EncodeOptions, GifEncodeOptions,
+    JpegEncodeOptions, JxlEncodeOptions, OutputFormat, PngEncodeOptions, PngFilter, ProcessRequest,
+    TiffCompression, TiffEncodeOptions, WebpEncodeOptions,
+};
+use serde_json::Value;
 
 // ── Protocol ─────────────────────────────────────────────────────────────────
 //
@@ -16,47 +20,6 @@ use serde::Deserialize;
 // info    success  → UTF-8 JSON  {"width":N,"height":N}
 // error            → UTF-8 error string
 
-#[derive(Deserialize)]
-#[serde(tag = "cmd")]
-enum Request {
-    #[serde(rename = "process")]
-    Process {
-        path: String,
-        #[serde(default)]
-        region_x: u32,
-        #[serde(default)]
-        region_y: u32,
-        #[serde(default)]
-        region_w: u32,
-        #[serde(default)]
-        region_h: u32,
-        #[serde(default)]
-        out_w: u32,
-        #[serde(default)]
-        out_h: u32,
-        #[serde(default = "default_format")]
-        format: String,
-        #[serde(default = "default_quality")]
-        quality: u8,
-        #[serde(default)]
-        page: u32,
-        #[serde(default)]
-        rotation: u16,
-        #[serde(default)]
-        square: bool,
-    },
-    #[serde(rename = "info")]
-    Info {
-        path: String,
-        #[serde(default)]
-        #[allow(dead_code)] // reserved for future page-aware info; field kept for protocol compat
-        page: u32,
-    },
-}
-
-fn default_format() -> String {
-    "jpeg".to_string()
-}
 fn default_quality() -> u8 {
     85
 }
@@ -116,46 +79,25 @@ fn handle_connection(mut stream: UnixStream) {
 }
 
 fn dispatch(json: &[u8]) -> (u8, Vec<u8>) {
-    let req: Request = match serde_json::from_slice(json) {
+    let req: Value = match serde_json::from_slice(json) {
         Ok(r) => r,
         Err(e) => return (1, format!("invalid request: {e}").into_bytes()),
     };
 
-    match req {
-        Request::Process {
-            path,
-            region_x, region_y, region_w, region_h,
-            out_w, out_h,
-            format,
-            quality,
-            page,
-            rotation,
-            square,
-        } => {
-            let fmt = match parse_format(&format) {
-                Ok(f) => f,
-                Err(e) => return (1, e.into_bytes()),
-            };
-            let request = ProcessRequest {
-                region_left: region_x,
-                region_top: region_y,
-                region_width: region_w,
-                region_height: region_h,
-                output_width: out_w,
-                output_height: out_h,
-                output_format: fmt,
-                quality,
-                page,
-                rotation,
-                square_region: square,
-            };
-            match process_image(&path, request) {
+    match req.get("cmd").and_then(Value::as_str) {
+        Some("process") => match parse_process_request(&req) {
+            Ok((path, request)) => match process_image(&path, request) {
                 Ok(bytes) => (0, bytes),
                 Err(e) => (1, e.to_string().into_bytes()),
-            }
-        }
-        Request::Info { path, page: _ } => {
-            match get_info(&path) {
+            },
+            Err(error) => (1, error.into_bytes()),
+        },
+        Some("info") => {
+            let path = match get_required_str(&req, "path") {
+                Ok(path) => path,
+                Err(error) => return (1, error.into_bytes()),
+            };
+            match get_info(path) {
                 Ok(info) => {
                     let json = format!(r#"{{"width":{},"height":{}}}"#, info.width, info.height);
                     (0, json.into_bytes())
@@ -163,6 +105,8 @@ fn dispatch(json: &[u8]) -> (u8, Vec<u8>) {
                 Err(e) => (1, e.to_string().into_bytes()),
             }
         }
+        Some(other) => (1, format!("unknown command: {other}").into_bytes()),
+        None => (1, b"invalid request: missing cmd".to_vec()),
     }
 }
 
@@ -173,7 +117,10 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > 64 * 1024 * 1024 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request too large",
+        ));
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
@@ -203,6 +150,167 @@ fn parse_format(s: &str) -> Result<OutputFormat, String> {
         "bmp" => Ok(OutputFormat::Bmp),
         other => Err(format!("unknown format: {other}")),
     }
+}
+
+fn parse_process_request(request: &Value) -> Result<(String, ProcessRequest), String> {
+    let path = get_required_str(request, "path")?.to_string();
+    let format = parse_format(
+        request
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("jpeg"),
+    )?;
+
+    let encode = parse_encode_options(request, format);
+    Ok((
+        path,
+        ProcessRequest {
+            region_left: get_u32(request, "region_x", 0),
+            region_top: get_u32(request, "region_y", 0),
+            region_width: get_u32(request, "region_w", 0),
+            region_height: get_u32(request, "region_h", 0),
+            output_width: get_u32(request, "out_w", 0),
+            output_height: get_u32(request, "out_h", 0),
+            encode,
+            page: get_u32(request, "page", 0),
+            rotation: get_u16(request, "rotation", 0),
+            square_region: get_bool(request, "square", false),
+        },
+    ))
+}
+
+fn parse_encode_options(request: &Value, format: OutputFormat) -> EncodeOptions {
+    match format {
+        OutputFormat::Jpeg => EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: get_u8(request, "quality", default_quality()).clamp(1, 100),
+            progressive: get_bool(request, "progressive", false),
+            chroma_subsampling: parse_chroma_subsampling(
+                request.get("chroma_subsampling").and_then(Value::as_str),
+            ),
+            restart_interval: get_u16(request, "restart_interval", 0),
+        }),
+        OutputFormat::Webp | OutputFormat::WebpLossless => EncodeOptions::Webp(WebpEncodeOptions {
+            quality: get_u8(request, "quality", default_quality()).min(100),
+            lossless: get_bool(request, "lossless", format == OutputFormat::WebpLossless),
+            near_lossless: get_bool(request, "near_lossless", false),
+            effort: get_u8(request, "effort", 4),
+            alpha_quality: get_u8(request, "alpha_quality", 100).min(100),
+        }),
+        OutputFormat::Png => EncodeOptions::Png(PngEncodeOptions {
+            compression: get_u8(request, "compression", 6).min(9),
+            progressive: get_bool(request, "progressive", false),
+            filter: parse_png_filter(request.get("filter").and_then(Value::as_str)),
+            bitdepth: match get_u8(request, "bitdepth", 8) {
+                16 => 16,
+                _ => 8,
+            },
+        }),
+        OutputFormat::Jxl => EncodeOptions::Jxl(JxlEncodeOptions {
+            quality: get_u8(request, "quality", default_quality()).min(100),
+            distance: request
+                .get("distance")
+                .and_then(Value::as_f64)
+                .map(|value| value as f32),
+            effort: get_u8(request, "effort", 7),
+            lossless: get_bool(request, "lossless", false),
+            tier: get_u8(request, "tier", 0),
+        }),
+        OutputFormat::Avif => EncodeOptions::Avif(AvifEncodeOptions {
+            quality: get_u8(request, "quality", default_quality()).clamp(1, 100),
+            lossless: get_bool(request, "lossless", false),
+            effort: get_u8(request, "effort", 4),
+        }),
+        OutputFormat::Tiff => EncodeOptions::Tiff(TiffEncodeOptions {
+            compression: parse_tiff_compression(request.get("compression").and_then(Value::as_str)),
+            quality: get_u8(request, "quality", default_quality()).clamp(1, 100),
+            predictor: get_bool(request, "predictor", true),
+            tiled: get_bool(request, "tiled", false),
+            tile_width: get_u16(request, "tile_width", 128),
+            tile_height: get_u16(request, "tile_height", 128),
+        }),
+        OutputFormat::Gif => EncodeOptions::Gif(GifEncodeOptions {
+            dither: get_f32(request, "dither", 1.0),
+            effort: get_u8(request, "effort", 7),
+            bitdepth: get_u8(request, "bitdepth", 8).clamp(1, 8),
+        }),
+        OutputFormat::Bmp => EncodeOptions::Bmp,
+    }
+}
+
+fn parse_chroma_subsampling(value: Option<&str>) -> ChromaSubsampling {
+    match value.unwrap_or("auto").to_ascii_lowercase().as_str() {
+        "420" => ChromaSubsampling::Cs420,
+        "422" => ChromaSubsampling::Cs422,
+        "444" => ChromaSubsampling::Cs444,
+        _ => ChromaSubsampling::Auto,
+    }
+}
+
+fn parse_png_filter(value: Option<&str>) -> PngFilter {
+    match value.unwrap_or("all").to_ascii_lowercase().as_str() {
+        "none" => PngFilter::None,
+        "sub" => PngFilter::Sub,
+        "up" => PngFilter::Up,
+        "avg" => PngFilter::Avg,
+        "paeth" => PngFilter::Paeth,
+        _ => PngFilter::All,
+    }
+}
+
+fn parse_tiff_compression(value: Option<&str>) -> TiffCompression {
+    match value.unwrap_or("lzw").to_ascii_lowercase().as_str() {
+        "none" => TiffCompression::None,
+        "deflate" => TiffCompression::Deflate,
+        "jpeg" => TiffCompression::Jpeg,
+        "packbits" => TiffCompression::Packbits,
+        _ => TiffCompression::Lzw,
+    }
+}
+
+fn get_required_str<'a>(request: &'a Value, field: &str) -> Result<&'a str, String> {
+    request
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("invalid request: missing {field}"))
+}
+
+fn get_u32(request: &Value, field: &str, default: u32) -> u32 {
+    request
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(default)
+}
+
+fn get_u16(request: &Value, field: &str, default: u16) -> u16 {
+    request
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(default)
+}
+
+fn get_u8(request: &Value, field: &str, default: u8) -> u8 {
+    request
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .unwrap_or(default)
+}
+
+fn get_bool(request: &Value, field: &str, default: bool) -> bool {
+    request
+        .get(field)
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
+fn get_f32(request: &Value, field: &str, default: f32) -> f32 {
+    request
+        .get(field)
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or(default)
 }
 
 fn parse_socket_arg() -> String {

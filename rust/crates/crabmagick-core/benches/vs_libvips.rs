@@ -15,9 +15,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crabmagick_core::pipeline::{self, JxlEncodeOptions};
-use crabmagick_core::{CrabMagickError, ImageInfo, OutputFormat, get_info, init};
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use libvips::{VipsImage, ops};
+use crabmagick_core::processor::EncodeOptions;
+use crabmagick_core::{get_info, init, CrabMagickError, ImageInfo, OutputFormat};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use libvips::{ops, VipsImage};
 
 const STORAGE_ROOT: &str = "/home/mattia/Work/IIIF_Server/var/storage";
 const REGION_SIDE: u32 = 256;
@@ -193,7 +194,8 @@ fn bench_decode_ops(c: &mut Criterion, sample: &SampleImage) {
 
         group.bench_function(BenchmarkId::new("crabmagick", op.label()), |b| {
             b.iter(|| {
-                let decoded = crabmagick_decode(sample, op).expect("crabmagick decode bench failed");
+                let decoded =
+                    crabmagick_decode(sample, op).expect("crabmagick decode bench failed");
                 black_box((decoded.width, decoded.height, decoded.pixels.len()))
             });
         });
@@ -216,7 +218,8 @@ fn bench_pipeline_ops(c: &mut Criterion, sample: &SampleImage) {
         group.throughput(Throughput::Elements(op.throughput_pixels(sample.info)));
 
         for output in OUTPUTS {
-            if crabmagick_pipeline(sample, op, output).is_err() || vips_pipeline(sample, op, output).is_err()
+            if crabmagick_pipeline(sample, op, output).is_err()
+                || vips_pipeline(sample, op, output).is_err()
             {
                 eprintln!(
                     "skipping pipeline bench: input={} op={} output={} (probe failed)",
@@ -231,15 +234,16 @@ fn bench_pipeline_ops(c: &mut Criterion, sample: &SampleImage) {
 
             group.bench_function(BenchmarkId::new("crabmagick", &bench_id), |b| {
                 b.iter(|| {
-                    let encoded =
-                        crabmagick_pipeline(sample, op, output).expect("crabmagick pipeline bench failed");
+                    let encoded = crabmagick_pipeline(sample, op, output)
+                        .expect("crabmagick pipeline bench failed");
                     black_box(encoded.len())
                 });
             });
 
             group.bench_function(BenchmarkId::new("libvips", &bench_id), |b| {
                 b.iter(|| {
-                    let encoded = vips_pipeline(sample, op, output).expect("libvips pipeline bench failed");
+                    let encoded =
+                        vips_pipeline(sample, op, output).expect("libvips pipeline bench failed");
                     black_box(encoded.len())
                 });
             });
@@ -337,7 +341,9 @@ fn crabmagick_decode(
     sample: &SampleImage,
     op: Operation,
 ) -> Result<pipeline::DecodedImage, CrabMagickError> {
-    let region = op.crop_side().map(|side| crop_at_ten_percent(sample.info, side));
+    let region = op
+        .crop_side()
+        .map(|side| crop_at_ten_percent(sample.info, side));
     let mut decoded = pipeline::decode_any_with_options(sample.path_str(), region, false, 0, None)?;
     if let Some((out_w, out_h)) = op.resize_target() {
         decoded = pipeline::resize_rgb(decoded, out_w, out_h);
@@ -361,7 +367,10 @@ fn crabmagick_pipeline(
                 ..JxlEncodeOptions::default()
             },
         ),
-        _ => pipeline::encode(decoded, output.format, output.quality),
+        _ => pipeline::encode(
+            decoded,
+            &EncodeOptions::with_quality(output.format, output.quality),
+        ),
     }
 }
 
@@ -370,7 +379,11 @@ fn vips_decode(sample: &SampleImage, op: Operation) -> Result<usize, String> {
     Ok(image.image_write_to_memory().len())
 }
 
-fn vips_pipeline(sample: &SampleImage, op: Operation, output: OutputSpec) -> Result<Vec<u8>, String> {
+fn vips_pipeline(
+    sample: &SampleImage,
+    op: Operation,
+    output: OutputSpec,
+) -> Result<Vec<u8>, String> {
     let image = vips_transform(sample, op)?;
     image
         .image_write_to_buffer(output.vips_suffix)
@@ -397,9 +410,12 @@ fn vips_transform(sample: &SampleImage, op: Operation) -> Result<VipsImage, Stri
 
 fn vips_load(sample: &SampleImage) -> libvips::Result<VipsImage> {
     match sample.format {
-        InputFormat::Jpeg => ops::jpegload(sample.path_str()).or_else(|_| VipsImage::new_from_file(sample.path_str())),
-        InputFormat::Webp => ops::webpload(sample.path_str()).or_else(|_| VipsImage::new_from_file(sample.path_str())),
-        InputFormat::Tiff => ops::tiffload(sample.path_str()).or_else(|_| VipsImage::new_from_file(sample.path_str())),
+        InputFormat::Jpeg => ops::jpegload(sample.path_str())
+            .or_else(|_| VipsImage::new_from_file(sample.path_str())),
+        InputFormat::Webp => ops::webpload(sample.path_str())
+            .or_else(|_| VipsImage::new_from_file(sample.path_str())),
+        InputFormat::Tiff => ops::tiffload(sample.path_str())
+            .or_else(|_| VipsImage::new_from_file(sample.path_str())),
         InputFormat::Jxl => VipsImage::new_from_file(sample.path_str()),
     }
 }
@@ -417,7 +433,10 @@ fn ensure_vips() {
     static VIPS_INIT: OnceLock<()> = OnceLock::new();
 
     VIPS_INIT.get_or_init(|| {
-        let app = Box::new(libvips::VipsApp::new("crabmagick-vs-libvips-bench", false).expect("failed to init libvips"));
+        let app = Box::new(
+            libvips::VipsApp::new("crabmagick-vs-libvips-bench", false)
+                .expect("failed to init libvips"),
+        );
         let _ = Box::leak(app);
     });
 }

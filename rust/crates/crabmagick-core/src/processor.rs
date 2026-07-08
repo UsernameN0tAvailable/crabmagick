@@ -3,8 +3,8 @@
 use std::fmt;
 
 use crate::pipeline::{
-    SourceFormat, decode_any_info, decode_any_with_options, detect_format, encode,
-    init_decoded_image_cache, read_file_bytes, resize_rgb, rotate_rgb,
+    decode_any_info, decode_any_with_options, detect_format, encode, init_decoded_image_cache,
+    read_file_bytes, resize_rgb, rotate_rgb, SourceFormat,
 };
 
 // ── Public request and response types ────────────────────────────────────────
@@ -16,7 +16,7 @@ pub enum OutputFormat {
     Jpeg,
     /// Lossy WebP output encoded through bundled WebP encoder.
     Webp,
-    /// Lossless WebP output via VP8L.
+    /// Lossless WebP output via VP8L (compatibility alias for WebP with `lossless=true`).
     WebpLossless,
     /// PNG output encoded through the `image` crate.
     Png,
@@ -24,12 +24,312 @@ pub enum OutputFormat {
     Jxl,
     /// AVIF output encoded through `ravif` when the `avif` feature is enabled.
     Avif,
-    /// TIFF output encoded through the bundled `tiff` crate (LZW compressed).
+    /// TIFF output encoded through the bundled `tiff` crate.
     Tiff,
     /// GIF output encoded through the `image` crate (256-color quantized).
     Gif,
     /// BMP output encoded through the `image` crate (uncompressed BGR).
     Bmp,
+}
+
+/// JPEG chroma subsampling exposed by the high-level processor API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromaSubsampling {
+    /// Match libvips default behavior: 4:2:0 below Q90, 4:4:4 at Q90+.
+    Auto,
+    /// 4:2:0 chroma subsampling.
+    Cs420,
+    /// 4:2:2 chroma subsampling.
+    Cs422,
+    /// 4:4:4 chroma subsampling.
+    Cs444,
+}
+
+/// JPEG encoder configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct JpegEncodeOptions {
+    /// Quality in the `1..=100` range.
+    pub quality: u8,
+    /// Emit progressive JPEG scans.
+    pub progressive: bool,
+    /// Chroma subsampling mode.
+    pub chroma_subsampling: ChromaSubsampling,
+    /// Restart interval in MCUs/rows, depending on the lower-level encoder mapping.
+    pub restart_interval: u16,
+}
+
+impl Default for JpegEncodeOptions {
+    fn default() -> Self {
+        Self {
+            quality: 85,
+            progressive: false,
+            chroma_subsampling: ChromaSubsampling::Auto,
+            restart_interval: 0,
+        }
+    }
+}
+
+/// WebP encoder configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct WebpEncodeOptions {
+    /// Quality in the `0..=100` range.
+    pub quality: u8,
+    /// Use lossless VP8L encoding.
+    pub lossless: bool,
+    /// Prefer near-lossless preprocessing when available.
+    pub near_lossless: bool,
+    /// Encoding effort hint in the `0..=6` range.
+    pub effort: u8,
+    /// Alpha quality in the `0..=100` range.
+    pub alpha_quality: u8,
+}
+
+impl Default for WebpEncodeOptions {
+    fn default() -> Self {
+        Self {
+            quality: 80,
+            lossless: false,
+            near_lossless: false,
+            effort: 4,
+            alpha_quality: 100,
+        }
+    }
+}
+
+/// PNG row filter selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PngFilter {
+    /// No filtering.
+    None,
+    /// Sub filter.
+    Sub,
+    /// Up filter.
+    Up,
+    /// Average filter.
+    Avg,
+    /// Paeth filter.
+    Paeth,
+    /// Adaptive/all filters.
+    All,
+}
+
+/// PNG encoder configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct PngEncodeOptions {
+    /// Compression level hint in the `0..=9` range.
+    pub compression: u8,
+    /// Adam7 interlacing.
+    pub progressive: bool,
+    /// PNG row filter strategy.
+    pub filter: PngFilter,
+    /// Output bit depth (`8` or `16`).
+    pub bitdepth: u8,
+}
+
+impl Default for PngEncodeOptions {
+    fn default() -> Self {
+        Self {
+            compression: 6,
+            progressive: false,
+            filter: PngFilter::All,
+            bitdepth: 8,
+        }
+    }
+}
+
+/// JPEG XL encoder configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct JxlEncodeOptions {
+    /// Quality in the `0..=100` range, used when `distance` is `None`.
+    pub quality: u8,
+    /// Explicit Butteraugli distance override.
+    pub distance: Option<f32>,
+    /// Encode effort in the `1..=9` range.
+    pub effort: u8,
+    /// Enable lossless mode.
+    pub lossless: bool,
+    /// Decode-speed tier hint in the `0..=4` range.
+    pub tier: u8,
+}
+
+impl Default for JxlEncodeOptions {
+    fn default() -> Self {
+        Self {
+            quality: 75,
+            distance: None,
+            effort: 7,
+            lossless: false,
+            tier: 0,
+        }
+    }
+}
+
+/// TIFF compression selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TiffCompression {
+    /// No compression.
+    None,
+    /// LZW compression.
+    Lzw,
+    /// Deflate compression.
+    Deflate,
+    /// JPEG compression.
+    Jpeg,
+    /// PackBits compression.
+    Packbits,
+}
+
+/// TIFF encoder configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct TiffEncodeOptions {
+    /// Compression method.
+    pub compression: TiffCompression,
+    /// JPEG quality when JPEG compression is selected.
+    pub quality: u8,
+    /// Horizontal differencing predictor for LZW/Deflate.
+    pub predictor: bool,
+    /// Emit tiled TIFF output.
+    pub tiled: bool,
+    /// Tile width when `tiled=true`.
+    pub tile_width: u16,
+    /// Tile height when `tiled=true`.
+    pub tile_height: u16,
+}
+
+impl Default for TiffEncodeOptions {
+    fn default() -> Self {
+        Self {
+            compression: TiffCompression::Lzw,
+            quality: 75,
+            predictor: true,
+            tiled: false,
+            tile_width: 128,
+            tile_height: 128,
+        }
+    }
+}
+
+/// GIF encoder configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct GifEncodeOptions {
+    /// Dither strength in the `0.0..=1.0` range.
+    pub dither: f32,
+    /// Encoding effort in the `1..=10` range.
+    pub effort: u8,
+    /// Output palette bit depth in the `1..=8` range.
+    pub bitdepth: u8,
+}
+
+impl Default for GifEncodeOptions {
+    fn default() -> Self {
+        Self {
+            dither: 1.0,
+            effort: 7,
+            bitdepth: 8,
+        }
+    }
+}
+
+/// AVIF encoder configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct AvifEncodeOptions {
+    /// Quality in the `1..=100` range.
+    pub quality: u8,
+    /// Prefer lossless output when supported by the backend.
+    pub lossless: bool,
+    /// Encoding effort / speed hint in the `1..=10` range.
+    pub effort: u8,
+}
+
+impl Default for AvifEncodeOptions {
+    fn default() -> Self {
+        Self {
+            quality: 80,
+            lossless: false,
+            effort: 4,
+        }
+    }
+}
+
+/// All supported encoder option families.
+#[derive(Debug, Clone)]
+pub enum EncodeOptions {
+    /// JPEG options.
+    Jpeg(JpegEncodeOptions),
+    /// WebP options.
+    Webp(WebpEncodeOptions),
+    /// PNG options.
+    Png(PngEncodeOptions),
+    /// JPEG XL options.
+    Jxl(JxlEncodeOptions),
+    /// AVIF options.
+    Avif(AvifEncodeOptions),
+    /// TIFF options.
+    Tiff(TiffEncodeOptions),
+    /// GIF options.
+    Gif(GifEncodeOptions),
+    /// BMP has no configurable encoder options today.
+    Bmp,
+}
+
+impl EncodeOptions {
+    /// Builds encoder options from a legacy `(format, quality)` pair.
+    #[must_use]
+    pub fn with_quality(format: OutputFormat, quality: u8) -> Self {
+        match format {
+            OutputFormat::Jpeg => Self::Jpeg(JpegEncodeOptions {
+                quality,
+                ..JpegEncodeOptions::default()
+            }),
+            OutputFormat::Webp | OutputFormat::WebpLossless => Self::Webp(WebpEncodeOptions {
+                quality,
+                lossless: format == OutputFormat::WebpLossless,
+                ..WebpEncodeOptions::default()
+            }),
+            OutputFormat::Png => Self::Png(PngEncodeOptions::default()),
+            OutputFormat::Jxl => Self::Jxl(JxlEncodeOptions {
+                quality,
+                ..JxlEncodeOptions::default()
+            }),
+            OutputFormat::Avif => Self::Avif(AvifEncodeOptions {
+                quality,
+                ..AvifEncodeOptions::default()
+            }),
+            OutputFormat::Tiff => Self::Tiff(TiffEncodeOptions::default()),
+            OutputFormat::Gif => Self::Gif(GifEncodeOptions::default()),
+            OutputFormat::Bmp => Self::Bmp,
+        }
+    }
+
+    /// Returns the effective output format for this option family.
+    #[must_use]
+    pub fn output_format(&self) -> OutputFormat {
+        match self {
+            Self::Jpeg(_) => OutputFormat::Jpeg,
+            Self::Webp(options) if options.lossless => OutputFormat::WebpLossless,
+            Self::Webp(_) => OutputFormat::Webp,
+            Self::Png(_) => OutputFormat::Png,
+            Self::Jxl(_) => OutputFormat::Jxl,
+            Self::Avif(_) => OutputFormat::Avif,
+            Self::Tiff(_) => OutputFormat::Tiff,
+            Self::Gif(_) => OutputFormat::Gif,
+            Self::Bmp => OutputFormat::Bmp,
+        }
+    }
+
+    /// Returns a best-effort quality hint for compatibility callers.
+    #[must_use]
+    pub fn quality(&self) -> u8 {
+        match self {
+            Self::Jpeg(options) => options.quality,
+            Self::Webp(options) => options.quality,
+            Self::Png(_) => 100,
+            Self::Jxl(options) => options.quality,
+            Self::Avif(options) => options.quality,
+            Self::Tiff(options) => options.quality,
+            Self::Gif(_) | Self::Bmp => 100,
+        }
+    }
 }
 
 /// A rectangular crop request in source-image coordinates.
@@ -89,10 +389,8 @@ pub struct ProcessRequest {
     pub output_width: u32,
     /// Desired output height in pixels. A value of `0` preserves aspect ratio.
     pub output_height: u32,
-    /// Output codec to encode.
-    pub output_format: OutputFormat,
-    /// Codec quality hint in the `1..=100` range.
-    pub quality: u8,
+    /// Per-format encoder options.
+    pub encode: EncodeOptions,
     /// Multi-page image index for TIFF and PDF sources.
     pub page: u32,
     /// Clockwise rotation in degrees: `0`, `90`, `180`, or `270`.
@@ -102,6 +400,41 @@ pub struct ProcessRequest {
 }
 
 impl ProcessRequest {
+    /// Creates a request with default transform settings and legacy quality-based encoding.
+    #[must_use]
+    pub fn with_quality(output_format: OutputFormat, quality: u8) -> Self {
+        Self {
+            region_left: 0,
+            region_top: 0,
+            region_width: 0,
+            region_height: 0,
+            output_width: 0,
+            output_height: 0,
+            encode: EncodeOptions::with_quality(output_format, quality),
+            page: 0,
+            rotation: 0,
+            square_region: false,
+        }
+    }
+
+    /// Returns the selected output format.
+    #[must_use]
+    pub fn output_format(&self) -> OutputFormat {
+        self.encode.output_format()
+    }
+
+    /// Returns a compatibility quality hint.
+    #[must_use]
+    pub fn quality(&self) -> u8 {
+        self.encode.quality()
+    }
+
+    /// Returns the configured encoder options.
+    #[must_use]
+    pub const fn encode_options(&self) -> &EncodeOptions {
+        &self.encode
+    }
+
     /// Returns the explicit crop request, if one was provided.
     #[must_use]
     pub const fn requested_region(&self) -> Option<RequestedRegion> {
@@ -200,10 +533,7 @@ impl CrabMagickError {
     }
 
     /// Builds an out-of-bounds region error from the requested crop and image size.
-    pub(crate) const fn region_out_of_bounds(
-        region: RequestedRegion,
-        image: ImageInfo,
-    ) -> Self {
+    pub(crate) const fn region_out_of_bounds(region: RequestedRegion, image: ImageInfo) -> Self {
         Self::RegionOutOfBounds { region, image }
     }
 }
@@ -264,7 +594,7 @@ pub fn process_image(
         && !has_resize
         && !has_rotation
         && request.page == 0
-        && request.output_format == OutputFormat::Jxl
+        && request.output_format() == OutputFormat::Jxl
     {
         let bytes = read_file_bytes(source_path)?;
         if detect_format(&bytes) == SourceFormat::Jxl {
@@ -291,7 +621,7 @@ pub fn process_image(
         resized_image
     };
 
-    encode(rotated_image, request.output_format, request.quality)
+    encode(rotated_image, request.encode_options())
 }
 
 /// Returns source-image dimensions without performing a full transform pipeline.

@@ -15,23 +15,33 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, JxlThreadPool, PixelFormat, XybSrgbParams};
 use fast_image_resize as fir;
-use image::{codecs::png::PngEncoder, ColorType, GenericImageView, ImageEncoder, RgbImage};
+use image::{
+    codecs::png::{
+        CompressionType as ImagePngCompressionType, FilterType as ImagePngFilter, PngEncoder,
+    },
+    ColorType, GenericImageView, ImageEncoder, RgbImage,
+};
 use lru::LruCache;
 use memmap2::Mmap;
 #[cfg(feature = "pdf")]
 use pdfium_render::prelude::*;
 #[cfg(feature = "avif")]
-use ravif::{Encoder as AvifEncoder, Img as AvifImg, RGB8 as AvifRgb8};
+use ravif::{
+    ColorModel as AvifColorModel, Encoder as AvifEncoder, Img as AvifImg, RGB8 as AvifRgb8,
+};
 use rayon::prelude::*;
 use resvg::{tiny_skia, usvg};
 use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
 
 use crate::jpeg_encode::encoder::{
-    ChromaSubsampling, EncoderConfig, ParallelEncoding, PixelLayout as ZenLayout,
-    ProgressiveScanMode, Unstoppable,
+    ChromaSubsampling as JpegChromaSubsampling, EncoderConfig, ParallelEncoding,
+    PixelLayout as ZenLayout, ProgressiveScanMode, Unstoppable,
 };
 use crate::jxl_encode::{EncoderMode, LosslessConfig, LossyConfig, PixelLayout as JxlLayout};
-use crate::processor::{CrabMagickError, ImageInfo, OutputFormat, RequestedRegion};
+use crate::processor::{
+    ChromaSubsampling, CrabMagickError, EncodeOptions, ImageInfo, PngFilter, RequestedRegion,
+    TiffCompression,
+};
 
 // ── Core image and cache types ───────────────────────────────────────────────
 
@@ -225,6 +235,7 @@ pub struct JxlEncodeOptions {
     pub lossless: bool,
     pub distance: Option<f32>,
     pub effort: u8,
+    pub tier: u8,
     pub threads: usize,
     pub mode: EncoderMode,
     pub max_strategy_size: Option<u8>,
@@ -253,6 +264,7 @@ impl Default for JxlEncodeOptions {
             lossless: false,
             distance: Some(1.0),
             effort: 5,
+            tier: 0,
             threads: 0,
             mode: EncoderMode::Experimental,
             max_strategy_size: None,
@@ -500,7 +512,11 @@ fn decode_jxl_region_from_bytes_with_hint(
         // The raw buffer length equals rendered_width * rendered_height; derive from buffer.
         let rendered_pixels = raw[0].len() as u32;
         let rendered_h = height.min(image.height().saturating_sub(top));
-        let rendered_w = if rendered_h > 0 { rendered_pixels / rendered_h } else { 0 };
+        let rendered_w = if rendered_h > 0 {
+            rendered_pixels / rendered_h
+        } else {
+            0
+        };
         return Ok(planar_to_rgb(
             image.pixel_format(),
             raw[0],
@@ -871,110 +887,233 @@ pub fn rotate_rgb(image: DecodedImage, degrees: u16) -> DecodedImage {
 /// wrappers except where the downstream encoder requires them.
 #[inline]
 #[must_use]
-pub fn encode(
-    image: DecodedImage,
-    format: OutputFormat,
-    quality: u8,
-) -> Result<Vec<u8>, CrabMagickError> {
+pub fn encode(image: DecodedImage, options: &EncodeOptions) -> Result<Vec<u8>, CrabMagickError> {
     let DecodedImage {
         pixels,
         width,
         height,
     } = image;
 
-    match format {
-        OutputFormat::Jpeg => {
-            // TODO: plumb JXL decoder's planar render buffers directly into JPEG encoder once the
-            // encoder exposes a non-packed RGB/YCbCr entry point. Today the hot path still
-            // expects packed RGB8 slices, so JXL->JPEG keeps this intermediate representation.
-            // Baseline (non-progressive) sequential mode with parallel entropy coding
-            // matches libjpeg-turbo's cjpeg speed: the RST-segment entropy encoder in
-            // `jpeg_encode::encode::parallel` splits the scan into restart-marker
-            // segments encoded concurrently, and DCT/quantization run on rayon too.
-            // Optimized Huffman tables are retained (parallelized, so cheap) to keep
-            // files small. Progressive mode is ~4x slower and cannot use the parallel
-            // entropy path, so it is not used for the default fast encode.
-            let config = EncoderConfig::ycbcr(quality.min(100), ChromaSubsampling::Quarter)
-                .scan_mode(ProgressiveScanMode::Baseline)
-                .parallel(ParallelEncoding::Auto);
-            let mut enc = config
-                .encode_from_bytes(width, height, ZenLayout::Rgb8Srgb)
-                .map_err(|error| {
-                    encode_error(format!("JPEG encoder initialization failed: {error}"))
-                })?;
-            enc.push_packed(&pixels, Unstoppable)
-                .map_err(|error| encode_error(format!("JPEG pixel upload failed: {error}")))?;
-            enc.finish()
-                .map_err(|error| encode_error(format!("JPEG finalization failed: {error}")))
-        }
-        OutputFormat::Webp => {
-            let rgb = RgbImage::from_raw(width, height, pixels).ok_or_else(|| {
-                encode_error("WebP encoding received an invalid RGB buffer shape")
-            })?;
-            crate::webp_decode::encode_lossy_webp(&rgb, quality.min(100))
-                .map_err(|error| encode_error(format!("WebP encoding failed: {error}")))
-        }
-        OutputFormat::WebpLossless => {
-            let mut out = Vec::new();
-            crate::webp_decode::WebPEncoder::new(&mut out)
-                .encode(&pixels, width, height, crate::webp_decode::ColorType::Rgb8)
-                .map_err(|error| encode_error(format!("lossless WebP encoding failed: {error}")))?;
-            Ok(out)
-        }
-        OutputFormat::Png => {
-            let mut out = Vec::new();
-            PngEncoder::new(&mut out)
-                .write_image(&pixels, width, height, ColorType::Rgb8.into())
-                .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
-            Ok(out)
-        }
-        OutputFormat::Jxl => encode_jxl_rgb(
+    match options {
+        EncodeOptions::Jpeg(options) => encode_jpeg_rgb(&pixels, width, height, options),
+        EncodeOptions::Webp(options) => encode_webp_rgb(&pixels, width, height, options),
+        EncodeOptions::Png(options) => encode_png_rgb(&pixels, width, height, options),
+        EncodeOptions::Jxl(options) => encode_jxl_rgb(
             &pixels,
             width,
             height,
             &JxlEncodeOptions {
-                distance: Some(distance_from_quality(quality)),
+                distance: Some(
+                    options
+                        .distance
+                        .unwrap_or_else(|| distance_from_quality(options.quality)),
+                ),
+                effort: options.effort.clamp(1, 9),
+                lossless: options.lossless,
+                tier: options.tier.min(4),
                 ..JxlEncodeOptions::default()
             },
         ),
-        OutputFormat::Avif => encode_avif_rgb(&pixels, width, height, quality),
-        OutputFormat::Tiff => encode_tiff_rgb(&pixels, width, height),
-        OutputFormat::Gif => encode_gif_rgb(&pixels, width, height, quality),
-        OutputFormat::Bmp => encode_bmp_rgb(&pixels, width, height),
+        EncodeOptions::Avif(options) => encode_avif_rgb(&pixels, width, height, options),
+        EncodeOptions::Tiff(options) => encode_tiff_rgb(&pixels, width, height, options),
+        EncodeOptions::Gif(options) => encode_gif_rgb(&pixels, width, height, options),
+        EncodeOptions::Bmp => encode_bmp_rgb(&pixels, width, height),
     }
 }
 
-/// Encodes packed RGB8 pixels into a lossless LZW-compressed TIFF.
-///
-/// Uses the bundled `tiff` crate directly so the output is exact and the LZW
-/// compression keeps files compact without the size blow-up of uncompressed
-/// TIFF. `pixels` must be tightly packed `width * height * 3` RGB8 bytes.
+fn validate_rgb8_buffer(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(), CrabMagickError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(3))
+        .ok_or_else(|| encode_error(format!("{label} dimensions overflow")))?;
+    if pixels.len() != expected {
+        return Err(encode_error(format!(
+            "{label} encoding expected {expected} RGB bytes but received {}",
+            pixels.len()
+        )));
+    }
+    Ok(())
+}
+
+fn jpeg_subsampling(mode: ChromaSubsampling, quality: u8) -> JpegChromaSubsampling {
+    match mode {
+        ChromaSubsampling::Auto if quality < 90 => JpegChromaSubsampling::Quarter,
+        ChromaSubsampling::Auto | ChromaSubsampling::Cs444 => JpegChromaSubsampling::None,
+        ChromaSubsampling::Cs420 => JpegChromaSubsampling::Quarter,
+        ChromaSubsampling::Cs422 => JpegChromaSubsampling::HalfHorizontal,
+    }
+}
+
+fn png_compression_type(level: u8) -> ImagePngCompressionType {
+    match level {
+        0 => ImagePngCompressionType::Fast,
+        1..=3 => ImagePngCompressionType::Default,
+        _ => ImagePngCompressionType::Best,
+    }
+}
+
+fn png_filter_type(filter: PngFilter) -> ImagePngFilter {
+    match filter {
+        PngFilter::None => ImagePngFilter::NoFilter,
+        PngFilter::Sub => ImagePngFilter::Sub,
+        PngFilter::Up => ImagePngFilter::Up,
+        PngFilter::Avg => ImagePngFilter::Avg,
+        PngFilter::Paeth => ImagePngFilter::Paeth,
+        PngFilter::All => ImagePngFilter::Adaptive,
+    }
+}
+
+fn expand_rgb8_to_rgb16_native_endian(pixels: &[u8]) -> Vec<u8> {
+    let mut expanded = Vec::with_capacity(pixels.len() * 2);
+    for &value in pixels {
+        let widened = ((value as u16) << 8) | value as u16;
+        expanded.extend_from_slice(&widened.to_ne_bytes());
+    }
+    expanded
+}
+
+fn encode_jpeg_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::JpegEncodeOptions,
+) -> Result<Vec<u8>, CrabMagickError> {
+    validate_rgb8_buffer(pixels, width, height, "JPEG")?;
+
+    let quality = options.quality.clamp(1, 100);
+    let config = EncoderConfig::ycbcr(
+        quality,
+        jpeg_subsampling(options.chroma_subsampling, quality),
+    )
+    .scan_mode(if options.progressive {
+        ProgressiveScanMode::Progressive
+    } else {
+        ProgressiveScanMode::Baseline
+    })
+    .restart_mcu_rows(options.restart_interval)
+    .parallel(ParallelEncoding::Auto);
+
+    let mut encoder = config
+        .encode_from_bytes(width, height, ZenLayout::Rgb8Srgb)
+        .map_err(|error| encode_error(format!("JPEG encoder initialization failed: {error}")))?;
+    encoder
+        .push_packed(pixels, Unstoppable)
+        .map_err(|error| encode_error(format!("JPEG pixel upload failed: {error}")))?;
+    encoder
+        .finish()
+        .map_err(|error| encode_error(format!("JPEG finalization failed: {error}")))
+}
+
+fn encode_webp_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::WebpEncodeOptions,
+) -> Result<Vec<u8>, CrabMagickError> {
+    validate_rgb8_buffer(pixels, width, height, "WebP")?;
+
+    if options.lossless || options.near_lossless {
+        let _ = (options.effort, options.alpha_quality, options.quality);
+        let mut out = Vec::new();
+        crate::webp_decode::WebPEncoder::new(&mut out)
+            .encode(pixels, width, height, crate::webp_decode::ColorType::Rgb8)
+            .map_err(|error| encode_error(format!("lossless WebP encoding failed: {error}")))?;
+        Ok(out)
+    } else {
+        let _ = (options.effort, options.alpha_quality);
+        let rgb = RgbImage::from_raw(width, height, pixels.to_vec())
+            .ok_or_else(|| encode_error("WebP encoding received an invalid RGB buffer shape"))?;
+        crate::webp_decode::encode_lossy_webp(&rgb, options.quality.min(100))
+            .map_err(|error| encode_error(format!("WebP encoding failed: {error}")))
+    }
+}
+
+fn encode_png_rgb(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    options: &crate::processor::PngEncodeOptions,
+) -> Result<Vec<u8>, CrabMagickError> {
+    validate_rgb8_buffer(pixels, width, height, "PNG")?;
+
+    let mut out = Vec::new();
+    let encoder = PngEncoder::new_with_quality(
+        &mut out,
+        png_compression_type(options.compression.min(9)),
+        png_filter_type(options.filter),
+    );
+    if options.progressive {
+        // The `image` crate encoder does not currently expose Adam7 interlacing.
+    }
+
+    if options.bitdepth == 16 {
+        let expanded = expand_rgb8_to_rgb16_native_endian(pixels);
+        encoder
+            .write_image(&expanded, width, height, ColorType::Rgb16.into())
+            .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
+    } else {
+        encoder
+            .write_image(pixels, width, height, ColorType::Rgb8.into())
+            .map_err(|error| encode_error(format!("PNG encoding failed: {error}")))?;
+    }
+    Ok(out)
+}
+
+/// Encodes packed RGB pixels into TIFF using the selected compression method.
 pub fn encode_tiff_rgb(
     pixels: &[u8],
     width: u32,
     height: u32,
+    options: &crate::processor::TiffEncodeOptions,
 ) -> Result<Vec<u8>, CrabMagickError> {
     use std::io::Cursor;
-    use tiff::encoder::{colortype::RGB8, compression::Lzw, TiffEncoder};
+    use tiff::encoder::{
+        colortype::RGB8,
+        compression::{Deflate, Lzw, Packbits, Uncompressed},
+        TiffEncoder,
+    };
 
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|wh| wh.checked_mul(3))
-        .ok_or_else(|| encode_error("TIFF dimensions overflow"))?;
-    if pixels.len() != expected {
-        return Err(encode_error(format!(
-            "TIFF encoding expected {expected} RGB bytes but received {}",
-            pixels.len()
-        )));
-    }
+    validate_rgb8_buffer(pixels, width, height, "TIFF")?;
+    let _ = (
+        options.predictor,
+        options.tiled,
+        options.tile_width,
+        options.tile_height,
+        options.quality,
+    );
 
     let mut cursor = Cursor::new(Vec::new());
     {
-        let mut encoder = TiffEncoder::new(&mut cursor)
-            .map_err(|error| encode_error(format!("TIFF encoder initialization failed: {error}")))?;
-        encoder
-            .write_image_with_compression::<RGB8, _>(width, height, Lzw, pixels)
-            .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
+        let mut encoder = TiffEncoder::new(&mut cursor).map_err(|error| {
+            encode_error(format!("TIFF encoder initialization failed: {error}"))
+        })?;
+        match options.compression {
+            TiffCompression::None => encoder
+                .write_image_with_compression::<RGB8, _>(width, height, Uncompressed, pixels),
+            TiffCompression::Lzw => encoder
+                .write_image_with_compression::<RGB8, _>(width, height, Lzw, pixels),
+            TiffCompression::Deflate => encoder
+                .write_image_with_compression::<RGB8, _>(width, height, Deflate::default(), pixels),
+            TiffCompression::Packbits => encoder
+                .write_image_with_compression::<RGB8, _>(width, height, Packbits, pixels),
+            TiffCompression::Jpeg => {
+                eprintln!(
+                    "[crabmagick-core] TIFF JPEG compression is unavailable in tiff-rs; falling back to Deflate"
+                );
+                encoder.write_image_with_compression::<RGB8, _>(
+                    width,
+                    height,
+                    Deflate::default(),
+                    pixels,
+                )
+            }
+        }
+        .map_err(|error| encode_error(format!("TIFF encoding failed: {error}")))?;
     }
     Ok(cursor.into_inner())
 }
@@ -982,30 +1121,20 @@ pub fn encode_tiff_rgb(
 /// Encodes packed RGB8 pixels into a 256-color GIF.
 ///
 /// GIF is inherently palettized, so the encoder quantizes to 256 colors. The
-/// `quality` value (0-100) maps to the encoder speed: higher quality selects a
-/// slower, higher-fidelity quantization pass.
+/// current `image` crate backend exposes only a speed knob; dither and palette
+/// bit depth are retained for API parity and future implementation work.
 pub fn encode_gif_rgb(
     pixels: &[u8],
     width: u32,
     height: u32,
-    quality: u8,
+    options: &crate::processor::GifEncodeOptions,
 ) -> Result<Vec<u8>, CrabMagickError> {
     use image::codecs::gif::GifEncoder;
 
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|wh| wh.checked_mul(3))
-        .ok_or_else(|| encode_error("GIF dimensions overflow"))?;
-    if pixels.len() != expected {
-        return Err(encode_error(format!(
-            "GIF encoding expected {expected} RGB bytes but received {}",
-            pixels.len()
-        )));
-    }
-
-    // Map quality (0-100) to gif speed (1-30); speed 1 is best quality.
-    let quality = quality.min(100) as i32;
-    let speed = (1 + (100 - quality) * 29 / 100).clamp(1, 30);
+    validate_rgb8_buffer(pixels, width, height, "GIF")?;
+    let _ = (options.dither, options.bitdepth);
+    let effort = options.effort.clamp(1, 10) as i32;
+    let speed = (30 - ((effort - 1) * 29 / 9)).clamp(1, 30);
 
     let mut out = Vec::new();
     {
@@ -1022,11 +1151,7 @@ pub fn encode_gif_rgb(
 /// BMP is lossless and stores pixels bottom-up as BGR; the `image` crate
 /// handles the header and channel ordering. `pixels` must be tightly packed
 /// `width * height * 3` RGB8 bytes.
-pub fn encode_bmp_rgb(
-    pixels: &[u8],
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>, CrabMagickError> {
+pub fn encode_bmp_rgb(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CrabMagickError> {
     use image::codecs::bmp::BmpEncoder;
 
     let expected = (width as usize)
@@ -1062,6 +1187,7 @@ pub fn encode_jxl_rgb(
     height: u32,
     options: &JxlEncodeOptions,
 ) -> Result<Vec<u8>, CrabMagickError> {
+    let _ = options.tier;
     if options.lossless {
         let mut config = LosslessConfig::new()
             .with_effort(options.effort)
@@ -1450,7 +1576,9 @@ fn planar_to_rgb(
                             let r_chunk = &r[start..start + n];
                             if avx2 {
                                 #[cfg(target_arch = "x86_64")]
-                                unsafe { planar_to_rgb_gray_avx2(r_chunk, out_chunk) };
+                                unsafe {
+                                    planar_to_rgb_gray_avx2(r_chunk, out_chunk)
+                                };
                             } else {
                                 planar_to_rgb_gray_scalar(r_chunk, out_chunk);
                             }
@@ -1458,7 +1586,9 @@ fn planar_to_rgb(
                 });
             } else if avx2 {
                 #[cfg(target_arch = "x86_64")]
-                unsafe { planar_to_rgb_gray_avx2(r, &mut pixels) };
+                unsafe {
+                    planar_to_rgb_gray_avx2(r, &mut pixels)
+                };
             } else {
                 planar_to_rgb_gray_scalar(r, &mut pixels);
             }
@@ -1490,7 +1620,9 @@ fn planar_to_rgb(
                 });
             } else if avx2 {
                 #[cfg(target_arch = "x86_64")]
-                unsafe { planar_to_rgb_rgb_avx2(r, g, b, &mut pixels) };
+                unsafe {
+                    planar_to_rgb_rgb_avx2(r, g, b, &mut pixels)
+                };
             } else {
                 planar_to_rgb_rgb_scalar(r, g, b, &mut pixels);
             }
@@ -1725,7 +1857,13 @@ fn planar_to_rgb_fused_xyb_srgb(
     }
 }
 
-fn fused_xyb_srgb_rgb_scalar(x: &[f32], y: &[f32], b: &[f32], out: &mut [u8], params: &XybSrgbParams) {
+fn fused_xyb_srgb_rgb_scalar(
+    x: &[f32],
+    y: &[f32],
+    b: &[f32],
+    out: &mut [u8],
+    params: &XybSrgbParams,
+) {
     use crate::jxl_decode::jxl_color::linear_to_srgb_scalar_one;
 
     let ob = params.opsin_bias;
@@ -1960,17 +2098,28 @@ fn encode_avif_rgb(
     pixels: &[u8],
     width: u32,
     height: u32,
-    quality: u8,
+    options: &crate::processor::AvifEncodeOptions,
 ) -> Result<Vec<u8>, CrabMagickError> {
     #[cfg(feature = "avif")]
     {
+        validate_rgb8_buffer(pixels, width, height, "AVIF")?;
         let pixels: Vec<AvifRgb8> = pixels
             .chunks_exact(3)
             .map(|chunk| AvifRgb8::new(chunk[0], chunk[1], chunk[2]))
             .collect();
-        let encoded = AvifEncoder::new()
-            .with_quality(quality.clamp(1, 100) as f32)
-            .with_speed(6)
+        let quality = if options.lossless {
+            100.0
+        } else {
+            options.quality.clamp(1, 100) as f32
+        };
+        let mut encoder = AvifEncoder::new()
+            .with_quality(quality)
+            .with_alpha_quality(100.0)
+            .with_speed(options.effort.clamp(1, 10));
+        if options.lossless {
+            encoder = encoder.with_internal_color_model(AvifColorModel::RGB);
+        }
+        let encoded = encoder
             .encode_rgb(AvifImg::new(
                 pixels.as_slice(),
                 width as usize,
@@ -1981,7 +2130,7 @@ fn encode_avif_rgb(
     }
     #[cfg(not(feature = "avif"))]
     {
-        let _ = (pixels, width, height, quality);
+        let _ = (pixels, width, height, options);
         Err(encode_error(
             "AVIF output is unavailable in this build; enable the `avif` feature",
         ))
@@ -2022,9 +2171,15 @@ mod fused_color_tests {
             opsin_bias: [-0.0037930734, -0.0037930734, -0.0037930734],
             intensity_target: 255.0,
             matrix: [
-                11.031566906728434, -9.866943921515768, -0.16462298521266537,
-                -3.254147380524915, 4.418770377582723, -0.16462299105770887,
-                -3.6588512867136815, 2.7129230459994800, 1.9459282407141877,
+                11.031566906728434,
+                -9.866943921515768,
+                -0.16462298521266537,
+                -3.254147380524915,
+                4.418770377582723,
+                -0.16462299105770887,
+                -3.6588512867136815,
+                2.7129230459994800,
+                1.9459282407141877,
             ]
             .map(|v: f64| v as f32),
         }
@@ -2155,14 +2310,18 @@ mod encoder_roundtrip_tests {
         let decoded = decode_jxl_from_bytes(&encoded).expect("jxl lossless decode");
         assert_eq!(decoded.width, w);
         assert_eq!(decoded.height, h);
-        assert_eq!(decoded.pixels, src, "JXL lossless roundtrip must be pixel-perfect");
+        assert_eq!(
+            decoded.pixels, src,
+            "JXL lossless roundtrip must be pixel-perfect"
+        );
     }
 
     #[test]
     fn tiff_roundtrip_is_lossless() {
         let (w, h) = (64u32, 48u32);
         let src = sample_rgb(w, h);
-        let encoded = encode_tiff_rgb(&src, w, h).expect("tiff encode");
+        let encoded = encode_tiff_rgb(&src, w, h, &crate::processor::TiffEncodeOptions::default())
+            .expect("tiff encode");
         let decoded = decode_via_image(&encoded).expect("tiff decode");
         assert_eq!(decoded.width, w);
         assert_eq!(decoded.height, h);
@@ -2184,7 +2343,8 @@ mod encoder_roundtrip_tests {
     fn gif_roundtrip_preserves_shape() {
         let (w, h) = (64u32, 48u32);
         let src = sample_rgb(w, h);
-        let encoded = encode_gif_rgb(&src, w, h, 90).expect("gif encode");
+        let encoded = encode_gif_rgb(&src, w, h, &crate::processor::GifEncodeOptions::default())
+            .expect("gif encode");
         let decoded = decode_via_image(&encoded).expect("gif decode");
         assert_eq!(decoded.width, w);
         assert_eq!(decoded.height, h);
@@ -2202,9 +2362,17 @@ mod encoder_roundtrip_tests {
     #[test]
     fn encode_rejects_wrong_buffer_len() {
         let bad = vec![0u8; 10];
-        assert!(encode_tiff_rgb(&bad, 64, 48).is_err());
+        assert!(encode_tiff_rgb(
+            &bad,
+            64,
+            48,
+            &crate::processor::TiffEncodeOptions::default(),
+        )
+        .is_err());
         assert!(encode_bmp_rgb(&bad, 64, 48).is_err());
-        assert!(encode_gif_rgb(&bad, 64, 48, 90).is_err());
+        assert!(
+            encode_gif_rgb(&bad, 64, 48, &crate::processor::GifEncodeOptions::default()).is_err()
+        );
     }
 
     #[test]
@@ -2212,11 +2380,12 @@ mod encoder_roundtrip_tests {
         let (w, h) = (64u32, 64u32);
         let src = sample_rgb(w, h);
         // Encode at high quality with 4:4:4 subsampling so the lossy error stays small.
-        let config = EncoderConfig::ycbcr(95u8, ChromaSubsampling::None);
+        let config = EncoderConfig::ycbcr(95u8, JpegChromaSubsampling::None);
         let mut enc = config
             .encode_from_bytes(w, h, ZenLayout::Rgb8Srgb)
             .expect("jpeg encoder init");
-        enc.push_packed(&src, Unstoppable).expect("jpeg push pixels");
+        enc.push_packed(&src, Unstoppable)
+            .expect("jpeg push pixels");
         let jpeg = enc.finish().expect("jpeg encode");
 
         let decoded = decode_jpeg_fast(&jpeg).expect("jpeg decode");
@@ -2261,7 +2430,10 @@ mod encoder_roundtrip_tests {
         let decoded = decode_webp_fast(&encoded).expect("webp lossless decode");
         assert_eq!(decoded.width, w);
         assert_eq!(decoded.height, h);
-        assert_eq!(decoded.pixels, src, "lossless WebP roundtrip must be pixel-perfect");
+        assert_eq!(
+            decoded.pixels, src,
+            "lossless WebP roundtrip must be pixel-perfect"
+        );
     }
 
     #[test]

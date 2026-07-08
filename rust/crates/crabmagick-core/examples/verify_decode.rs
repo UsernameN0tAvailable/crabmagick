@@ -9,27 +9,21 @@ fn main() {
         .expect("usage: verify_decode <image-path>");
     let orig = std::fs::read(&path).expect("read input");
 
-    let request = ProcessRequest {
-        region_left: 0,
-        region_top: 0,
-        region_width: 0,
-        region_height: 0,
-        output_width: 0,
-        output_height: 0,
-        output_format: OutputFormat::Png,
-        quality: 100,
-        page: 0,
-        rotation: 0,
-        square_region: false,
-    };
+    let request = ProcessRequest::with_quality(OutputFormat::Png, 100);
 
     let png = process_image(&path, request).expect("crabmagick pipeline decode->png");
-    let ours = image::load_from_memory(&png).expect("decode our png").to_rgb8();
+    let ours = image::load_from_memory(&png)
+        .expect("decode our png")
+        .to_rgb8();
     let reference = image::load_from_memory(&orig)
         .expect("reference decode")
         .to_rgb8();
 
-    assert_eq!(ours.dimensions(), reference.dimensions(), "dimension mismatch");
+    assert_eq!(
+        ours.dimensions(),
+        reference.dimensions(),
+        "dimension mismatch"
+    );
     let mut max_diff = 0u8;
     let mut sum: u64 = 0;
     for (a, b) in ours.as_raw().iter().zip(reference.as_raw().iter()) {

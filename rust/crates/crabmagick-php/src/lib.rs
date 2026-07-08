@@ -87,19 +87,16 @@ impl CrabmagickImage {
     }
 
     pub fn encode(&self, format: String, quality: u8) -> PhpResult<Binary<u8>> {
-        let req = ProcessRequest {
-            region_left: self.region_x,
-            region_top: self.region_y,
-            region_width: self.region_w,
-            region_height: self.region_h,
-            output_width: self.out_w,
-            output_height: self.out_h,
-            output_format: parse_format(&format)?,
-            quality,
-            page: self.page,
-            rotation: self.rotation,
-            square_region: self.square_region,
-        };
+        let mut req = ProcessRequest::with_quality(parse_format(&format)?, quality);
+        req.region_left = self.region_x;
+        req.region_top = self.region_y;
+        req.region_width = self.region_w;
+        req.region_height = self.region_h;
+        req.output_width = self.out_w;
+        req.output_height = self.out_h;
+        req.page = self.page;
+        req.rotation = self.rotation;
+        req.square_region = self.square_region;
 
         process_image(&self.path, req)
             .map(Binary::from)
@@ -137,19 +134,13 @@ pub fn crabmagick_process(
     format: String,
     quality: u8,
 ) -> PhpResult<Binary<u8>> {
-    let req = ProcessRequest {
-        region_left: rx,
-        region_top: ry,
-        region_width: rw,
-        region_height: rh,
-        output_width: ow,
-        output_height: oh,
-        output_format: parse_format(&format)?,
-        quality,
-        page: 0,
-        rotation: 0,
-        square_region: false,
-    };
+    let mut req = ProcessRequest::with_quality(parse_format(&format)?, quality);
+    req.region_left = rx;
+    req.region_top = ry;
+    req.region_width = rw;
+    req.region_height = rh;
+    req.output_width = ow;
+    req.output_height = oh;
 
     process_image(&path, req)
         .map(Binary::from)
