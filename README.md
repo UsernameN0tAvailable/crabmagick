@@ -174,26 +174,64 @@ $info = (new \CrabMagick\Image($path))->getInfo();
 
 ## Performance
 
-All numbers are **median wall-clock time** on an 800×600 synthetic image, Intel Core Ultra 7 155H
-(AVX2, 22 threads), compared against libvips (the industry-standard C image processing library).
+Benchmarks run on Intel Core Ultra 7 155H (AVX2, 22 threads) against libvips (industry-standard C
+image processing). Three image types (photo/document/gradient), three sizes (256×256 tile, 800×600
+medium, 1920×1080 HD). Each cell shows median of 5 runs.
 
-### Encoders vs libvips
+### Photo 800×600 — encoder comparison
 
-| Format | crabmagick | libvips | Speedup | Our size | vips size |
-|--------|-----------|---------|---------|----------|-----------|
-| JPEG Q75 | **5 ms** | 4 ms | at parity† | 209 KB | 204 KB |
-| JPEG Q85 progressive | **10 ms** | 14 ms | **1.4× faster** | 237 KB | 246 KB |
-| WebP Q80 effort=4 | **50 ms** | 56 ms | **1.1× faster** | 231 KB | 231 KB |
-| WebP lossless | **2 ms** | 183 ms | **80× faster** | 12 KB | 20 KB |
-| PNG (default) | **9 ms** | 12 ms | **1.3× faster** | 89 KB | 461 KB |
-| JXL lossless (document) | **8 ms** | 22 ms | **2.7× faster** | 3 KB | 3 KB |
-| JXL d=2.0 effort=3 | 19 ms | 16 ms | at parity | 218 KB | 214 KB |
-| TIFF LZW+predictor | 22 ms | 14 ms | ~1.5× slower‡ | 448 KB | 448 KB |
-| TIFF Deflate | **7 ms** | 9 ms | **1.3× faster** | 55 KB | 55 KB |
+| Codec | crab ms | crab KB | PSNR | vips ms | vips KB |
+|-------|---------|---------|------|---------|---------|
+| JPEG Q75 | 4.8 | 209 | 18.3 | 4.4 | 204 |
+| JPEG Q75 opt-huffman | **3.0** | 193 | 18.3 | 6.6 | 197 |
+| JPEG Q85 | 5.4 | 263 | 18.7 | 3.7 | 274 |
+| JPEG Q85 opt-huffman | **3.7** | 248 | 18.7 | 7.4 | 263 |
+| JPEG Q95 opt-huffman | **4.9** | 603 | 27.0 | 14.5 | 761 |
+| JPEG Q85 progressive | **10.5** | 237 | 18.7 | 13.7 | 246 |
+| WebP Q80 eff=0 | **21** | 239 | 19.2 | 27 | 239 |
+| WebP Q80 eff=4 | **52** | 231 | 19.2 | 59 | 231 |
+| WebP Q80 eff=6 | **162** | 225 | 19.2 | 176 | 225 |
+| WebP lossless eff=4 | **2.5** | 12 | inf | 191 | 20 |
+| WebP near-lossless Q80 | 1836 | 522 | 51.1 | 456 | 536 |
+| PNG level=3 | **9.4** | 89 | inf | 9.1 | 462 |
+| PNG level=6 | **8.5** | 89 | inf | 13.0 | 461 |
+| JXL d=2.0 eff=3 | 21 | 218 | 20.1 | 21 | 214 |
+| JXL d=1.0 eff=5 | 46 | 307 | 22.8 | 26 | 249 |
+| JXL lossless eff=3 | 38 | 1310 | inf | 30 | 1221 |
+| JXL lossless eff=5 | **91** | 1126 | inf | 439 | 611 |
+| JXL lossless eff=7 | **310** | 610 | inf | 627 | 430 |
+| TIFF LZW | 21 | 448 | inf | 13 | 448 |
+| TIFF Deflate | **7** | 55 | inf | 9 | 55 |
 
-†JPEG baseline: single-pass with built-in tables (matches libjpeg-turbo speed). Enable
-`optimize_huffman=true` for a two-pass build that produces ~8% smaller files.
-‡TIFF LZW uses tiff-rs (weezl encoder); known gap vs libvips's hand-tuned LZW.
+†JPEG: `optimize_huffman=false` (default) uses single-pass fixed tables — fastest for tiles.
+`optimize_huffman=true` (two-pass) is faster at large images and produces ~10% smaller files.
+‡TIFF LZW: tiff-rs/weezl LZW is slower than libvips's hand-tuned implementation.
+
+### Photo 256×256 (tile) highlights
+
+| Codec | crab ms | vips ms | Our size | vips size |
+|-------|---------|---------|----------|-----------|
+| JPEG Q75 | **1.2** | 1.2 | 28 KB | 28 KB |
+| JPEG Q85 opt-huffman | **0.6** | 1.9 | 34 KB | 36 KB |
+| JPEG Q95 opt-huffman | **1.0** | 3.9 | 82 KB | 104 KB |
+| WebP Q80 eff=4 | **8.0** | 8.9 | 32 KB | 32 KB |
+| WebP lossless eff=4 | **0.8** | 64 | 8 KB | 20 KB |
+| PNG level=6 | **4.4** | 5.1 | 25 KB | 186 KB |
+| JXL lossless eff=3 | **8.7** | 13.3 | 172 KB | 167 KB |
+| TIFF LZW | **3.6** | 3.9 | 86 KB | 86 KB |
+
+### Photo 1920×1080 (HD) highlights
+
+| Codec | crab ms | vips ms | Notes |
+|-------|---------|---------|-------|
+| JPEG Q75 | 23 | 7.6 | Fixed tables; use opt-huffman for large images |
+| JPEG Q75 opt-huffman | **12.9** | 18.2 | 1.4× faster |
+| JPEG Q95 opt-huffman | **25.6** | 52.7 | **2.1× faster** |
+| JPEG Q85 progressive | **49** | 52 | at parity |
+| WebP lossless eff=4 | **24** | 401 | **17× faster** |
+| JXL lossless eff=5 | **166** | 1667 | **10× faster** |
+| JXL lossless eff=7 | **297** | 2996 | **10× faster** |
+| TIFF Deflate | **17** | 26 | 1.5× faster, same size |
 
 ### Decoders
 
@@ -227,9 +265,20 @@ All numbers are **median wall-clock time** on an 800×600 synthetic image, Intel
 | EXIF metadata | ✅ Extracted from JPEG/WebP, re-embedded on JPEG encode |
 | JXL lossless (natural images) | ✅ At parity |
 | JXL lossless (palette/binary) | ✅ Auto-detected, 2.7× faster than libjxl |
-| WebP near-lossless | ✅ Full libwebp near_lossless support |
+| WebP near-lossless | ✅ Full libwebp near_lossless support; file sizes match libvips |
 | TIFF LZW/Deflate/Packbits + predictor | ✅ Same output size as libvips |
 | TIFF tiled output | ⚠️ Not yet implemented (tiff-rs limitation) |
+
+### Known gaps vs libvips
+
+| Case | Our result | libvips | Gap |
+|------|-----------|---------|-----|
+| JPEG Q75 baseline (tile 256×256) | at parity | libjpeg-turbo SIMD | — |
+| JPEG Q75 baseline (HD 1920×1080) | 23 ms | 7.6 ms | 3× slower; use `optimize_huffman=true` |
+| JXL lossy d=1.0 eff=7 | 362 KB | 251 KB | 44% larger (VarDCT optimization gap) |
+| JXL lossless eff=5 | 1126 KB | 611 KB | 84% larger on noisy images |
+| TIFF LZW | 1.5–2× slower | — | tiff-rs/weezl limitation |
+| PNG level=1 (large noisy images) | large | small | adaptive filter needed for random content |
 
 **Encoder options (all formats):** quality, progressive, optimize_huffman, chroma subsampling (JPEG);
 effort, lossless, near-lossless, alpha quality (WebP); distance, effort, lossless, tier (JXL);

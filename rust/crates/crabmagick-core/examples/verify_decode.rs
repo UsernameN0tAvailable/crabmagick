@@ -1,7 +1,7 @@
 //! Standalone correctness check for the vendored decode pipeline.
 //! Usage: cargo run -p crabmagick-core --example verify_decode -- <image-path>
 
-use crabmagick_core::{process_image, OutputFormat, ProcessRequest};
+use crabmagick_core::{OutputFormat, ProcessRequest, process_image};
 
 fn main() {
     let path = std::env::args()

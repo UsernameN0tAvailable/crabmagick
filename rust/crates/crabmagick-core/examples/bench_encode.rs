@@ -1,4 +1,4 @@
-use crabmagick_core::pipeline::{encode, encode_jxl_rgb, DecodedImage, JxlEncodeOptions};
+use crabmagick_core::pipeline::{DecodedImage, JxlEncodeOptions, encode, encode_jxl_rgb};
 use crabmagick_core::processor::{EncodeOptions, OutputFormat};
 use std::time::Instant;
 
@@ -29,13 +29,13 @@ fn load_ppm(path: &str) -> Option<DecodedImage> {
     let h: u32 = parts.next()?.parse().ok()?;
     let _maxval: u32 = parts.next()?.parse().ok()?;
     Some(DecodedImage {
-            pixels: data[hdr_end..].to_vec(),
-            alpha: None,
-            icc: None,
-            exif: None,
-            width: w,
-            height: h,
-        })
+        pixels: data[hdr_end..].to_vec(),
+        alpha: None,
+        icc: None,
+        exif: None,
+        width: w,
+        height: h,
+    })
 }
 
 fn bench(label: &str, mut f: impl FnMut() -> Vec<u8>) {
@@ -67,13 +67,13 @@ fn main() {
     eprintln!("Encoding {w}x{h} ({} KB raw RGB)", img.pixels.len() / 1024);
 
     let mk = |p: &[u8]| DecodedImage {
-            pixels: p.to_vec(),
-            alpha: None,
-            icc: None,
-            exif: None,
-            width: w,
-            height: h,
-        };
+        pixels: p.to_vec(),
+        alpha: None,
+        icc: None,
+        exif: None,
+        width: w,
+        height: h,
+    };
     let px = img.pixels.clone();
 
     bench("JPEG Q90 encode", || {

@@ -6,9 +6,12 @@ use std::time::Instant;
 
 use crabmagick_core::pipeline::{DecodedImage, decode_any_with_options, encode};
 use crabmagick_core::processor::{
-    ChromaSubsampling, EncodeOptions, JpegEncodeOptions, JxlEncodeOptions, PngEncodeOptions,
-    TiffCompression, TiffEncodeOptions, WebpEncodeOptions,
+    ChromaSubsampling, EncodeOptions, JpegEncodeOptions, JxlEncodeOptions,
+    PngEncodeOptions, TiffCompression, TiffEncodeOptions, WebpEncodeOptions,
 };
+
+#[cfg(feature = "avif")]
+use crabmagick_core::processor::AvifEncodeOptions;
 
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     assert_eq!(a.len(), b.len());
@@ -202,237 +205,144 @@ struct BenchCase {
     vips_suffix: &'static str,
 }
 
-fn bench_cases() -> Vec<BenchCase> {
+fn jpeg_cases() -> Vec<BenchCase> {
     vec![
-        BenchCase {
-            label: "JPEG Q75",
-            opts: EncodeOptions::Jpeg(JpegEncodeOptions {
-                quality: 75,
-                ..Default::default()
-            }),
-            vips_suffix: ".jpg[Q=75]",
-        },
-        BenchCase {
-            label: "JPEG Q85",
-            opts: EncodeOptions::Jpeg(JpegEncodeOptions {
-                quality: 85,
-                ..Default::default()
-            }),
-            vips_suffix: ".jpg[Q=85]",
-        },
-        BenchCase {
-            label: "JPEG Q95",
-            opts: EncodeOptions::Jpeg(JpegEncodeOptions {
-                quality: 95,
-                ..Default::default()
-            }),
-            vips_suffix: ".jpg[Q=95]",
-        },
-        BenchCase {
-            label: "JPEG Q85 progressive",
-            opts: EncodeOptions::Jpeg(JpegEncodeOptions {
-                quality: 85,
-                progressive: true,
-                ..Default::default()
-            }),
-            vips_suffix: ".jpg[Q=85,interlace=1]",
-        },
-        BenchCase {
-            label: "JPEG Q90 4:4:4",
-            opts: EncodeOptions::Jpeg(JpegEncodeOptions {
-                quality: 90,
-                chroma_subsampling: ChromaSubsampling::Cs444,
-                ..Default::default()
-            }),
-            vips_suffix: ".jpg[Q=90,subsample_mode=off]",
-        },
-        BenchCase {
-            label: "WebP Q80 effort0",
-            opts: EncodeOptions::Webp(WebpEncodeOptions {
-                quality: 80,
-                effort: 0,
-                ..Default::default()
-            }),
-            vips_suffix: ".webp[Q=80,effort=0]",
-        },
-        BenchCase {
-            label: "WebP Q80 effort4",
-            opts: EncodeOptions::Webp(WebpEncodeOptions {
-                quality: 80,
-                effort: 4,
-                ..Default::default()
-            }),
-            vips_suffix: ".webp[Q=80,effort=4]",
-        },
-        BenchCase {
-            label: "WebP Q80 effort6",
-            opts: EncodeOptions::Webp(WebpEncodeOptions {
-                quality: 80,
-                effort: 6,
-                ..Default::default()
-            }),
-            vips_suffix: ".webp[Q=80,effort=6]",
-        },
-        BenchCase {
-            label: "WebP Q90 effort4",
-            opts: EncodeOptions::Webp(WebpEncodeOptions {
-                quality: 90,
-                effort: 4,
-                ..Default::default()
-            }),
-            vips_suffix: ".webp[Q=90,effort=4]",
-        },
-        BenchCase {
-            label: "WebP lossless",
-            opts: EncodeOptions::Webp(WebpEncodeOptions {
-                lossless: true,
-                ..Default::default()
-            }),
-            vips_suffix: ".webp[lossless=1]",
-        },
-        BenchCase {
-            label: "PNG compression=1",
-            opts: EncodeOptions::Png(PngEncodeOptions {
-                compression: 1,
-                ..Default::default()
-            }),
-            vips_suffix: ".png[compression=1]",
-        },
-        BenchCase {
-            label: "PNG compression=6",
-            opts: EncodeOptions::Png(PngEncodeOptions {
-                compression: 6,
-                ..Default::default()
-            }),
-            vips_suffix: ".png[compression=6]",
-        },
-        BenchCase {
-            label: "PNG compression=9",
-            opts: EncodeOptions::Png(PngEncodeOptions {
-                compression: 9,
-                ..Default::default()
-            }),
-            vips_suffix: ".png[compression=9]",
-        },
-        BenchCase {
-            label: "JXL d=2.0 effort=3",
-            opts: EncodeOptions::Jxl(JxlEncodeOptions {
-                distance: Some(2.0),
-                effort: 3,
-                ..Default::default()
-            }),
-            vips_suffix: ".jxl[distance=2.0,effort=3]",
-        },
-        BenchCase {
-            label: "JXL d=1.0 effort=5",
-            opts: EncodeOptions::Jxl(JxlEncodeOptions {
-                distance: Some(1.0),
-                effort: 5,
-                ..Default::default()
-            }),
-            vips_suffix: ".jxl[distance=1.0,effort=5]",
-        },
-        BenchCase {
-            label: "JXL d=0.5 effort=7",
-            opts: EncodeOptions::Jxl(JxlEncodeOptions {
-                distance: Some(0.5),
-                effort: 7,
-                ..Default::default()
-            }),
-            vips_suffix: ".jxl[distance=0.5,effort=7]",
-        },
-        BenchCase {
-            label: "JXL lossless effort=3",
-            opts: EncodeOptions::Jxl(JxlEncodeOptions {
-                lossless: true,
-                effort: 3,
-                ..Default::default()
-            }),
-            vips_suffix: ".jxl[lossless=1,effort=3]",
-        },
-        BenchCase {
-            label: "TIFF lzw",
-            opts: EncodeOptions::Tiff(TiffEncodeOptions {
-                compression: TiffCompression::Lzw,
-                ..Default::default()
-            }),
-            vips_suffix: ".tif[compression=lzw]",
-        },
-        BenchCase {
-            label: "TIFF deflate",
-            opts: EncodeOptions::Tiff(TiffEncodeOptions {
-                compression: TiffCompression::Deflate,
-                ..Default::default()
-            }),
-            vips_suffix: ".tif[compression=deflate]",
-        },
-        BenchCase {
-            label: "TIFF none",
-            opts: EncodeOptions::Tiff(TiffEncodeOptions {
-                compression: TiffCompression::None,
-                ..Default::default()
-            }),
-            vips_suffix: ".tif[compression=none]",
-        },
+        BenchCase { label: "JPEG Q50",              opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 50,  ..Default::default() }), vips_suffix: ".jpg[Q=50]" },
+        BenchCase { label: "JPEG Q75",              opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 75,  ..Default::default() }), vips_suffix: ".jpg[Q=75]" },
+        BenchCase { label: "JPEG Q75 opt-huffman",  opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 75, optimize_huffman: true,  ..Default::default() }), vips_suffix: ".jpg[Q=75,optimize_coding=true]" },
+        BenchCase { label: "JPEG Q85",              opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 85,  ..Default::default() }), vips_suffix: ".jpg[Q=85]" },
+        BenchCase { label: "JPEG Q85 opt-huffman",  opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 85, optimize_huffman: true,  ..Default::default() }), vips_suffix: ".jpg[Q=85,optimize_coding=true]" },
+        BenchCase { label: "JPEG Q95",              opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 95,  ..Default::default() }), vips_suffix: ".jpg[Q=95]" },
+        BenchCase { label: "JPEG Q95 opt-huffman",  opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 95, optimize_huffman: true,  ..Default::default() }), vips_suffix: ".jpg[Q=95,optimize_coding=true]" },
+        BenchCase { label: "JPEG Q85 progressive",  opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 85, progressive: true,       ..Default::default() }), vips_suffix: ".jpg[Q=85,interlace=1]" },
+        BenchCase { label: "JPEG Q90 4:4:4",        opts: EncodeOptions::Jpeg(JpegEncodeOptions { quality: 90, chroma_subsampling: ChromaSubsampling::Cs444, ..Default::default() }), vips_suffix: ".jpg[Q=90,subsample_mode=off]" },
     ]
 }
 
-fn main() {
-    let runs = 5;
-    let images = vec![
-        (
-            "photo",
-            DecodedImage {
-                pixels: synthetic_photo(800, 600),
-                alpha: None,
-                icc: None,
-                exif: None,
-                width: 800,
-                height: 600,
-            },
-        ),
-        (
-            "document",
-            DecodedImage {
-                pixels: document_pattern(800, 600),
-                alpha: None,
-                icc: None,
-                exif: None,
-                width: 800,
-                height: 600,
-            },
-        ),
-        (
-            "gradient",
-            DecodedImage {
-                pixels: gradient(800, 600),
-                alpha: None,
-                icc: None,
-                exif: None,
-                width: 800,
-                height: 600,
-            },
-        ),
-    ];
-    let cases = bench_cases();
+fn webp_cases() -> Vec<BenchCase> {
+    vec![
+        // Lossy: quality sweep at effort=4
+        BenchCase { label: "WebP lossy Q50 eff=4",   opts: EncodeOptions::Webp(WebpEncodeOptions { quality: 50, effort: 4, ..Default::default() }), vips_suffix: ".webp[Q=50,effort=4]" },
+        BenchCase { label: "WebP lossy Q80 eff=0",   opts: EncodeOptions::Webp(WebpEncodeOptions { quality: 80, effort: 0, ..Default::default() }), vips_suffix: ".webp[Q=80,effort=0]" },
+        BenchCase { label: "WebP lossy Q80 eff=4",   opts: EncodeOptions::Webp(WebpEncodeOptions { quality: 80, effort: 4, ..Default::default() }), vips_suffix: ".webp[Q=80,effort=4]" },
+        BenchCase { label: "WebP lossy Q80 eff=6",   opts: EncodeOptions::Webp(WebpEncodeOptions { quality: 80, effort: 6, ..Default::default() }), vips_suffix: ".webp[Q=80,effort=6]" },
+        BenchCase { label: "WebP lossy Q90 eff=4",   opts: EncodeOptions::Webp(WebpEncodeOptions { quality: 90, effort: 4, ..Default::default() }), vips_suffix: ".webp[Q=90,effort=4]" },
+        // Near-lossless: near_lossless=1 enables it; Q controls preprocessing quality (100=lossless, 0=max lossy preprocessing)
+        BenchCase { label: "WebP near-lossless Q80", opts: EncodeOptions::Webp(WebpEncodeOptions { near_lossless: true, quality: 80, effort: 4, ..Default::default() }), vips_suffix: ".webp[near_lossless=1,Q=80]" },
+        BenchCase { label: "WebP near-lossless Q40", opts: EncodeOptions::Webp(WebpEncodeOptions { near_lossless: true, quality: 40, effort: 4, ..Default::default() }), vips_suffix: ".webp[near_lossless=1,Q=40]" },
+        // Lossless: effort sweep
+        BenchCase { label: "WebP lossless eff=0",    opts: EncodeOptions::Webp(WebpEncodeOptions { lossless: true, effort: 0, ..Default::default() }), vips_suffix: ".webp[lossless=1,effort=0]" },
+        BenchCase { label: "WebP lossless eff=4",    opts: EncodeOptions::Webp(WebpEncodeOptions { lossless: true, effort: 4, ..Default::default() }), vips_suffix: ".webp[lossless=1,effort=4]" },
+        BenchCase { label: "WebP lossless eff=6",    opts: EncodeOptions::Webp(WebpEncodeOptions { lossless: true, effort: 6, ..Default::default() }), vips_suffix: ".webp[lossless=1,effort=6]" },
+    ]
+}
 
-    for (name, img) in images {
-        println!("## {name}\n");
-        println!("| Codec/Option | Speed (ms) | Size (KB) | PSNR (dB) | vips (ms) | vips size |");
-        println!("|--------------|------------|-----------|-----------|-----------|-----------|");
-        for case in &cases {
-            let (ms, size_kb, psnr_val) = bench_encode(case.label, &img, &case.opts, runs);
-            let vips = vips_encode_bench(case.vips_suffix, &img, runs);
-            println!(
-                "| {} | {:>10.1} | {:>9} | {:>9} | {:>9} | {:>9} |",
-                case.label,
-                ms,
-                size_kb,
-                fmt_psnr(psnr_val),
-                fmt_opt_f64(vips.map(|(v, _)| v)),
-                fmt_opt_usize(vips.map(|(_, s)| s)),
-            );
+fn png_cases() -> Vec<BenchCase> {
+    vec![
+        BenchCase { label: "PNG level=1", opts: EncodeOptions::Png(PngEncodeOptions { compression: 1, ..Default::default() }), vips_suffix: ".png[compression=1]" },
+        BenchCase { label: "PNG level=3", opts: EncodeOptions::Png(PngEncodeOptions { compression: 3, ..Default::default() }), vips_suffix: ".png[compression=3]" },
+        BenchCase { label: "PNG level=6", opts: EncodeOptions::Png(PngEncodeOptions { compression: 6, ..Default::default() }), vips_suffix: ".png[compression=6]" },
+        BenchCase { label: "PNG level=9", opts: EncodeOptions::Png(PngEncodeOptions { compression: 9, ..Default::default() }), vips_suffix: ".png[compression=9]" },
+    ]
+}
+
+fn jxl_cases() -> Vec<BenchCase> {
+    vec![
+        // Lossy: distance sweep at effort=5
+        BenchCase { label: "JXL d=3.0 eff=3", opts: EncodeOptions::Jxl(JxlEncodeOptions { distance: Some(3.0), effort: 3, ..Default::default() }), vips_suffix: ".jxl[distance=3.0,effort=3]" },
+        BenchCase { label: "JXL d=2.0 eff=3", opts: EncodeOptions::Jxl(JxlEncodeOptions { distance: Some(2.0), effort: 3, ..Default::default() }), vips_suffix: ".jxl[distance=2.0,effort=3]" },
+        BenchCase { label: "JXL d=1.0 eff=5", opts: EncodeOptions::Jxl(JxlEncodeOptions { distance: Some(1.0), effort: 5, ..Default::default() }), vips_suffix: ".jxl[distance=1.0,effort=5]" },
+        BenchCase { label: "JXL d=0.5 eff=7", opts: EncodeOptions::Jxl(JxlEncodeOptions { distance: Some(0.5), effort: 7, ..Default::default() }), vips_suffix: ".jxl[distance=0.5,effort=7]" },
+        BenchCase { label: "JXL d=0.1 eff=7", opts: EncodeOptions::Jxl(JxlEncodeOptions { distance: Some(0.1), effort: 7, ..Default::default() }), vips_suffix: ".jxl[distance=0.1,effort=7]" },
+        // Effort sweep at d=1.0
+        BenchCase { label: "JXL d=1.0 eff=3", opts: EncodeOptions::Jxl(JxlEncodeOptions { distance: Some(1.0), effort: 3, ..Default::default() }), vips_suffix: ".jxl[distance=1.0,effort=3]" },
+        BenchCase { label: "JXL d=1.0 eff=7", opts: EncodeOptions::Jxl(JxlEncodeOptions { distance: Some(1.0), effort: 7, ..Default::default() }), vips_suffix: ".jxl[distance=1.0,effort=7]" },
+        // Lossless: effort sweep
+        BenchCase { label: "JXL lossless eff=1", opts: EncodeOptions::Jxl(JxlEncodeOptions { lossless: true, effort: 1, ..Default::default() }), vips_suffix: ".jxl[lossless=1,effort=1]" },
+        BenchCase { label: "JXL lossless eff=3", opts: EncodeOptions::Jxl(JxlEncodeOptions { lossless: true, effort: 3, ..Default::default() }), vips_suffix: ".jxl[lossless=1,effort=3]" },
+        BenchCase { label: "JXL lossless eff=5", opts: EncodeOptions::Jxl(JxlEncodeOptions { lossless: true, effort: 5, ..Default::default() }), vips_suffix: ".jxl[lossless=1,effort=5]" },
+        BenchCase { label: "JXL lossless eff=7", opts: EncodeOptions::Jxl(JxlEncodeOptions { lossless: true, effort: 7, ..Default::default() }), vips_suffix: ".jxl[lossless=1,effort=7]" },
+    ]
+}
+
+fn tiff_cases() -> Vec<BenchCase> {
+    vec![
+        BenchCase { label: "TIFF LZW",      opts: EncodeOptions::Tiff(TiffEncodeOptions { compression: TiffCompression::Lzw,     ..Default::default() }), vips_suffix: ".tif[compression=lzw]" },
+        BenchCase { label: "TIFF deflate",   opts: EncodeOptions::Tiff(TiffEncodeOptions { compression: TiffCompression::Deflate, ..Default::default() }), vips_suffix: ".tif[compression=deflate]" },
+        BenchCase { label: "TIFF packbits",  opts: EncodeOptions::Tiff(TiffEncodeOptions { compression: TiffCompression::Packbits, ..Default::default() }), vips_suffix: ".tif[compression=packbits]" },
+        BenchCase { label: "TIFF none",      opts: EncodeOptions::Tiff(TiffEncodeOptions { compression: TiffCompression::None,    ..Default::default() }), vips_suffix: ".tif[compression=none]" },
+    ]
+}
+
+#[cfg(feature = "avif")]
+fn avif_cases() -> Vec<BenchCase> {
+    vec![
+        BenchCase { label: "AVIF Q60 spd=6",  opts: EncodeOptions::Avif(AvifEncodeOptions { quality: 60, effort: 6, ..Default::default() }), vips_suffix: ".avif[Q=60,speed=6]" },
+        BenchCase { label: "AVIF Q80 spd=6",  opts: EncodeOptions::Avif(AvifEncodeOptions { quality: 80, effort: 6, ..Default::default() }), vips_suffix: ".avif[Q=80,speed=6]" },
+        BenchCase { label: "AVIF Q80 spd=4",  opts: EncodeOptions::Avif(AvifEncodeOptions { quality: 80, effort: 4, ..Default::default() }), vips_suffix: ".avif[Q=80,speed=4]" },
+        BenchCase { label: "AVIF Q95 spd=6",  opts: EncodeOptions::Avif(AvifEncodeOptions { quality: 95, effort: 6, ..Default::default() }), vips_suffix: ".avif[Q=95,speed=6]" },
+    ]
+}
+
+fn all_cases() -> Vec<(&'static str, Vec<BenchCase>)> {
+    let groups: Vec<(&'static str, Vec<BenchCase>)> = vec![
+        ("JPEG",  jpeg_cases()),
+        ("WebP",  webp_cases()),
+        ("PNG",   png_cases()),
+        ("JXL",   jxl_cases()),
+        ("TIFF",  tiff_cases()),
+    ];
+    #[cfg(feature = "avif")]
+    groups.push(("AVIF", avif_cases()));
+    groups
+}
+
+fn make_image(pixels: Vec<u8>, w: u32, h: u32) -> DecodedImage {
+    DecodedImage { pixels, alpha: None, icc: None, exif: None, width: w, height: h }
+}
+
+fn main() {
+    // Sizes: tile (256×256), medium (800×600), HD (1920×1080)
+    let sizes: &[(u32, u32, &str)] = &[
+        (256,  256,  "256×256 (tile)"),
+        (800,  600,  "800×600"),
+        (1920, 1080, "1920×1080 (HD)"),
+    ];
+
+    let image_types: &[(&str, fn(u32, u32) -> Vec<u8>)] = &[
+        ("photo",    synthetic_photo),
+        ("document", document_pattern),
+        ("gradient", gradient),
+    ];
+
+    let runs = 5;
+    let groups = all_cases();
+
+    // ── per image-type × size: full codec sweep ──────────────────────────
+    for (img_type, make_pixels) in image_types {
+        for &(w, h, size_label) in sizes {
+            let img = make_image(make_pixels(w, h), w, h);
+            println!("## {img_type} {size_label}\n");
+            println!("| Codec/Option | crab ms | crab KB | PSNR | vips ms | vips KB |");
+            println!("|---|---|---|---|---|---|");
+            for (group_name, cases) in &groups {
+                println!("| **{group_name}** | | | | | |");
+                for case in cases {
+                    let (ms, size_kb, psnr_val) = bench_encode(case.label, &img, &case.opts, runs);
+                    let vips = vips_encode_bench(case.vips_suffix, &img, runs);
+                    println!(
+                        "| {} | {:.1} | {} | {} | {} | {} |",
+                        case.label,
+                        ms,
+                        size_kb,
+                        fmt_psnr(psnr_val),
+                        fmt_opt_f64(vips.map(|(v, _)| v)),
+                        fmt_opt_usize(vips.map(|(_, s)| s)),
+                    );
+                }
+            }
+            println!();
         }
-        println!();
     }
 }
+

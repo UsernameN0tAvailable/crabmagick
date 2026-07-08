@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use crabmagick_core::pipeline::{self, JxlEncodeOptions};
 use crabmagick_core::processor::EncodeOptions;
-use crabmagick_core::{get_info, init, CrabMagickError, ImageInfo, OutputFormat};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use libvips::{ops, VipsImage};
+use crabmagick_core::{CrabMagickError, ImageInfo, OutputFormat, get_info, init};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use libvips::{VipsImage, ops};
 
 const STORAGE_ROOT: &str = "/home/mattia/Work/IIIF_Server/var/storage";
 const REGION_SIDE: u32 = 256;

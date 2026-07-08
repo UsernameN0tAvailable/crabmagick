@@ -528,7 +528,8 @@ impl EffortProfile {
             pixel_domain_loss: false, // N/A for lossless
             error_diffusion: false,   // N/A for lossless
             patches: effort >= 5,
-            tree_learning: effort >= 7,
+            // libjxl enables tree learning at kKitten (effort 5) with nb_repeats=0.5
+            tree_learning: effort >= 5,
             lz77: effort >= 7,
             lz77_method: match effort {
                 0..=6 => Lz77Method::Rle,
@@ -1062,7 +1063,7 @@ mod tests {
     fn test_lossless_reference_e4() {
         let p = EffortProfile::lossless(4, EncoderMode::Reference);
         assert!(p.use_ans);
-        assert!(!p.tree_learning); // e7+
+        assert!(!p.tree_learning); // e5+
         assert!(!p.lz77); // e7+
         assert!(!p.patches); // e5+
     }

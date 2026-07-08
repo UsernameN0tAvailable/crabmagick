@@ -694,18 +694,32 @@ fn avif_q80_roundtrip() {
 fn jpeg_quality_psnr_ordering() {
     // PSNR must increase with quality for same image
     let (w, h) = (800u32, 600u32);
-    let mut px = vec![255u8; (w*h*3) as usize];
+    let mut px = vec![255u8; (w * h * 3) as usize];
     for y in 0..h as usize {
         for x in 0..w as usize {
             let tb = (y / 7) % 2 == 0;
             let gl = ((x / 5) + (y / 11)) % 9 < 4;
             let mg = x > 18 && x + 18 < w as usize && y > 18 && y + 18 < h as usize;
-            if tb && gl && mg { let i = (y*w as usize+x)*3; px[i]=0; px[i+1]=0; px[i+2]=0; }
+            if tb && gl && mg {
+                let i = (y * w as usize + x) * 3;
+                px[i] = 0;
+                px[i + 1] = 0;
+                px[i + 2] = 0;
+            }
         }
     }
-    let opts_75 = EncodeOptions::Jpeg(JpegEncodeOptions { quality: 75, ..Default::default() });
-    let opts_85 = EncodeOptions::Jpeg(JpegEncodeOptions { quality: 85, ..Default::default() });
-    let opts_95 = EncodeOptions::Jpeg(JpegEncodeOptions { quality: 95, ..Default::default() });
+    let opts_75 = EncodeOptions::Jpeg(JpegEncodeOptions {
+        quality: 75,
+        ..Default::default()
+    });
+    let opts_85 = EncodeOptions::Jpeg(JpegEncodeOptions {
+        quality: 85,
+        ..Default::default()
+    });
+    let opts_95 = EncodeOptions::Jpeg(JpegEncodeOptions {
+        quality: 95,
+        ..Default::default()
+    });
     let (_, dec75) = encode_roundtrip(px.clone(), w, h, &opts_75);
     let (_, dec85) = encode_roundtrip(px.clone(), w, h, &opts_85);
     let (_, dec95) = encode_roundtrip(px.clone(), w, h, &opts_95);
