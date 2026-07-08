@@ -28,6 +28,9 @@
 
 use rayon::prelude::*;
 
+#[cfg(target_arch = "x86_64")]
+include!("yuv_avx2.rs");
+
 /// `_mm_mulhi_epu16` emulation
 fn mulhi(v: u8, coeff: u16) -> i32 {
     ((u32::from(v) * u32::from(coeff)) >> 8) as i32
@@ -161,8 +164,36 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
     }
 }
 
-/// Fills a row with the fancy interpolation as detailed
+/// Fills a row with the fancy interpolation as detailed.
+///
+/// Dispatches to an AVX2 fast path for RGB (BPP = 3) when available, otherwise
+/// falls back to the scalar implementation.
 fn fill_row_fancy_with_2_uv_rows<const BPP: usize>(
+    row_buffer: &mut [u8],
+    y_row: &[u8],
+    u_row_1: &[u8],
+    u_row_2: &[u8],
+    v_row_1: &[u8],
+    v_row_2: &[u8],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if BPP == 3 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the runtime `avx2` feature detection above.
+            unsafe {
+                fill_row_fancy_rgb_avx2(row_buffer, y_row, u_row_1, u_row_2, v_row_1, v_row_2);
+            }
+            return;
+        }
+    }
+
+    fill_row_fancy_with_2_uv_rows_scalar::<BPP>(
+        row_buffer, y_row, u_row_1, u_row_2, v_row_1, v_row_2,
+    );
+}
+
+/// Scalar implementation of the fancy interpolation for a row with two chroma rows.
+fn fill_row_fancy_with_2_uv_rows_scalar<const BPP: usize>(
     row_buffer: &mut [u8],
     y_row: &[u8],
     u_row_1: &[u8],
@@ -458,5 +489,57 @@ mod tests {
         assert_eq!(yuv_to_r(y, v), 80);
         assert_eq!(yuv_to_g(y, u, v), 255);
         assert_eq!(yuv_to_b(y, u), 40);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        // Exercise several widths (even and odd) to cover the vectorized bulk,
+        // the scalar tail, the first pixel and the final leftover pixel.
+        for &width in &[7usize, 8, 15, 16, 33, 64, 65, 100, 101, 257] {
+            let chroma_width = width.div_ceil(2);
+
+            // Deterministic pseudo-random-ish content.
+            let make = |seed: usize, len: usize| -> Vec<u8> {
+                (0..len)
+                    .map(|i| ((i.wrapping_mul(2654435761).wrapping_add(seed.wrapping_mul(40503))) >> 5) as u8)
+                    .collect()
+            };
+            let y_row = make(1, width);
+            let u_row_1 = make(2, chroma_width);
+            let u_row_2 = make(3, chroma_width);
+            let v_row_1 = make(4, chroma_width);
+            let v_row_2 = make(5, chroma_width);
+
+            let mut scalar_buf = vec![0u8; width * 3];
+            let mut avx2_buf = vec![0u8; width * 3];
+
+            fill_row_fancy_with_2_uv_rows_scalar::<3>(
+                &mut scalar_buf,
+                &y_row,
+                &u_row_1,
+                &u_row_2,
+                &v_row_1,
+                &v_row_2,
+            );
+
+            // SAFETY: guarded by the avx2 feature detection above.
+            unsafe {
+                fill_row_fancy_rgb_avx2(
+                    &mut avx2_buf,
+                    &y_row,
+                    &u_row_1,
+                    &u_row_2,
+                    &v_row_1,
+                    &v_row_2,
+                );
+            }
+
+            assert_eq!(scalar_buf, avx2_buf, "AVX2 output differs from scalar at width {width}");
+        }
     }
 }

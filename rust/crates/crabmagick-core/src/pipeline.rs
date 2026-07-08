@@ -2169,4 +2169,61 @@ mod encoder_roundtrip_tests {
         assert!(encode_bmp_rgb(&bad, 64, 48).is_err());
         assert!(encode_gif_rgb(&bad, 64, 48, 90).is_err());
     }
+
+    #[test]
+    fn jpeg_decoder_roundtrip() {
+        let (w, h) = (64u32, 64u32);
+        let src = sample_rgb(w, h);
+        // Encode at high quality with 4:4:4 subsampling so the lossy error stays small.
+        let config = EncoderConfig::ycbcr(95u8, ChromaSubsampling::None);
+        let mut enc = config
+            .encode_from_bytes(w, h, ZenLayout::Rgb8Srgb)
+            .expect("jpeg encoder init");
+        enc.push_packed(&src, Unstoppable).expect("jpeg push pixels");
+        let jpeg = enc.finish().expect("jpeg encode");
+
+        let decoded = decode_jpeg_fast(&jpeg).expect("jpeg decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels.len(), src.len());
+        for (o, d) in src.iter().zip(decoded.pixels.iter()) {
+            let diff = (i32::from(*o) - i32::from(*d)).abs();
+            assert!(diff <= 4, "JPEG pixel diff {diff} > 4");
+        }
+    }
+
+    #[test]
+    fn webp_decoder_roundtrip() {
+        // NOTE: the crate's own `encode_lossy_webp` currently produces bitstreams that
+        // the decoder cannot reproduce faithfully (a pre-existing VP8 encoder bug), so
+        // this test decodes a reference WebP produced by libwebp (via Pillow) from the
+        // same gradient and checks our lossy VP8 + YUV->RGB path against the source.
+        let (w, h) = (64u32, 64u32);
+        let src = sample_rgb(w, h);
+        let webp = include_bytes!("../tests/data/gradient_64.webp");
+
+        let decoded = decode_webp_fast(webp).expect("webp decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels.len(), src.len());
+        for (o, d) in src.iter().zip(decoded.pixels.iter()) {
+            let diff = (i32::from(*o) - i32::from(*d)).abs();
+            assert!(diff <= 8, "WebP pixel diff {diff} > 8");
+        }
+    }
+
+    #[test]
+    fn png_decoder_roundtrip() {
+        let (w, h) = (64u32, 64u32);
+        let src = sample_rgb(w, h);
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&src, w, h, ColorType::Rgb8.into())
+            .expect("png encode");
+
+        let decoded = decode_via_image(&png).expect("png decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels, src, "PNG roundtrip must be lossless");
+    }
 }

@@ -16,7 +16,7 @@ use crate::jpeg_decode::errors::DecodeErrors;
 
 /// Determines how many bits of lookahead we have for our bitstream decoder.
 
-pub const HUFF_LOOKAHEAD: u8 = 9;
+pub const HUFF_LOOKAHEAD: u8 = 11;
 
 /// A struct which contains necessary tables for decoding a JPEG
 /// huffman encoded bitstream
