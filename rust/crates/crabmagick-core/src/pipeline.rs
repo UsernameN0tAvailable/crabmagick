@@ -914,6 +914,13 @@ pub fn encode(
             crate::webp_decode::encode_lossy_webp(&rgb, quality.min(100))
                 .map_err(|error| encode_error(format!("WebP encoding failed: {error}")))
         }
+        OutputFormat::WebpLossless => {
+            let mut out = Vec::new();
+            crate::webp_decode::WebPEncoder::new(&mut out)
+                .encode(&pixels, width, height, crate::webp_decode::ColorType::Rgb8)
+                .map_err(|error| encode_error(format!("lossless WebP encoding failed: {error}")))?;
+            Ok(out)
+        }
         OutputFormat::Png => {
             let mut out = Vec::new();
             PngEncoder::new(&mut out)
@@ -2131,6 +2138,26 @@ mod encoder_roundtrip_tests {
         pixels
     }
 
+    fn assert_jxl_lossless_roundtrip(effort: u8) {
+        let (w, h) = (64u32, 48u32);
+        let src = sample_rgb(w, h);
+        let encoded = encode_jxl_rgb(
+            &src,
+            w,
+            h,
+            &JxlEncodeOptions {
+                lossless: true,
+                effort,
+                ..JxlEncodeOptions::default()
+            },
+        )
+        .expect("jxl lossless encode");
+        let decoded = decode_jxl_from_bytes(&encoded).expect("jxl lossless decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels, src, "JXL lossless roundtrip must be pixel-perfect");
+    }
+
     #[test]
     fn tiff_roundtrip_is_lossless() {
         let (w, h) = (64u32, 48u32);
@@ -2220,6 +2247,36 @@ mod encoder_roundtrip_tests {
             let diff = (i32::from(*o) - i32::from(*d)).abs();
             assert!(diff <= 8, "WebP pixel diff {diff} > 8");
         }
+    }
+
+    #[test]
+    fn webp_lossless_roundtrip_is_exact() {
+        let (w, h) = (64u32, 64u32);
+        let src = sample_rgb(w, h);
+        let mut encoded = Vec::new();
+        crate::webp_decode::WebPEncoder::new(&mut encoded)
+            .encode(&src, w, h, crate::webp_decode::ColorType::Rgb8)
+            .expect("webp lossless encode");
+
+        let decoded = decode_webp_fast(&encoded).expect("webp lossless decode");
+        assert_eq!(decoded.width, w);
+        assert_eq!(decoded.height, h);
+        assert_eq!(decoded.pixels, src, "lossless WebP roundtrip must be pixel-perfect");
+    }
+
+    #[test]
+    fn jxl_lossless_roundtrip_is_exact() {
+        assert_jxl_lossless_roundtrip(5);
+    }
+
+    #[test]
+    fn jxl_lossless_roundtrip_effort1() {
+        assert_jxl_lossless_roundtrip(1);
+    }
+
+    #[test]
+    fn jxl_lossless_roundtrip_effort9() {
+        assert_jxl_lossless_roundtrip(9);
     }
 
     #[test]

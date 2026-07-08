@@ -14,8 +14,10 @@ use crate::pipeline::{
 pub enum OutputFormat {
     /// Baseline JPEG output encoded through bundled JPEG encoder.
     Jpeg,
-    /// Lossy WebP output encoded through bundled WebP decoder.
+    /// Lossy WebP output encoded through bundled WebP encoder.
     Webp,
+    /// Lossless WebP output via VP8L.
+    WebpLossless,
     /// PNG output encoded through the `image` crate.
     Png,
     /// JPEG XL output encoded through bundled JXL encoder.

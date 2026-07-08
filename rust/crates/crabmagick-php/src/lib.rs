@@ -181,6 +181,7 @@ fn parse_format(s: &str) -> PhpResult<OutputFormat> {
     match s.to_ascii_lowercase().as_str() {
         "jpg" | "jpeg" => Ok(OutputFormat::Jpeg),
         "webp" => Ok(OutputFormat::Webp),
+        "webp-lossless" | "webp_lossless" | "webplossless" => Ok(OutputFormat::WebpLossless),
         "png" => Ok(OutputFormat::Png),
         "jxl" => Ok(OutputFormat::Jxl),
         "avif" => Ok(OutputFormat::Avif),

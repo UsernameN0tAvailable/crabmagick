@@ -1,4 +1,4 @@
-use crabmagick_core::pipeline::{encode, DecodedImage};
+use crabmagick_core::pipeline::{encode, encode_jxl_rgb, DecodedImage, JxlEncodeOptions};
 use crabmagick_core::processor::OutputFormat;
 use std::time::Instant;
 
@@ -39,8 +39,12 @@ fn bench(label: &str, mut f: impl FnMut() -> Vec<u8>) {
 }
 
 fn main() {
-    let Some(img) = load_ppm("/tmp/test_bench.ppm") else {
-        eprintln!("No /tmp/test_bench.ppm — run bench_formats first to create test images");
+    let ppm_path = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("CRABMAGICK_BENCH_PPM").ok())
+        .unwrap_or_else(|| "/tmp/test_bench.ppm".to_string());
+    let Some(img) = load_ppm(&ppm_path) else {
+        eprintln!("No benchmark PPM at {ppm_path} — pass a path arg, set CRABMAGICK_BENCH_PPM, or create /tmp/test_bench.ppm");
         return;
     };
     let (w, h) = (img.width, img.height);
@@ -51,7 +55,27 @@ fn main() {
 
     bench("JPEG Q90 encode",  || encode(mk(&px), OutputFormat::Jpeg, 90).unwrap());
     bench("WebP Q90 encode",  || encode(mk(&px), OutputFormat::Webp, 90).unwrap());
+    bench("WebP lossless encode", || encode(mk(&px), OutputFormat::WebpLossless, 90).unwrap());
     bench("PNG encode",       || encode(mk(&px), OutputFormat::Png, 90).unwrap());
     bench("JXL d1.0 encode",  || encode(mk(&px), OutputFormat::Jxl, 90).unwrap());
+    for effort in [1u8, 3, 5, 7, 9] {
+        bench(&format!("JXL lossy d1.0 effort={effort}"), || {
+            encode_jxl_rgb(&px, w, h, &JxlEncodeOptions {
+                lossless: false,
+                effort,
+                distance: Some(1.0),
+                ..JxlEncodeOptions::default()
+            }).unwrap()
+        });
+    }
+    for effort in [1u8, 3, 5, 7, 9] {
+        bench(&format!("JXL lossless effort={effort}"), || {
+            encode_jxl_rgb(&px, w, h, &JxlEncodeOptions {
+                lossless: true,
+                effort,
+                ..JxlEncodeOptions::default()
+            }).unwrap()
+        });
+    }
     bench("TIFF LZW encode",  || encode(mk(&px), OutputFormat::Tiff, 90).unwrap());
 }
