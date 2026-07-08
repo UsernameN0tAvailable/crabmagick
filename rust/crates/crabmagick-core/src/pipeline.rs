@@ -16,10 +16,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::jxl_decode::jxl_oxide::{CropInfo, JxlImage, JxlThreadPool, PixelFormat, XybSrgbParams};
 use fast_image_resize as fir;
 use image::{
+    ColorType, GenericImageView, ImageEncoder,
     codecs::png::{
         CompressionType as ImagePngCompressionType, FilterType as ImagePngFilter, PngEncoder,
     },
-    ColorType, GenericImageView, ImageEncoder, RgbImage,
 };
 use lru::LruCache;
 use memmap2::Mmap;
@@ -1025,11 +1025,18 @@ fn encode_webp_rgb(
             .map_err(|error| encode_error(format!("lossless WebP encoding failed: {error}")))?;
         Ok(out)
     } else {
-        let _ = (options.effort, options.alpha_quality);
-        let rgb = RgbImage::from_raw(width, height, pixels.to_vec())
-            .ok_or_else(|| encode_error("WebP encoding received an invalid RGB buffer shape"))?;
-        crate::webp_decode::encode_lossy_webp(&rgb, options.quality.min(100))
-            .map_err(|error| encode_error(format!("WebP encoding failed: {error}")))
+        let mut config = webp::WebPConfig::new().map_err(|error| {
+            encode_error(format!("WebP config initialization failed: {error:?}"))
+        })?;
+        config.lossless = 0;
+        config.quality = options.quality.min(100) as f32;
+        config.method = options.effort.min(6) as i32;
+        config.alpha_quality = options.alpha_quality.min(100) as i32;
+
+        webp::Encoder::from_rgb(pixels, width, height)
+            .encode_advanced(&config)
+            .map(|encoded| encoded.to_vec())
+            .map_err(|error| encode_error(format!("WebP encoding failed: {error:?}")))
     }
 }
 

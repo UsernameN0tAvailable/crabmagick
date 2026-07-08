@@ -1,16 +1,62 @@
-//! Codec correctness smoke test using only the public API.
-//!
-//! Encodes a synthetic RGB image to **lossless** JPEG XL and decodes it back through the
-//! full public decode pipeline, asserting byte-for-byte reconstruction. Lossless mode makes
-//! the round-trip exact, so any regression in the entropy decoder (the ANS hot path in
-//! `jxl_coding::ans`), the modular decoder, or the render pipeline shows up as either a decode
-//! error, a dimension mismatch, or a non-zero pixel difference.
+//! Comprehensive codec roundtrip coverage using only the public API.
 
-use crabmagick_core::JxlEncodeOptions;
-use crabmagick_core::pipeline::{decode_jxl_from_bytes, encode_jxl_rgb};
+use std::io::Write;
+use std::path::Path;
 
-/// Builds a deterministic `width * height` RGB image with per-channel gradients plus a small
-/// high-frequency component so the entropy coder has non-trivial content to round-trip.
+use crabmagick_core::pipeline::{
+    DecodedImage, JxlEncodeOptions as RawJxlEncodeOptions, decode_any_with_options,
+    decode_jxl_from_bytes, encode, encode_jxl_rgb,
+};
+#[cfg(feature = "avif")]
+use crabmagick_core::processor::AvifEncodeOptions;
+use crabmagick_core::processor::{
+    ChromaSubsampling, EncodeOptions, GifEncodeOptions, JpegEncodeOptions,
+    JxlEncodeOptions as ProcJxlEncodeOptions, PngEncodeOptions, TiffCompression, TiffEncodeOptions,
+    WebpEncodeOptions,
+};
+
+/// Compute PSNR (dB) between two u8 RGB buffers. Returns f64::INFINITY for identical inputs.
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mse: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            let d = x as f64 - y as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / a.len() as f64;
+    if mse == 0.0 {
+        return f64::INFINITY;
+    }
+    20.0 * f64::log10(255.0) - 10.0 * f64::log10(mse)
+}
+
+/// Synthetic photo-like test image (W×H RGB): perlin-ish using bit patterns.
+fn synthetic_photo(w: u32, h: u32) -> Vec<u8> {
+    let mut px = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = ((x.wrapping_mul(3) ^ y.wrapping_mul(5)) & 0xff) as u8;
+            let g = ((x.wrapping_mul(7) ^ y.wrapping_mul(11)) & 0xff) as u8;
+            let b = ((x.wrapping_mul(13) ^ y.wrapping_mul(17)) & 0xff) as u8;
+            px.extend_from_slice(&[r, g, b]);
+        }
+    }
+    px
+}
+
+/// Decode any encoded buffer back to RGB pixels using the pipeline.
+fn decode_to_rgb(encoded: &[u8]) -> (u32, u32, Vec<u8>) {
+    let mut f = tempfile::NamedTempFile::new_in(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+    f.write_all(encoded).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let result = decode_any_with_options(&path, None, false, 0, None)
+        .unwrap_or_else(|e| panic!("decode failed: {e}"));
+    (result.width, result.height, result.pixels)
+}
+
 fn synthetic_rgb(width: u32, height: u32) -> Vec<u8> {
     let mut pixels = Vec::with_capacity((width * height * 3) as usize);
     for y in 0..height {
@@ -24,15 +70,95 @@ fn synthetic_rgb(width: u32, height: u32) -> Vec<u8> {
     pixels
 }
 
+fn smooth_gradient(w: u32, h: u32) -> Vec<u8> {
+    let mut px = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = (x * 255 / w.max(1)) as u8;
+            let g = (y * 255 / h.max(1)) as u8;
+            let b = (((x + y) * 255) / (w + h).max(1)) as u8;
+            px.extend_from_slice(&[r, g, b]);
+        }
+    }
+    px
+}
+
+fn lossy_test_image(w: u32, h: u32) -> Vec<u8> {
+    smooth_gradient(w, h)
+}
+
+fn webp_test_image(w: u32, h: u32) -> Vec<u8> {
+    let mut px = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..(w * h) {
+        px.extend_from_slice(&[160, 160, 160]);
+    }
+    px
+}
+
+fn document_pattern(w: u32, h: u32) -> Vec<u8> {
+    let mut px = vec![255u8; (w * h * 3) as usize];
+    let stride = (w * 3) as usize;
+    for y in 0..h {
+        for x in 0..w {
+            let text_band = (y / 6) % 2 == 0;
+            let glyph = ((x / 5) + (y / 9)) % 7 < 3;
+            let margin = x > 6 && x + 6 < w && y > 6 && y + 6 < h;
+            if text_band && glyph && margin {
+                let idx = y as usize * stride + x as usize * 3;
+                px[idx..idx + 3].copy_from_slice(&[0, 0, 0]);
+            }
+        }
+    }
+    px
+}
+
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| x.abs_diff(y) as u64)
+        .sum::<u64>() as f64
+        / a.len() as f64
+}
+
+fn encode_roundtrip(
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    opts: &EncodeOptions,
+) -> (Vec<u8>, Vec<u8>) {
+    let encoded = encode(
+        DecodedImage {
+            pixels: pixels.clone(),
+            width,
+            height,
+        },
+        opts,
+    )
+    .expect("encode failed");
+    let (decoded_w, decoded_h, decoded) = decode_to_rgb(&encoded);
+    assert_eq!((decoded_w, decoded_h), (width, height));
+    (encoded, decoded)
+}
+
+fn assert_magic(encoded: &[u8], magic: &[u8]) {
+    assert!(
+        encoded.starts_with(magic),
+        "magic mismatch: expected {:x?}, got prefix {:x?}",
+        magic,
+        &encoded[..encoded.len().min(magic.len())]
+    );
+}
+
 #[test]
 fn jxl_lossless_roundtrip_is_exact() {
     let (width, height) = (64u32, 48u32);
     let original = synthetic_rgb(width, height);
 
-    let options = JxlEncodeOptions {
+    let options = RawJxlEncodeOptions {
         lossless: true,
         threads: 1,
-        ..JxlEncodeOptions::default()
+        ..RawJxlEncodeOptions::default()
     };
 
     let encoded = encode_jxl_rgb(&original, width, height, &options)
@@ -63,11 +189,11 @@ fn jxl_lossy_roundtrip_is_close() {
     let (width, height) = (64u32, 64u32);
     let original = synthetic_rgb(width, height);
 
-    let options = JxlEncodeOptions {
+    let options = RawJxlEncodeOptions {
         lossless: false,
         distance: Some(1.0),
         threads: 1,
-        ..JxlEncodeOptions::default()
+        ..RawJxlEncodeOptions::default()
     };
 
     let encoded = encode_jxl_rgb(&original, width, height, &options)
@@ -78,17 +204,447 @@ fn jxl_lossy_roundtrip_is_close() {
     assert_eq!((decoded.width, decoded.height), (width, height));
     assert_eq!(decoded.pixels.len(), original.len());
 
-    // Lossy decode exercises the VarDCT / color-convert path; reconstruction is approximate but
-    // must stay close for a low distance target. A broken DCT or ANS path blows this up.
-    let sum: u64 = decoded
-        .pixels
-        .iter()
-        .zip(original.iter())
-        .map(|(a, b)| a.abs_diff(*b) as u64)
-        .sum();
-    let mean = sum as f64 / original.len() as f64;
+    let mean = mean_abs_diff(&decoded.pixels, &original);
     assert!(
         mean < 8.0,
         "lossy JPEG XL round-trip mean pixel diff too large: {mean}"
     );
+}
+
+#[test]
+fn jpeg_q85_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: 85,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 35.0);
+}
+
+#[test]
+fn jpeg_q95_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: 95,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 42.0);
+}
+
+#[test]
+fn jpeg_progressive_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: 85,
+            progressive: true,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 35.0);
+}
+
+#[test]
+fn jpeg_444_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (encoded, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: 90,
+            chroma_subsampling: ChromaSubsampling::Cs444,
+            ..Default::default()
+        }),
+    );
+    assert_magic(&encoded, &[0xff, 0xd8]);
+    assert!(psnr(&original, &decoded) > 40.0);
+}
+
+#[test]
+fn jpeg_non_aligned_roundtrip() {
+    let (w, h) = (100, 99);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: 85,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 30.0);
+}
+
+#[test]
+fn jpeg_tiny_roundtrip() {
+    let (w, h) = (8, 8);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jpeg(JpegEncodeOptions {
+            quality: 85,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 20.0);
+}
+
+#[test]
+fn webp_q80_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = webp_test_image(w, h);
+    let (encoded, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Webp(WebpEncodeOptions {
+            quality: 80,
+            ..Default::default()
+        }),
+    );
+    assert_magic(&encoded, b"RIFF");
+    assert!(psnr(&original, &decoded) > 30.0);
+}
+
+#[test]
+fn webp_q90_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = webp_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Webp(WebpEncodeOptions {
+            quality: 90,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 35.0);
+}
+
+#[test]
+fn webp_effort0_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = webp_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Webp(WebpEncodeOptions {
+            quality: 80,
+            effort: 0,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 28.0);
+}
+
+#[test]
+fn webp_effort6_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = webp_test_image(w, h);
+    let fast = encode(
+        DecodedImage {
+            pixels: original.clone(),
+            width: w,
+            height: h,
+        },
+        &EncodeOptions::Webp(WebpEncodeOptions {
+            quality: 80,
+            effort: 0,
+            ..Default::default()
+        }),
+    )
+    .expect("encode failed");
+    let (encoded, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Webp(WebpEncodeOptions {
+            quality: 80,
+            effort: 6,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 30.0);
+    assert!(encoded.len() < fast.len());
+}
+
+#[test]
+fn webp_lossless_exact_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = smooth_gradient(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Webp(WebpEncodeOptions {
+            lossless: true,
+            ..Default::default()
+        }),
+    );
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn png_lossless_exact_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = smooth_gradient(w, h);
+    let (encoded, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Png(PngEncodeOptions::default()),
+    );
+    assert_magic(&encoded, &[0x89, 0x50, 0x4e, 0x47]);
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn png_compress1_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = document_pattern(w, h);
+    let (encoded1, decoded1) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Png(PngEncodeOptions {
+            compression: 1,
+            ..Default::default()
+        }),
+    );
+    let encoded9 = encode(
+        DecodedImage {
+            pixels: original.clone(),
+            width: w,
+            height: h,
+        },
+        &EncodeOptions::Png(PngEncodeOptions {
+            compression: 9,
+            ..Default::default()
+        }),
+    )
+    .expect("encode failed");
+    assert_eq!(decoded1, original);
+    assert!(encoded1.len() > encoded9.len());
+}
+
+#[test]
+fn png_compress9_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = document_pattern(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Png(PngEncodeOptions {
+            compression: 9,
+            ..Default::default()
+        }),
+    );
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn png_16bit_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = smooth_gradient(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original,
+        w,
+        h,
+        &EncodeOptions::Png(PngEncodeOptions {
+            bitdepth: 16,
+            ..Default::default()
+        }),
+    );
+    assert_eq!(decoded.len(), (w * h * 3) as usize);
+}
+
+#[test]
+fn jxl_d05_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jxl(ProcJxlEncodeOptions {
+            distance: Some(0.5),
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 45.0);
+}
+
+#[test]
+fn jxl_d20_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jxl(ProcJxlEncodeOptions {
+            distance: Some(2.0),
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 30.0);
+}
+
+#[test]
+fn jxl_effort3_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jxl(ProcJxlEncodeOptions {
+            effort: 3,
+            distance: Some(1.0),
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 35.0);
+}
+
+#[test]
+fn jxl_effort7_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Jxl(ProcJxlEncodeOptions {
+            effort: 7,
+            distance: Some(1.0),
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 38.0);
+}
+
+#[test]
+fn tiff_lzw_exact_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = document_pattern(w, h);
+    let (encoded, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Tiff(TiffEncodeOptions {
+            compression: TiffCompression::Lzw,
+            ..Default::default()
+        }),
+    );
+    assert!(encoded.starts_with(b"II") || encoded.starts_with(b"MM"));
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn tiff_deflate_exact_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = document_pattern(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Tiff(TiffEncodeOptions {
+            compression: TiffCompression::Deflate,
+            ..Default::default()
+        }),
+    );
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn tiff_none_exact_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = document_pattern(w, h);
+    let lzw = encode(
+        DecodedImage {
+            pixels: original.clone(),
+            width: w,
+            height: h,
+        },
+        &EncodeOptions::Tiff(TiffEncodeOptions {
+            compression: TiffCompression::Lzw,
+            ..Default::default()
+        }),
+    )
+    .expect("encode failed");
+    let (encoded, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Tiff(TiffEncodeOptions {
+            compression: TiffCompression::None,
+            ..Default::default()
+        }),
+    );
+    assert_eq!(decoded, original);
+    assert!(encoded.len() > lzw.len());
+}
+
+#[test]
+fn gif_roundtrip_near_lossless() {
+    let (w, h) = (64, 64);
+    let original = smooth_gradient(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Gif(GifEncodeOptions::default()),
+    );
+    assert!(mean_abs_diff(&original, &decoded) < 30.0);
+}
+
+#[test]
+fn bmp_exact_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = synthetic_photo(w, h);
+    let (encoded, decoded) = encode_roundtrip(original.clone(), w, h, &EncodeOptions::Bmp);
+    assert_magic(&encoded, b"BM");
+    assert_eq!(decoded, original);
+}
+
+#[cfg(feature = "avif")]
+#[test]
+fn avif_q80_roundtrip() {
+    let (w, h) = (64, 64);
+    let original = lossy_test_image(w, h);
+    let (_, decoded) = encode_roundtrip(
+        original.clone(),
+        w,
+        h,
+        &EncodeOptions::Avif(AvifEncodeOptions {
+            quality: 80,
+            ..Default::default()
+        }),
+    );
+    assert!(psnr(&original, &decoded) > 30.0);
 }

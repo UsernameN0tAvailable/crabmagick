@@ -46,6 +46,7 @@ tinyvec = { version = "1.10", features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
 ultrahdr-core = { version = "0.3.0", default-features = false }
 web-sys = { version = "0.3", features = ["console"], optional = true }
+webp = "0.3"
 whereat = "0.1.5"
 wide = "1.1"
 yuv = { version = "0.8", features = ["professional_mode"] }
@@ -97,6 +98,7 @@ vendor-upstream-tests = []
 [build-dependencies]
 
 [dev-dependencies]
+tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 libvips = "1.6"
 rand = "0.8"
@@ -105,5 +107,4 @@ fast_ssim2 = { package = "fast-ssim2", version = "0.8" }
 yuvxyb = "0.5"
 butteraugli = "0.9"
 walkdir = "2"
-webp = "0.3"
 jxl = "0.4"
