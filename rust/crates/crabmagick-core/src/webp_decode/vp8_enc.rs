@@ -7,16 +7,27 @@ use rayon::prelude::*;
 use crate::webp_decode::transform;
 use crate::webp_decode::vp8::{
     AC_QUANT, COEFF_BANDS, COEFF_PROBS, COEFF_UPDATE_PROBS, DCT_0, DCT_1, DCT_2, DCT_3, DCT_4,
-    DCT_CAT_BASE, DCT_CAT1, DCT_CAT2, DCT_CAT3, DCT_CAT4, DCT_CAT5, DCT_CAT6, DCT_EOB,
-    DC_QUANT, PROB_DCT_CAT, ZIGZAG,
+    DCT_CAT1, DCT_CAT2, DCT_CAT3, DCT_CAT4, DCT_CAT5, DCT_CAT6, DCT_CAT_BASE, DCT_EOB, DC_QUANT,
+    KEYFRAME_BPRED_MODE_PROBS, PROB_DCT_CAT, ZIGZAG,
 };
 
 const KEYFRAME_YMODE_B_PRED_PROB: u8 = 145;
-const KEYFRAME_BPRED_DC_PROB: u8 = 231;
-const KEYFRAME_UVMODE_DC_PROB: u8 = 142;
+const KEYFRAME_UV_MODE_PROBS: [u8; 3] = [142, 114, 183];
 
 const LUMA_BLOCKS_PER_MB: usize = 16;
 const CHROMA_BLOCKS_PER_MB: usize = 4;
+const B_DC_PRED: u8 = 0;
+const B_TM_PRED: u8 = 1;
+const B_VE_PRED: u8 = 2;
+const B_HE_PRED: u8 = 3;
+const B_LD_PRED: u8 = 4;
+const B_RD_PRED: u8 = 5;
+const B_VR_PRED: u8 = 6;
+const B_VL_PRED: u8 = 7;
+const B_HD_PRED: u8 = 8;
+const B_HU_PRED: u8 = 9;
+const LUMA_WS_STRIDE: usize = 1 + 16 + 4;
+const LUMA_WS_SIZE: usize = (1 + 16) * LUMA_WS_STRIDE;
 
 /// Errors returned by the lossy VP8/WebP encoder.
 #[derive(Debug, Clone)]
@@ -38,6 +49,8 @@ struct MacroBlockData {
     y_nonzero: [bool; LUMA_BLOCKS_PER_MB],
     u_nonzero: [bool; CHROMA_BLOCKS_PER_MB],
     v_nonzero: [bool; CHROMA_BLOCKS_PER_MB],
+    bpred_modes: [u8; LUMA_BLOCKS_PER_MB],
+    chroma_mode: u8,
 }
 
 pub(crate) struct BoolEncoder {
@@ -114,13 +127,16 @@ impl BoolEncoder {
         self.bits
             .chunks(8)
             .map(|chunk| {
-                chunk.iter().enumerate().fold(0u8, |b, (i, &bit)| {
-                    if bit {
-                        b | (0x80u8 >> i)
-                    } else {
-                        b
-                    }
-                })
+                chunk.iter().enumerate().fold(
+                    0u8,
+                    |b, (i, &bit)| {
+                        if bit {
+                            b | (0x80u8 >> i)
+                        } else {
+                            b
+                        }
+                    },
+                )
             })
             .collect()
     }
@@ -133,7 +149,9 @@ pub(crate) fn encode_lossy_webp(img: &RgbImage, quality: u8) -> Result<Vec<u8>, 
     let height = img.height();
 
     if width == 0 || height == 0 {
-        return Err(WebPEncodeError("VP8 encoder does not support empty images".to_owned()));
+        return Err(WebPEncodeError(
+            "VP8 encoder does not support empty images".to_owned(),
+        ));
     }
     if width > 16_383 || height > 16_383 {
         return Err(WebPEncodeError(
@@ -191,7 +209,7 @@ pub(crate) fn encode_lossy_webp(img: &RgbImage, quality: u8) -> Result<Vec<u8>, 
         }
     }
 
-    let first_partition = encode_first_partition(q_idx, mb_width * mb_height);
+    let first_partition = encode_first_partition(q_idx, &macroblocks, mb_width);
     let coeff_partition = encode_coeff_partition(&macroblocks, mb_width);
 
     let vp8_frame = build_vp8_frame(width, height, &first_partition, &coeff_partition)?;
@@ -201,7 +219,7 @@ pub(crate) fn encode_lossy_webp(img: &RgbImage, quality: u8) -> Result<Vec<u8>, 
 #[inline(always)]
 fn quality_to_q_index(quality: u8) -> usize {
     let q = quality.min(100) as usize;
-    (127 * (100 - q) / 100).min(127)
+    ((127 * (100 - q) + 79) / 80).min(127)
 }
 
 #[inline]
@@ -346,50 +364,67 @@ fn encode_macroblock(
         y_nonzero: [false; LUMA_BLOCKS_PER_MB],
         u_nonzero: [false; CHROMA_BLOCKS_PER_MB],
         v_nonzero: [false; CHROMA_BLOCKS_PER_MB],
+        bpred_modes: [B_DC_PRED; LUMA_BLOCKS_PER_MB],
+        chroma_mode: 0,
     };
+    let mut luma_ws = init_luma_workspace(recon_y, y_stride, mb_x, mb_y);
 
     for sub_y in 0..4 {
         for sub_x in 0..4 {
             let block_index = sub_x + sub_y * 4;
             let x = mb_x * 16 + sub_x * 4;
             let y = mb_y * 16 + sub_y * 4;
-            let pred = predict_bdc_4x4(recon_y, y_stride, x, y);
+            let x0 = sub_x * 4 + 1;
+            let y0 = sub_y * 4 + 1;
             let src = read_block_4x4(src_y, y_stride, x, y);
-            let residual = residual_from_prediction(&src, pred);
+            let (mode, pred) = best_luma_mode_4x4(&src, &luma_ws, x0, y0);
+            let residual = residual_from_block_prediction(&src, &pred);
             let dct = fdct4x4(&residual);
             let (coeffs, nonzero) = quantize_block(&dct, q_idx);
-            let recon = reconstruct_from_coeffs(&coeffs, q_idx, pred);
-            write_block_4x4(recon_y, y_stride, x, y, &recon);
+            let recon = reconstruct_from_block_coeffs(&coeffs, q_idx, &pred);
+            write_workspace_block_4x4(&mut luma_ws, x0, y0, &recon);
             data.y_blocks[block_index] = coeffs;
             data.y_nonzero[block_index] = nonzero;
+            data.bpred_modes[block_index] = mode;
         }
+    }
+
+    for row in 0..16 {
+        let dst = (mb_y * 16 + row) * y_stride + mb_x * 16;
+        let src = (row + 1) * LUMA_WS_STRIDE + 1;
+        recon_y[dst..dst + 16].copy_from_slice(&luma_ws[src..src + 16]);
     }
 
     let chroma_x = mb_x * 8;
     let chroma_y = mb_y * 8;
-    let pred_u = predict_dc_8x8(recon_u, uv_stride, chroma_x, chroma_y);
-    let pred_v = predict_dc_8x8(recon_v, uv_stride, chroma_x, chroma_y);
+    let (chroma_mode, pred_u, pred_v) = best_chroma_mode_8x8(
+        src_u, src_v, recon_u, recon_v, uv_stride, chroma_x, chroma_y,
+    );
+    data.chroma_mode = chroma_mode;
 
     for sub_y in 0..2 {
         for sub_x in 0..2 {
             let block_index = sub_x + sub_y * 2;
             let x = chroma_x + sub_x * 4;
             let y = chroma_y + sub_y * 4;
+            let pred_offset = sub_y * 32 + sub_x * 4;
 
             let src_block_u = read_block_4x4(src_u, uv_stride, x, y);
-            let residual_u = residual_from_prediction(&src_block_u, pred_u);
+            let pred_block_u = plane_block_4x4(&pred_u, pred_offset);
+            let residual_u = residual_from_block_prediction(&src_block_u, &pred_block_u);
             let dct_u = fdct4x4(&residual_u);
             let (coeffs_u, nonzero_u) = quantize_block(&dct_u, q_idx);
-            let recon_block_u = reconstruct_from_coeffs(&coeffs_u, q_idx, pred_u);
+            let recon_block_u = reconstruct_from_block_coeffs(&coeffs_u, q_idx, &pred_block_u);
             write_block_4x4(recon_u, uv_stride, x, y, &recon_block_u);
             data.u_blocks[block_index] = coeffs_u;
             data.u_nonzero[block_index] = nonzero_u;
 
             let src_block_v = read_block_4x4(src_v, uv_stride, x, y);
-            let residual_v = residual_from_prediction(&src_block_v, pred_v);
+            let pred_block_v = plane_block_4x4(&pred_v, pred_offset);
+            let residual_v = residual_from_block_prediction(&src_block_v, &pred_block_v);
             let dct_v = fdct4x4(&residual_v);
             let (coeffs_v, nonzero_v) = quantize_block(&dct_v, q_idx);
-            let recon_block_v = reconstruct_from_coeffs(&coeffs_v, q_idx, pred_v);
+            let recon_block_v = reconstruct_from_block_coeffs(&coeffs_v, q_idx, &pred_block_v);
             write_block_4x4(recon_v, uv_stride, x, y, &recon_block_v);
             data.v_blocks[block_index] = coeffs_v;
             data.v_nonzero[block_index] = nonzero_v;
@@ -399,26 +434,415 @@ fn encode_macroblock(
     data
 }
 
-fn predict_bdc_4x4(recon: &[u8], stride: usize, x: usize, y: usize) -> u8 {
-    let mut sum = 4u32;
+fn avg3(left: u8, center: u8, right: u8) -> u8 {
+    ((u16::from(left) + 2 * u16::from(center) + u16::from(right) + 2) >> 2) as u8
+}
 
-    if y == 0 {
-        sum += 4 * 127;
+fn avg2(left: u8, right: u8) -> u8 {
+    ((u16::from(left) + u16::from(right) + 1) >> 1) as u8
+}
+
+fn init_luma_workspace(
+    recon: &[u8],
+    stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> [u8; LUMA_WS_SIZE] {
+    let mut ws = [0u8; LUMA_WS_SIZE];
+    let base_x = mb_x * 16;
+    let base_y = mb_y * 16;
+
+    if mb_y == 0 {
+        ws[1..LUMA_WS_STRIDE].fill(127);
     } else {
-        for dx in 0..4 {
-            sum += u32::from(recon[(y - 1) * stride + x + dx]);
+        let top_row = (base_y - 1) * stride + base_x;
+        ws[1..17].copy_from_slice(&recon[top_row..top_row + 16]);
+        let fill = recon[top_row + 15];
+        if base_x + 20 <= stride {
+            ws[17..21].copy_from_slice(&recon[top_row + 16..top_row + 20]);
+        } else {
+            ws[17..21].fill(fill);
         }
     }
 
-    if x == 0 {
-        sum += 4 * 129;
+    for i in 17..LUMA_WS_STRIDE {
+        ws[4 * LUMA_WS_STRIDE + i] = ws[i];
+        ws[8 * LUMA_WS_STRIDE + i] = ws[i];
+        ws[12 * LUMA_WS_STRIDE + i] = ws[i];
+    }
+
+    if mb_x == 0 {
+        for y in 0..16 {
+            ws[(y + 1) * LUMA_WS_STRIDE] = 129;
+        }
     } else {
-        for dy in 0..4 {
-            sum += u32::from(recon[(y + dy) * stride + x - 1]);
+        for y in 0..16 {
+            ws[(y + 1) * LUMA_WS_STRIDE] = recon[(base_y + y) * stride + base_x - 1];
         }
     }
 
-    (sum >> 3) as u8
+    ws[0] = if mb_y == 0 {
+        127
+    } else if mb_x == 0 {
+        129
+    } else {
+        recon[(base_y - 1) * stride + base_x - 1]
+    };
+
+    ws
+}
+
+fn predict_luma_4x4(mode: u8, ws: &[u8], x0: usize, y0: usize) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let top = (y0 - 1) * LUMA_WS_STRIDE + x0;
+    let left = y0 * LUMA_WS_STRIDE + x0 - 1;
+    let top_left = ws[top - 1];
+
+    match mode {
+        B_DC_PRED => {
+            let mut sum = 4u32;
+            for dx in 0..4 {
+                sum += u32::from(ws[top + dx]);
+            }
+            for dy in 0..4 {
+                sum += u32::from(ws[left + dy * LUMA_WS_STRIDE]);
+            }
+            out.fill((sum >> 3) as u8);
+        }
+        B_TM_PRED => {
+            for dy in 0..4 {
+                let left_val = i32::from(ws[left + dy * LUMA_WS_STRIDE]);
+                for dx in 0..4 {
+                    let top_val = i32::from(ws[top + dx]);
+                    out[dy * 4 + dx] =
+                        (left_val + top_val - i32::from(top_left)).clamp(0, 255) as u8;
+                }
+            }
+        }
+        B_VE_PRED => {
+            let row = [
+                avg3(top_left, ws[top], ws[top + 1]),
+                avg3(ws[top], ws[top + 1], ws[top + 2]),
+                avg3(ws[top + 1], ws[top + 2], ws[top + 3]),
+                avg3(ws[top + 2], ws[top + 3], ws[top + 4]),
+            ];
+            for dy in 0..4 {
+                out[dy * 4..dy * 4 + 4].copy_from_slice(&row);
+            }
+        }
+        B_HE_PRED => {
+            let rows = [
+                avg3(top_left, ws[left], ws[left + LUMA_WS_STRIDE]),
+                avg3(
+                    ws[left],
+                    ws[left + LUMA_WS_STRIDE],
+                    ws[left + 2 * LUMA_WS_STRIDE],
+                ),
+                avg3(
+                    ws[left + LUMA_WS_STRIDE],
+                    ws[left + 2 * LUMA_WS_STRIDE],
+                    ws[left + 3 * LUMA_WS_STRIDE],
+                ),
+                avg3(
+                    ws[left + 2 * LUMA_WS_STRIDE],
+                    ws[left + 3 * LUMA_WS_STRIDE],
+                    ws[left + 3 * LUMA_WS_STRIDE],
+                ),
+            ];
+            for (dy, &value) in rows.iter().enumerate() {
+                out[dy * 4..dy * 4 + 4].fill(value);
+            }
+        }
+        B_LD_PRED => {
+            let avgs = [
+                avg3(ws[top], ws[top + 1], ws[top + 2]),
+                avg3(ws[top + 1], ws[top + 2], ws[top + 3]),
+                avg3(ws[top + 2], ws[top + 3], ws[top + 4]),
+                avg3(ws[top + 3], ws[top + 4], ws[top + 5]),
+                avg3(ws[top + 4], ws[top + 5], ws[top + 6]),
+                avg3(ws[top + 5], ws[top + 6], ws[top + 7]),
+                avg3(ws[top + 6], ws[top + 7], ws[top + 7]),
+            ];
+            for dy in 0..4 {
+                out[dy * 4..dy * 4 + 4].copy_from_slice(&avgs[dy..dy + 4]);
+            }
+        }
+        B_RD_PRED => {
+            let e0 = ws[left + 3 * LUMA_WS_STRIDE];
+            let e1 = ws[left + 2 * LUMA_WS_STRIDE];
+            let e2 = ws[left + LUMA_WS_STRIDE];
+            let e3 = ws[left];
+            let e4 = top_left;
+            let e5 = ws[top];
+            let e6 = ws[top + 1];
+            let e7 = ws[top + 2];
+            let e8 = ws[top + 3];
+            let avgs = [
+                avg3(e0, e1, e2),
+                avg3(e1, e2, e3),
+                avg3(e2, e3, e4),
+                avg3(e3, e4, e5),
+                avg3(e4, e5, e6),
+                avg3(e5, e6, e7),
+                avg3(e6, e7, e8),
+            ];
+            for dy in 0..4 {
+                out[dy * 4..dy * 4 + 4].copy_from_slice(&avgs[3 - dy..7 - dy]);
+            }
+        }
+        B_VR_PRED => {
+            let e1 = ws[left + 2 * LUMA_WS_STRIDE];
+            let e2 = ws[left + LUMA_WS_STRIDE];
+            let e3 = ws[left];
+            let e4 = top_left;
+            let e5 = ws[top];
+            let e6 = ws[top + 1];
+            let e7 = ws[top + 2];
+            let e8 = ws[top + 3];
+            out[12] = avg3(e1, e2, e3);
+            out[8] = avg3(e2, e3, e4);
+            out[13] = avg3(e3, e4, e5);
+            out[4] = avg3(e3, e4, e5);
+            out[9] = avg2(e4, e5);
+            out[0] = avg2(e4, e5);
+            out[14] = avg3(e4, e5, e6);
+            out[5] = avg3(e4, e5, e6);
+            out[10] = avg2(e5, e6);
+            out[1] = avg2(e5, e6);
+            out[15] = avg3(e5, e6, e7);
+            out[6] = avg3(e5, e6, e7);
+            out[11] = avg2(e6, e7);
+            out[2] = avg2(e6, e7);
+            out[7] = avg3(e6, e7, e8);
+            out[3] = avg2(e7, e8);
+        }
+        B_VL_PRED => {
+            let a0 = ws[top];
+            let a1 = ws[top + 1];
+            let a2 = ws[top + 2];
+            let a3 = ws[top + 3];
+            let a4 = ws[top + 4];
+            let a5 = ws[top + 5];
+            let a6 = ws[top + 6];
+            let a7 = ws[top + 7];
+            out[0] = avg2(a0, a1);
+            out[4] = avg3(a0, a1, a2);
+            out[8] = avg2(a1, a2);
+            out[1] = avg2(a1, a2);
+            out[5] = avg3(a1, a2, a3);
+            out[12] = avg3(a1, a2, a3);
+            out[9] = avg2(a2, a3);
+            out[2] = avg2(a2, a3);
+            out[13] = avg3(a2, a3, a4);
+            out[6] = avg3(a2, a3, a4);
+            out[10] = avg2(a3, a4);
+            out[3] = avg2(a3, a4);
+            out[14] = avg3(a3, a4, a5);
+            out[7] = avg3(a3, a4, a5);
+            out[11] = avg3(a4, a5, a6);
+            out[15] = avg3(a5, a6, a7);
+        }
+        B_HD_PRED => {
+            let e0 = ws[left + 3 * LUMA_WS_STRIDE];
+            let e1 = ws[left + 2 * LUMA_WS_STRIDE];
+            let e2 = ws[left + LUMA_WS_STRIDE];
+            let e3 = ws[left];
+            let e4 = top_left;
+            let e5 = ws[top];
+            let e6 = ws[top + 1];
+            let e7 = ws[top + 2];
+            out[12] = avg2(e0, e1);
+            out[13] = avg3(e0, e1, e2);
+            out[8] = avg2(e1, e2);
+            out[14] = avg2(e1, e2);
+            out[9] = avg3(e1, e2, e3);
+            out[15] = avg3(e1, e2, e3);
+            out[10] = avg2(e2, e3);
+            out[4] = avg2(e2, e3);
+            out[11] = avg3(e2, e3, e4);
+            out[5] = avg3(e2, e3, e4);
+            out[6] = avg2(e3, e4);
+            out[0] = avg2(e3, e4);
+            out[7] = avg3(e3, e4, e5);
+            out[1] = avg3(e3, e4, e5);
+            out[2] = avg3(e4, e5, e6);
+            out[3] = avg3(e5, e6, e7);
+        }
+        B_HU_PRED => {
+            let l0 = ws[left];
+            let l1 = ws[left + LUMA_WS_STRIDE];
+            let l2 = ws[left + 2 * LUMA_WS_STRIDE];
+            let l3 = ws[left + 3 * LUMA_WS_STRIDE];
+            out[0] = avg2(l0, l1);
+            out[1] = avg3(l0, l1, l2);
+            out[2] = avg2(l1, l2);
+            out[4] = avg2(l1, l2);
+            out[3] = avg3(l1, l2, l3);
+            out[5] = avg3(l1, l2, l3);
+            out[6] = avg2(l2, l3);
+            out[8] = avg2(l2, l3);
+            out[7] = avg3(l2, l3, l3);
+            out[9] = avg3(l2, l3, l3);
+            out[10] = l3;
+            out[11] = l3;
+            out[12] = l3;
+            out[13] = l3;
+            out[14] = l3;
+            out[15] = l3;
+        }
+        _ => unreachable!(),
+    }
+
+    out
+}
+
+fn best_luma_mode_4x4(src: &[u8; 16], ws: &[u8], x0: usize, y0: usize) -> (u8, [u8; 16]) {
+    let modes = [
+        B_DC_PRED, B_TM_PRED, B_VE_PRED, B_HE_PRED, B_LD_PRED, B_RD_PRED, B_VR_PRED, B_VL_PRED,
+        B_HD_PRED, B_HU_PRED,
+    ];
+    let mut best_mode = B_DC_PRED;
+    let mut best_pred = predict_luma_4x4(best_mode, ws, x0, y0);
+    let mut best_sad = sad_4x4(src, &best_pred);
+
+    for &mode in &modes[1..] {
+        let pred = predict_luma_4x4(mode, ws, x0, y0);
+        let sad = sad_4x4(src, &pred);
+        if sad < best_sad {
+            best_mode = mode;
+            best_pred = pred;
+            best_sad = sad;
+        }
+    }
+
+    (best_mode, best_pred)
+}
+
+fn sad_4x4(src: &[u8; 16], pred: &[u8; 16]) -> u32 {
+    src.iter()
+        .zip(pred.iter())
+        .map(|(&s, &p)| u32::from(s.abs_diff(p)))
+        .sum()
+}
+
+fn write_workspace_block_4x4(ws: &mut [u8], x0: usize, y0: usize, block: &[u8; 16]) {
+    for row in 0..4 {
+        let start = (y0 + row) * LUMA_WS_STRIDE + x0;
+        ws[start..start + 4].copy_from_slice(&block[row * 4..row * 4 + 4]);
+    }
+}
+
+fn plane_block_4x4(plane: &[u8; 64], offset: usize) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for row in 0..4 {
+        let src = offset + row * 8;
+        out[row * 4..row * 4 + 4].copy_from_slice(&plane[src..src + 4]);
+    }
+    out
+}
+
+fn read_block_8x8(src: &[u8], stride: usize, x: usize, y: usize) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for row in 0..8 {
+        let start = (y + row) * stride + x;
+        out[row * 8..row * 8 + 8].copy_from_slice(&src[start..start + 8]);
+    }
+    out
+}
+
+fn sad_8x8(src: &[u8; 64], pred: &[u8; 64]) -> u32 {
+    src.iter()
+        .zip(pred.iter())
+        .map(|(&s, &p)| u32::from(s.abs_diff(p)))
+        .sum()
+}
+
+fn predict_chroma_plane(mode: u8, recon: &[u8], stride: usize, x: usize, y: usize) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    match mode {
+        0 => out.fill(predict_dc_8x8(recon, stride, x, y)),
+        1 => {
+            let top = if y == 0 {
+                [127u8; 8]
+            } else {
+                let mut row = [0u8; 8];
+                row.copy_from_slice(&recon[(y - 1) * stride + x..(y - 1) * stride + x + 8]);
+                row
+            };
+            for row in out.chunks_exact_mut(8) {
+                row.copy_from_slice(&top);
+            }
+        }
+        2 => {
+            for dy in 0..8 {
+                let left = if x == 0 {
+                    129
+                } else {
+                    recon[(y + dy) * stride + x - 1]
+                };
+                out[dy * 8..dy * 8 + 8].fill(left);
+            }
+        }
+        3 => {
+            let top_left = if y == 0 {
+                127
+            } else if x == 0 {
+                129
+            } else {
+                recon[(y - 1) * stride + x - 1]
+            };
+            let mut top = [127u8; 8];
+            if y != 0 {
+                top.copy_from_slice(&recon[(y - 1) * stride + x..(y - 1) * stride + x + 8]);
+            }
+            for dy in 0..8 {
+                let left = if x == 0 {
+                    129
+                } else {
+                    recon[(y + dy) * stride + x - 1]
+                };
+                for dx in 0..8 {
+                    out[dy * 8 + dx] = (i32::from(left) + i32::from(top[dx]) - i32::from(top_left))
+                        .clamp(0, 255) as u8;
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    out
+}
+
+fn best_chroma_mode_8x8(
+    src_u: &[u8],
+    src_v: &[u8],
+    recon_u: &[u8],
+    recon_v: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+) -> (u8, [u8; 64], [u8; 64]) {
+    let src_block_u = read_block_8x8(src_u, stride, x, y);
+    let src_block_v = read_block_8x8(src_v, stride, x, y);
+    let modes = [0u8, 1, 2, 3];
+
+    let mut best_mode = 0u8;
+    let mut best_pred_u = predict_chroma_plane(best_mode, recon_u, stride, x, y);
+    let mut best_pred_v = predict_chroma_plane(best_mode, recon_v, stride, x, y);
+    let mut best_sad = sad_8x8(&src_block_u, &best_pred_u) + sad_8x8(&src_block_v, &best_pred_v);
+
+    for &mode in &modes[1..] {
+        let pred_u = predict_chroma_plane(mode, recon_u, stride, x, y);
+        let pred_v = predict_chroma_plane(mode, recon_v, stride, x, y);
+        let sad = sad_8x8(&src_block_u, &pred_u) + sad_8x8(&src_block_v, &pred_v);
+        if sad < best_sad {
+            best_mode = mode;
+            best_pred_u = pred_u;
+            best_pred_v = pred_v;
+            best_sad = sad;
+        }
+    }
+
+    (best_mode, best_pred_u, best_pred_v)
 }
 
 fn predict_dc_8x8(recon: &[u8], stride: usize, x: usize, y: usize) -> u8 {
@@ -464,12 +888,31 @@ fn write_block_4x4(dst: &mut [u8], stride: usize, x: usize, y: usize, block: &[u
     }
 }
 
+fn residual_from_block_prediction(src: &[u8; 16], pred: &[u8; 16]) -> [i16; 16] {
+    let mut residual = [0i16; 16];
+    for (dst, (&pixel, &pred)) in residual.iter_mut().zip(src.iter().zip(pred.iter())) {
+        *dst = i16::from(pixel) - i16::from(pred);
+    }
+    residual
+}
+
 fn residual_from_prediction(src: &[u8; 16], pred: u8) -> [i16; 16] {
     let mut residual = [0i16; 16];
     for (dst, &pixel) in residual.iter_mut().zip(src.iter()) {
         *dst = i16::from(pixel) - i16::from(pred);
     }
     residual
+}
+
+fn reconstruct_from_block_coeffs(coeffs: &[i16; 16], q_idx: usize, pred: &[u8; 16]) -> [u8; 16] {
+    let mut dequant = dequantize_block(coeffs, q_idx);
+    transform::idct4x4(&mut dequant);
+
+    let mut out = [0u8; 16];
+    for (dst, (&prediction, residue)) in out.iter_mut().zip(pred.iter().zip(dequant.iter())) {
+        *dst = (i32::from(prediction) + *residue).clamp(0, 255) as u8;
+    }
+    out
 }
 
 fn reconstruct_from_coeffs(coeffs: &[i16; 16], q_idx: usize, pred: u8) -> [u8; 16] {
@@ -483,7 +926,107 @@ fn reconstruct_from_coeffs(coeffs: &[i16; 16], q_idx: usize, pred: u8) -> [u8; 1
     out
 }
 
-fn encode_first_partition(q_idx: usize, macroblock_count: usize) -> Vec<u8> {
+fn write_bpred_mode(enc: &mut BoolEncoder, top: u8, left: u8, mode: u8) {
+    let probs = &KEYFRAME_BPRED_MODE_PROBS[top as usize][left as usize];
+    match mode {
+        B_DC_PRED => {
+            enc.write_bool(false, probs[0]);
+        }
+        B_TM_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(false, probs[1]);
+        }
+        B_VE_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(true, probs[1]);
+            enc.write_bool(false, probs[2]);
+        }
+        B_HE_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(true, probs[1]);
+            enc.write_bool(true, probs[2]);
+            enc.write_bool(false, probs[3]);
+            enc.write_bool(false, probs[4]);
+        }
+        B_RD_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(true, probs[1]);
+            enc.write_bool(true, probs[2]);
+            enc.write_bool(false, probs[3]);
+            enc.write_bool(true, probs[4]);
+            enc.write_bool(false, probs[5]);
+        }
+        B_VR_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(true, probs[1]);
+            enc.write_bool(true, probs[2]);
+            enc.write_bool(false, probs[3]);
+            enc.write_bool(true, probs[4]);
+            enc.write_bool(true, probs[5]);
+        }
+        B_LD_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(true, probs[1]);
+            enc.write_bool(true, probs[2]);
+            enc.write_bool(true, probs[3]);
+            enc.write_bool(false, probs[6]);
+        }
+        B_VL_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(true, probs[1]);
+            enc.write_bool(true, probs[2]);
+            enc.write_bool(true, probs[3]);
+            enc.write_bool(true, probs[6]);
+            enc.write_bool(false, probs[7]);
+        }
+        B_HD_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(true, probs[1]);
+            enc.write_bool(true, probs[2]);
+            enc.write_bool(true, probs[3]);
+            enc.write_bool(true, probs[6]);
+            enc.write_bool(true, probs[7]);
+            enc.write_bool(false, probs[8]);
+        }
+        B_HU_PRED => {
+            enc.write_bool(true, probs[0]);
+            enc.write_bool(true, probs[1]);
+            enc.write_bool(true, probs[2]);
+            enc.write_bool(true, probs[3]);
+            enc.write_bool(true, probs[6]);
+            enc.write_bool(true, probs[7]);
+            enc.write_bool(true, probs[8]);
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn write_uv_mode(enc: &mut BoolEncoder, mode: u8) {
+    match mode {
+        0 => enc.write_bool(false, KEYFRAME_UV_MODE_PROBS[0]),
+        1 => {
+            enc.write_bool(true, KEYFRAME_UV_MODE_PROBS[0]);
+            enc.write_bool(false, KEYFRAME_UV_MODE_PROBS[1]);
+        }
+        2 => {
+            enc.write_bool(true, KEYFRAME_UV_MODE_PROBS[0]);
+            enc.write_bool(true, KEYFRAME_UV_MODE_PROBS[1]);
+            enc.write_bool(false, KEYFRAME_UV_MODE_PROBS[2]);
+        }
+        3 => {
+            enc.write_bool(true, KEYFRAME_UV_MODE_PROBS[0]);
+            enc.write_bool(true, KEYFRAME_UV_MODE_PROBS[1]);
+            enc.write_bool(true, KEYFRAME_UV_MODE_PROBS[2]);
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn encode_first_partition(
+    q_idx: usize,
+    macroblocks: &[MacroBlockData],
+    mb_width: usize,
+) -> Vec<u8> {
     let mut enc = BoolEncoder::new();
 
     enc.write_literal(1, 0);
@@ -514,12 +1057,25 @@ fn encode_first_partition(q_idx: usize, macroblock_count: usize) -> Vec<u8> {
 
     enc.write_literal(1, 0);
 
-    for _ in 0..macroblock_count {
-        enc.write_bool(false, KEYFRAME_YMODE_B_PRED_PROB);
-        for _ in 0..16 {
-            enc.write_bool(false, KEYFRAME_BPRED_DC_PROB);
+    let mut top_modes = vec![[B_DC_PRED; 4]; mb_width];
+    for row in macroblocks.chunks(mb_width) {
+        let mut left_modes = [B_DC_PRED; 4];
+        for (mb_x, mb) in row.iter().enumerate() {
+            enc.write_bool(false, KEYFRAME_YMODE_B_PRED_PROB);
+            for sub_y in 0..4 {
+                let mut left = left_modes[sub_y];
+                for sub_x in 0..4 {
+                    let block_index = sub_x + sub_y * 4;
+                    let top = top_modes[mb_x][sub_x];
+                    let mode = mb.bpred_modes[block_index];
+                    write_bpred_mode(&mut enc, top, left, mode);
+                    top_modes[mb_x][sub_x] = mode;
+                    left = mode;
+                }
+                left_modes[sub_y] = left;
+            }
+            write_uv_mode(&mut enc, mb.chroma_mode);
         }
-        enc.write_bool(false, KEYFRAME_UVMODE_DC_PROB);
     }
 
     enc.finish()
@@ -590,9 +1146,7 @@ fn encode_block(
     ctx: usize,
 ) {
     let probs = &COEFF_PROBS[block_type];
-    let last_nz = (first..16)
-        .rev()
-        .find(|&i| coeffs[ZIGZAG[i] as usize] != 0);
+    let last_nz = (first..16).rev().find(|&i| coeffs[ZIGZAG[i] as usize] != 0);
 
     let Some(last_nz) = last_nz else {
         let band = COEFF_BANDS[first] as usize;

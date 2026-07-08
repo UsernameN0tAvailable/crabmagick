@@ -1,7 +1,6 @@
 //! Encoding of WebP images.
 use std::collections::BinaryHeap;
 use std::io::{self, Write};
-use std::slice::ChunksExact;
 
 use quick_error::quick_error;
 
@@ -78,7 +77,92 @@ impl<W: Write> BitWriter<W> {
     }
 }
 
-fn write_single_entry_huffman_tree<W: Write>(w: &mut BitWriter<W>, symbol: u8) -> io::Result<()> {
+const NUM_LENGTH_CODES: usize = 24;
+const GREEN_COPY_CODES: usize = 256 + NUM_LENGTH_CODES;
+const DIST_ALPHABET_SIZE: usize = 40;
+const HASH_BITS: usize = 18;
+const HASH_SIZE: usize = 1 << HASH_BITS;
+const MAX_MATCH_LEN: usize = 4096;
+const MAX_CHAIN_DEPTH: usize = 32;
+const MAX_PLANE_CODE: usize = 1_048_576;
+const MAX_BACKWARD_DISTANCE: usize = MAX_PLANE_CODE - 120;
+
+#[rustfmt::skip]
+const DISTANCE_MAP: [(i8, i8); 120] = [
+    (0, 1),  (1, 0),  (1, 1),  (-1, 1), (0, 2),  (2, 0),  (1, 2),  (-1, 2),
+    (2, 1),  (-2, 1), (2, 2),  (-2, 2), (0, 3),  (3, 0),  (1, 3),  (-1, 3),
+    (3, 1),  (-3, 1), (2, 3),  (-2, 3), (3, 2),  (-3, 2), (0, 4),  (4, 0),
+    (1, 4),  (-1, 4), (4, 1),  (-4, 1), (3, 3),  (-3, 3), (2, 4),  (-2, 4),
+    (4, 2),  (-4, 2), (0, 5),  (3, 4),  (-3, 4), (4, 3),  (-4, 3), (5, 0),
+    (1, 5),  (-1, 5), (5, 1),  (-5, 1), (2, 5),  (-2, 5), (5, 2),  (-5, 2),
+    (4, 4),  (-4, 4), (3, 5),  (-3, 5), (5, 3),  (-5, 3), (0, 6),  (6, 0),
+    (1, 6),  (-1, 6), (6, 1),  (-6, 1), (2, 6),  (-2, 6), (6, 2),  (-6, 2),
+    (4, 5),  (-4, 5), (5, 4),  (-5, 4), (3, 6),  (-3, 6), (6, 3),  (-6, 3),
+    (0, 7),  (7, 0),  (1, 7),  (-1, 7), (5, 5),  (-5, 5), (7, 1),  (-7, 1),
+    (4, 6),  (-4, 6), (6, 4),  (-6, 4), (2, 7),  (-2, 7), (7, 2),  (-7, 2),
+    (3, 7),  (-3, 7), (7, 3),  (-7, 3), (5, 6),  (-5, 6), (6, 5),  (-6, 5),
+    (8, 0),  (4, 7),  (-4, 7), (7, 4),  (-7, 4), (8, 1),  (8, 2),  (6, 6),
+    (-6, 6), (8, 3),  (5, 7),  (-5, 7), (7, 5),  (-7, 5), (8, 4),  (6, 7),
+    (-6, 7), (7, 6),  (-7, 6), (8, 5),  (7, 7),  (-7, 7), (8, 6),  (8, 7)
+];
+
+#[derive(Clone, Debug)]
+enum Token {
+    Literal(u32),
+    CacheHit(u16),
+    Copy { len: u16, dist: u32 },
+}
+
+struct ColorCache {
+    table: Vec<u32>,
+    bits: u8,
+}
+
+impl ColorCache {
+    fn new(bits: u8) -> Self {
+        Self {
+            table: vec![0; 1 << bits],
+            bits,
+        }
+    }
+
+    #[inline(always)]
+    fn lookup(&self, argb: u32) -> Option<u16> {
+        let idx = self.hash(argb);
+        (self.table[idx] == argb).then_some(idx as u16)
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, argb: u32) {
+        let idx = self.hash(argb);
+        self.table[idx] = argb;
+    }
+
+    #[inline(always)]
+    fn hash(&self, argb: u32) -> usize {
+        (argb.wrapping_mul(0x1e35a7bd) >> (32 - self.bits)) as usize
+    }
+}
+
+struct HashChain {
+    chain: Vec<i32>,
+}
+
+impl HashChain {
+    fn build(pixels: &[u32]) -> Self {
+        let mut chain = vec![-1; pixels.len()];
+        let mut head = vec![-1; HASH_SIZE];
+        for (pos, &pixel) in pixels.iter().enumerate() {
+            let hash = pixel_hash(pixel);
+            chain[pos] = head[hash];
+            head[hash] = pos as i32;
+        }
+        Self { chain }
+    }
+}
+
+fn write_single_entry_huffman_tree<W: Write>(w: &mut BitWriter<W>, symbol: u16) -> io::Result<()> {
+    debug_assert!(symbol < 256);
     w.write_bits(1, 2)?;
     if symbol <= 1 {
         w.write_bits(0, 1)?;
@@ -222,12 +306,30 @@ fn write_huffman_tree<W: Write>(
     lengths: &mut [u8],
     codes: &mut [u16],
 ) -> io::Result<()> {
+    let nonzero = frequencies
+        .iter()
+        .enumerate()
+        .filter_map(|(symbol, &frequency)| (frequency > 0).then_some(symbol))
+        .collect::<Vec<_>>();
+
+    if nonzero.is_empty() {
+        lengths.fill(0);
+        codes.fill(0);
+        return write_single_entry_huffman_tree(w, 0);
+    }
+
+    if nonzero.len() == 1 && nonzero[0] < 256 {
+        lengths.fill(0);
+        codes.fill(0);
+        return write_single_entry_huffman_tree(w, nonzero[0] as u16);
+    }
+
     if !build_huffman_tree(frequencies, lengths, codes, 15) {
-        let symbol = frequencies
-            .iter()
-            .position(|&frequency| frequency > 0)
-            .unwrap_or(0);
-        return write_single_entry_huffman_tree(w, symbol as u8);
+        let mut scratch = frequencies.to_vec();
+        let symbol = nonzero[0];
+        let dummy = usize::from(symbol == 0);
+        scratch[dummy] = scratch[dummy].max(1);
+        build_huffman_tree(&scratch, lengths, codes, 15);
     }
 
     let mut code_length_lengths = [0u8; 16];
@@ -261,17 +363,8 @@ fn write_huffman_tree<W: Write>(
         }
     }
 
-    match lengths.len() {
-        256 => {
-            w.write_bits(1, 1)?; // max_symbol is stored
-            w.write_bits(3, 3)?; // max_symbol_nbits / 2 - 2
-            w.write_bits(254, 8)?; // max_symbol - 2
-        }
-        280 => w.write_bits(0, 1)?,
-        _ => unreachable!(),
-    }
+    w.write_bits(0, 1)?; // use full alphabet size
 
-    // Write the huffman codes
     if !single_code_length_length {
         for &len in lengths.iter() {
             w.write_bits(
@@ -284,66 +377,349 @@ fn write_huffman_tree<W: Write>(
     Ok(())
 }
 
-const fn length_to_symbol(len: u16) -> (u16, u8) {
-    let len = len - 1;
-    let highest_bit = len.ilog2() as u16;
-    let second_highest_bit = (len >> (highest_bit - 1)) & 1;
+#[inline(always)]
+fn pixel_hash(pixel: u32) -> usize {
+    (pixel.wrapping_mul(0x1e35a7bd) as usize) & (HASH_SIZE - 1)
+}
+
+#[inline(always)]
+fn pack_pixel(pixel: &[u8]) -> u32 {
+    (u32::from(pixel[3]) << 24)
+        | (u32::from(pixel[0]) << 16)
+        | (u32::from(pixel[1]) << 8)
+        | u32::from(pixel[2])
+}
+
+#[inline(always)]
+fn pixel_channels(pixel: u32) -> (usize, usize, usize, usize) {
+    (
+        ((pixel >> 16) & 0xFF) as usize,
+        ((pixel >> 8) & 0xFF) as usize,
+        (pixel & 0xFF) as usize,
+        ((pixel >> 24) & 0xFF) as usize,
+    )
+}
+
+#[inline(always)]
+fn value_to_prefix(value: u32) -> (u16, u8, u32) {
+    debug_assert!(value >= 1);
+    if value <= 4 {
+        return ((value - 1) as u16, 0, 0);
+    }
+
+    let n = value - 1;
+    let highest_bit = 31 - n.leading_zeros();
     let extra_bits = highest_bit - 1;
-    let symbol = 2 * highest_bit + second_highest_bit;
-    (symbol, extra_bits as u8)
+    let second_highest_bit = (n >> extra_bits) & 1;
+    let symbol = (2 * highest_bit + second_highest_bit) as u16;
+    let offset = (2 + second_highest_bit) << extra_bits;
+    (symbol, extra_bits as u8, n - offset)
 }
 
 #[inline(always)]
-fn count_run(
-    pixel: &[u8],
-    it: &mut std::iter::Peekable<ChunksExact<u8>>,
-    frequencies1: &mut [u32; 280],
+fn plane_code_to_distance(width: u32, plane_code: usize) -> usize {
+    if plane_code > 120 {
+        plane_code - 120
+    } else {
+        let (xoffset, yoffset) = DISTANCE_MAP[plane_code - 1];
+        let dist = i32::from(xoffset) + i32::from(yoffset) * width as i32;
+        dist.max(1) as usize
+    }
+}
+
+fn build_small_distance_lookup(width: u32) -> Vec<u16> {
+    let max_dist = (1..=120)
+        .map(|plane_code| plane_code_to_distance(width, plane_code))
+        .max()
+        .unwrap_or(1);
+    let mut lookup = vec![0u16; max_dist + 1];
+    for plane_code in 1..=120u16 {
+        let dist = plane_code_to_distance(width, plane_code as usize);
+        if let Some(entry) = lookup.get_mut(dist) {
+            if *entry == 0 || plane_code < *entry {
+                *entry = plane_code;
+            }
+        }
+    }
+    lookup
+}
+
+#[inline(always)]
+fn distance_to_plane_code(dist: usize, small_lookup: &[u16]) -> u32 {
+    if dist < small_lookup.len() {
+        let code = small_lookup[dist];
+        if code != 0 {
+            return u32::from(code);
+        }
+    }
+    (dist + 120) as u32
+}
+
+fn find_longest_match(pixels: &[u32], chain: &HashChain, pos: usize) -> Option<(usize, usize)> {
+    if pos + 1 >= pixels.len() {
+        return None;
+    }
+
+    let max_len = (pixels.len() - pos).min(MAX_MATCH_LEN);
+    let mut best_len = 0usize;
+    let mut best_dist = 0usize;
+    let mut depth = 0usize;
+    let mut candidate_index = chain.chain[pos];
+
+    while candidate_index >= 0 && depth < MAX_CHAIN_DEPTH {
+        let candidate = candidate_index as usize;
+        let dist = pos - candidate;
+        if dist > MAX_BACKWARD_DISTANCE {
+            break;
+        }
+
+        let mut len = 0usize;
+        while len < max_len && pixels[candidate + len] == pixels[pos + len] {
+            len += 1;
+        }
+
+        if len > best_len || (len == best_len && dist < best_dist) {
+            best_len = len;
+            best_dist = dist;
+            if best_len == max_len {
+                break;
+            }
+        }
+
+        candidate_index = chain.chain[candidate];
+        depth += 1;
+    }
+
+    (best_len >= 2).then_some((best_len, best_dist))
+}
+
+#[inline(always)]
+fn should_use_copy(len: usize, dist: usize, cache_hit: bool) -> bool {
+    len >= 4 || (len == 3 && (!cache_hit || dist <= 128)) || (len == 2 && dist <= 16 && !cache_hit)
+}
+
+fn choose_cache_bits(num_pixels: usize) -> u8 {
+    if num_pixels >= 1 << 18 {
+        10
+    } else if num_pixels >= 1 << 14 {
+        9
+    } else {
+        8
+    }
+}
+
+fn tokenize_pixels(pixels: &[u32], cache_bits: Option<u8>) -> (Vec<Token>, usize) {
+    let chain = HashChain::build(pixels);
+    let mut tokens = Vec::with_capacity(pixels.len());
+    let mut cache = cache_bits.map(ColorCache::new);
+    let mut cache_hits = 0usize;
+    let mut pos = 0usize;
+
+    while pos < pixels.len() {
+        let cache_hit = cache.as_ref().and_then(|c| c.lookup(pixels[pos]));
+        let copy = find_longest_match(pixels, &chain, pos);
+
+        if let Some((len, dist)) = copy {
+            let use_copy = if pos + 1 < pixels.len() {
+                let next_cache_hit = cache.as_ref().and_then(|c| c.lookup(pixels[pos + 1]));
+                let next_copy = find_longest_match(pixels, &chain, pos + 1);
+                let skip_for_better_next = next_copy
+                    .map(|(next_len, next_dist)| {
+                        should_use_copy(next_len, next_dist, next_cache_hit.is_some())
+                            && next_len > len + 1
+                    })
+                    .unwrap_or(false);
+                !skip_for_better_next && should_use_copy(len, dist, cache_hit.is_some())
+            } else {
+                should_use_copy(len, dist, cache_hit.is_some())
+            };
+
+            if use_copy {
+                tokens.push(Token::Copy {
+                    len: len as u16,
+                    dist: dist as u32,
+                });
+                if let Some(cache) = cache.as_mut() {
+                    for &pixel in &pixels[pos..pos + len] {
+                        cache.insert(pixel);
+                    }
+                }
+                pos += len;
+                continue;
+            }
+        }
+
+        if let Some(index) = cache_hit {
+            tokens.push(Token::CacheHit(index));
+            cache_hits += 1;
+        } else {
+            tokens.push(Token::Literal(pixels[pos]));
+        }
+
+        if let Some(cache) = cache.as_mut() {
+            cache.insert(pixels[pos]);
+        }
+        pos += 1;
+    }
+
+    (tokens, cache_hits)
+}
+
+fn count_token_frequencies(
+    tokens: &[Token],
+    color: ColorType,
+    width: u32,
+    green_alphabet_size: usize,
+) -> (
+    Vec<u32>,
+    [u32; 256],
+    [u32; 256],
+    [u32; 256],
+    [u32; DIST_ALPHABET_SIZE],
 ) {
-    let mut run_length = 0;
-    while run_length < 4096 && it.peek() == Some(&pixel) {
-        run_length += 1;
-        it.next();
+    let mut frequencies0 = [0u32; 256];
+    let mut frequencies1 = vec![0u32; green_alphabet_size];
+    let mut frequencies2 = [0u32; 256];
+    let mut frequencies3 = [0u32; 256];
+    let mut frequencies_dist = [0u32; DIST_ALPHABET_SIZE];
+    let small_lookup = build_small_distance_lookup(width);
+
+    match color {
+        ColorType::L8 => {
+            frequencies0[0] = 1;
+            frequencies2[0] = 1;
+            frequencies3[0] = 1;
+        }
+        ColorType::La8 => {
+            frequencies0[0] = 1;
+            frequencies2[0] = 1;
+        }
+        ColorType::Rgb8 => {
+            frequencies3[0] = 1;
+        }
+        ColorType::Rgba8 => {}
     }
-    if run_length > 0 {
-        if run_length <= 4 {
-            let symbol = 256 + run_length - 1;
-            frequencies1[symbol] += 1;
-        } else {
-            let (symbol, _extra_bits) = length_to_symbol(run_length as u16);
-            frequencies1[256 + symbol as usize] += 1;
+
+    for token in tokens {
+        match *token {
+            Token::Literal(pixel) => {
+                let (red, green, blue, alpha) = pixel_channels(pixel);
+                frequencies1[green] += 1;
+                match color {
+                    ColorType::L8 => {}
+                    ColorType::La8 => {
+                        frequencies3[alpha] += 1;
+                    }
+                    ColorType::Rgb8 => {
+                        frequencies0[red] += 1;
+                        frequencies2[blue] += 1;
+                    }
+                    ColorType::Rgba8 => {
+                        frequencies0[red] += 1;
+                        frequencies2[blue] += 1;
+                        frequencies3[alpha] += 1;
+                    }
+                }
+            }
+            Token::CacheHit(index) => {
+                frequencies1[GREEN_COPY_CODES + usize::from(index)] += 1;
+            }
+            Token::Copy { len, dist } => {
+                let (length_symbol, _, _) = value_to_prefix(u32::from(len));
+                frequencies1[256 + usize::from(length_symbol)] += 1;
+
+                let plane_code = distance_to_plane_code(dist as usize, &small_lookup);
+                let (dist_symbol, _, _) = value_to_prefix(plane_code);
+                frequencies_dist[usize::from(dist_symbol)] += 1;
+            }
         }
     }
+
+    (
+        frequencies1,
+        frequencies0,
+        frequencies2,
+        frequencies3,
+        frequencies_dist,
+    )
 }
 
-#[inline(always)]
-fn write_run<W: Write>(
+fn write_tokens<W: Write>(
     w: &mut BitWriter<W>,
-    pixel: &[u8],
-    it: &mut std::iter::Peekable<ChunksExact<u8>>,
-    codes1: &[u16; 280],
-    lengths1: &[u8; 280],
+    tokens: &[Token],
+    color: ColorType,
+    width: u32,
+    codes0: &[u16; 256],
+    lengths0: &[u8; 256],
+    codes1: &[u16],
+    lengths1: &[u8],
+    codes2: &[u16; 256],
+    lengths2: &[u8; 256],
+    codes3: &[u16; 256],
+    lengths3: &[u8; 256],
+    codes_dist: &[u16; DIST_ALPHABET_SIZE],
+    lengths_dist: &[u8; DIST_ALPHABET_SIZE],
 ) -> io::Result<()> {
-    let mut run_length = 0;
-    while run_length < 4096 && it.peek() == Some(&pixel) {
-        run_length += 1;
-        it.next();
-    }
-    if run_length > 0 {
-        if run_length <= 4 {
-            let symbol = 256 + run_length - 1;
-            w.write_bits(u64::from(codes1[symbol]), lengths1[symbol])?;
-        } else {
-            let (symbol, extra_bits) = length_to_symbol(run_length as u16);
-            w.write_bits(
-                u64::from(codes1[256 + symbol as usize]),
-                lengths1[256 + symbol as usize],
-            )?;
-            w.write_bits(
-                (run_length as u64 - 1) & ((1 << extra_bits) - 1),
-                extra_bits,
-            )?;
+    let small_lookup = build_small_distance_lookup(width);
+
+    for token in tokens {
+        match *token {
+            Token::Literal(pixel) => {
+                let (red, green, blue, alpha) = pixel_channels(pixel);
+                match color {
+                    ColorType::L8 => {
+                        w.write_bits(u64::from(codes1[green]), lengths1[green])?;
+                    }
+                    ColorType::La8 => {
+                        let len1 = lengths1[green];
+                        let len3 = lengths3[alpha];
+                        let code = u64::from(codes1[green]) | (u64::from(codes3[alpha]) << len1);
+                        w.write_bits(code, len1 + len3)?;
+                    }
+                    ColorType::Rgb8 => {
+                        let len1 = lengths1[green];
+                        let len0 = lengths0[red];
+                        let len2 = lengths2[blue];
+                        let code = u64::from(codes1[green])
+                            | (u64::from(codes0[red]) << len1)
+                            | (u64::from(codes2[blue]) << (len1 + len0));
+                        w.write_bits(code, len1 + len0 + len2)?;
+                    }
+                    ColorType::Rgba8 => {
+                        let len1 = lengths1[green];
+                        let len0 = lengths0[red];
+                        let len2 = lengths2[blue];
+                        let len3 = lengths3[alpha];
+                        let code = u64::from(codes1[green])
+                            | (u64::from(codes0[red]) << len1)
+                            | (u64::from(codes2[blue]) << (len1 + len0))
+                            | (u64::from(codes3[alpha]) << (len1 + len0 + len2));
+                        w.write_bits(code, len1 + len0 + len2 + len3)?;
+                    }
+                }
+            }
+            Token::CacheHit(index) => {
+                let symbol = GREEN_COPY_CODES + usize::from(index);
+                w.write_bits(u64::from(codes1[symbol]), lengths1[symbol])?;
+            }
+            Token::Copy { len, dist } => {
+                let (length_symbol, length_extra_bits, length_extra_value) =
+                    value_to_prefix(u32::from(len));
+                let green_symbol = 256 + usize::from(length_symbol);
+                w.write_bits(u64::from(codes1[green_symbol]), lengths1[green_symbol])?;
+                w.write_bits(u64::from(length_extra_value), length_extra_bits)?;
+
+                let plane_code = distance_to_plane_code(dist as usize, &small_lookup);
+                let (dist_symbol, dist_extra_bits, dist_extra_value) = value_to_prefix(plane_code);
+                w.write_bits(
+                    u64::from(codes_dist[usize::from(dist_symbol)]),
+                    lengths_dist[usize::from(dist_symbol)],
+                )?;
+                w.write_bits(u64::from(dist_extra_value), dist_extra_bits)?;
+            }
         }
     }
+
     Ok(())
 }
 
@@ -423,12 +799,6 @@ fn encode_frame<W: Write>(
     // transforms done
     w.write_bits(0x0, 1)?;
 
-    // color cache
-    w.write_bits(0x0, 1)?;
-
-    // meta-huffman codes
-    w.write_bits(0x0, 1)?;
-
     // expand to RGBA
     let mut pixels = match color {
         ColorType::L8 => data.iter().flat_map(|&p| [p, p, p, 255]).collect(),
@@ -465,60 +835,43 @@ fn encode_frame<W: Write>(
         pixels[3] = pixels[3].wrapping_sub(255);
     }
 
-    // compute frequencies
-    let mut frequencies0 = [0u32; 256];
-    let mut frequencies1 = [0u32; 280];
-    let mut frequencies2 = [0u32; 256];
-    let mut frequencies3 = [0u32; 256];
-    let mut it = pixels.chunks_exact(4).peekable();
-    match color {
-        ColorType::L8 => {
-            frequencies0[0] = 1;
-            frequencies2[0] = 1;
-            frequencies3[0] = 1;
-            while let Some(pixel) = it.next() {
-                frequencies1[pixel[1] as usize] += 1;
-                count_run(pixel, &mut it, &mut frequencies1);
-            }
-        }
-        ColorType::La8 => {
-            frequencies0[0] = 1;
-            frequencies2[0] = 1;
-            while let Some(pixel) = it.next() {
-                frequencies1[pixel[1] as usize] += 1;
-                frequencies3[pixel[3] as usize] += 1;
-                count_run(pixel, &mut it, &mut frequencies1);
-            }
-        }
-        ColorType::Rgb8 => {
-            frequencies3[0] = 1;
-            while let Some(pixel) = it.next() {
-                frequencies0[pixel[0] as usize] += 1;
-                frequencies1[pixel[1] as usize] += 1;
-                frequencies2[pixel[2] as usize] += 1;
-                count_run(pixel, &mut it, &mut frequencies1);
-            }
-        }
-        ColorType::Rgba8 => {
-            while let Some(pixel) = it.next() {
-                frequencies0[pixel[0] as usize] += 1;
-                frequencies1[pixel[1] as usize] += 1;
-                frequencies2[pixel[2] as usize] += 1;
-                frequencies3[pixel[3] as usize] += 1;
-                count_run(pixel, &mut it, &mut frequencies1);
-            }
-        }
+    let transformed = pixels.chunks_exact(4).map(pack_pixel).collect::<Vec<_>>();
+
+    let suggested_cache_bits = choose_cache_bits(transformed.len());
+    let (mut tokens, cache_hits) = tokenize_pixels(&transformed, Some(suggested_cache_bits));
+    let cache_bits = if cache_hits == 0 {
+        tokens = tokenize_pixels(&transformed, None).0;
+        None
+    } else {
+        Some(suggested_cache_bits)
+    };
+
+    // color cache
+    if let Some(bits) = cache_bits {
+        w.write_bits(1, 1)?;
+        w.write_bits(u64::from(bits), 4)?;
+    } else {
+        w.write_bits(0, 1)?;
     }
+
+    // meta-huffman codes
+    w.write_bits(0x0, 1)?;
+
+    let green_alphabet_size = GREEN_COPY_CODES + cache_bits.map_or(0, |bits| 1usize << bits);
+    let (frequencies1, frequencies0, frequencies2, frequencies3, frequencies_dist) =
+        count_token_frequencies(&tokens, color, width, green_alphabet_size);
 
     // compute and write huffman codes
     let mut lengths0 = [0u8; 256];
-    let mut lengths1 = [0u8; 280];
+    let mut lengths1 = vec![0u8; green_alphabet_size];
     let mut lengths2 = [0u8; 256];
     let mut lengths3 = [0u8; 256];
+    let mut lengths_dist = [0u8; DIST_ALPHABET_SIZE];
     let mut codes0 = [0u16; 256];
-    let mut codes1 = [0u16; 280];
+    let mut codes1 = vec![0u16; green_alphabet_size];
     let mut codes2 = [0u16; 256];
     let mut codes3 = [0u16; 256];
+    let mut codes_dist = [0u16; DIST_ALPHABET_SIZE];
     write_huffman_tree(w, &frequencies1, &mut lengths1, &mut codes1)?;
     if is_color {
         write_huffman_tree(w, &frequencies0, &mut lengths0, &mut codes0)?;
@@ -534,63 +887,25 @@ fn encode_frame<W: Write>(
     } else {
         write_single_entry_huffman_tree(w, 255)?;
     }
-    write_single_entry_huffman_tree(w, 1)?;
+    write_huffman_tree(w, &frequencies_dist, &mut lengths_dist, &mut codes_dist)?;
 
     // Write image data
-    let mut it = pixels.chunks_exact(4).peekable();
-    match color {
-        ColorType::L8 => {
-            while let Some(pixel) = it.next() {
-                w.write_bits(
-                    u64::from(codes1[pixel[1] as usize]),
-                    lengths1[pixel[1] as usize],
-                )?;
-                write_run(w, pixel, &mut it, &codes1, &lengths1)?;
-            }
-        }
-        ColorType::La8 => {
-            while let Some(pixel) = it.next() {
-                let len1 = lengths1[pixel[1] as usize];
-                let len3 = lengths3[pixel[3] as usize];
-
-                let code = u64::from(codes1[pixel[1] as usize])
-                    | (u64::from(codes3[pixel[3] as usize]) << len1);
-
-                w.write_bits(code, len1 + len3)?;
-                write_run(w, pixel, &mut it, &codes1, &lengths1)?;
-            }
-        }
-        ColorType::Rgb8 => {
-            while let Some(pixel) = it.next() {
-                let len1 = lengths1[pixel[1] as usize];
-                let len0 = lengths0[pixel[0] as usize];
-                let len2 = lengths2[pixel[2] as usize];
-
-                let code = u64::from(codes1[pixel[1] as usize])
-                    | (u64::from(codes0[pixel[0] as usize]) << len1)
-                    | (u64::from(codes2[pixel[2] as usize]) << (len1 + len0));
-
-                w.write_bits(code, len1 + len0 + len2)?;
-                write_run(w, pixel, &mut it, &codes1, &lengths1)?;
-            }
-        }
-        ColorType::Rgba8 => {
-            while let Some(pixel) = it.next() {
-                let len1 = lengths1[pixel[1] as usize];
-                let len0 = lengths0[pixel[0] as usize];
-                let len2 = lengths2[pixel[2] as usize];
-                let len3 = lengths3[pixel[3] as usize];
-
-                let code = u64::from(codes1[pixel[1] as usize])
-                    | (u64::from(codes0[pixel[0] as usize]) << len1)
-                    | (u64::from(codes2[pixel[2] as usize]) << (len1 + len0))
-                    | (u64::from(codes3[pixel[3] as usize]) << (len1 + len0 + len2));
-
-                w.write_bits(code, len1 + len0 + len2 + len3)?;
-                write_run(w, pixel, &mut it, &codes1, &lengths1)?;
-            }
-        }
-    }
+    write_tokens(
+        w,
+        &tokens,
+        color,
+        width,
+        &codes0,
+        &lengths0,
+        &codes1,
+        &lengths1,
+        &codes2,
+        &lengths2,
+        &codes3,
+        &lengths3,
+        &codes_dist,
+        &lengths_dist,
+    )?;
 
     w.flush()?;
     Ok(())
@@ -756,7 +1071,8 @@ mod tests {
             .encode(&img, 256, 256, crate::webp_decode::ColorType::Rgba8)
             .unwrap();
 
-        let mut decoder = crate::webp_decode::WebPDecoder::new(std::io::Cursor::new(output)).unwrap();
+        let mut decoder =
+            crate::webp_decode::WebPDecoder::new(std::io::Cursor::new(output)).unwrap();
         let mut img2 = vec![0; 256 * 256 * 4];
         decoder.read_image(&mut img2).unwrap();
         assert_eq!(img, img2);
@@ -777,7 +1093,8 @@ mod tests {
             .encode(&img, 256, 256, crate::webp_decode::ColorType::Rgb8)
             .unwrap();
 
-        let mut decoder = crate::webp_decode::WebPDecoder::new(std::io::Cursor::new(output)).unwrap();
+        let mut decoder =
+            crate::webp_decode::WebPDecoder::new(std::io::Cursor::new(output)).unwrap();
 
         let mut img2 = vec![0; 256 * 256 * 3];
         decoder.read_image(&mut img2).unwrap();
@@ -806,7 +1123,12 @@ mod tests {
         let mut encoder = WebPEncoder::new(&mut output);
         encoder.set_params(params.clone());
         encoder
-            .encode(&img[..256 * 256 * 3], 256, 256, crate::webp_decode::ColorType::Rgb8)
+            .encode(
+                &img[..256 * 256 * 3],
+                256,
+                256,
+                crate::webp_decode::ColorType::Rgb8,
+            )
             .unwrap();
         let decoded = webp::Decoder::new(&output).decode().unwrap();
         assert_eq!(img[..256 * 256 * 3], *decoded);

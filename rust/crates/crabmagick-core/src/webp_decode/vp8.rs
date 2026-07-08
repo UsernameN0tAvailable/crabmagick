@@ -417,7 +417,7 @@ const KEYFRAME_BPRED_MODE_TREE: [i8; 18] = [
 ];
 
 // Probabilities for the BPRED_MODE_TREE
-const KEYFRAME_BPRED_MODE_PROBS: [[[Prob; 9]; 10]; 10] = [
+pub(crate) const KEYFRAME_BPRED_MODE_PROBS: [[[Prob; 9]; 10]; 10] = [
     [
         [231, 120, 48, 89, 115, 113, 120, 152, 112],
         [152, 179, 64, 126, 170, 118, 46, 70, 95],
@@ -2365,7 +2365,11 @@ mod add_residue_simd {
 
     #[target_feature(enable = "sse4.1")]
     pub unsafe fn add_residue_sse41(
-        pblock: &mut [u8], rblock: &[i32; 16], y0: usize, x0: usize, stride: usize
+        pblock: &mut [u8],
+        rblock: &[i32; 16],
+        y0: usize,
+        x0: usize,
+        stride: usize,
     ) {
         let base = y0 * stride + x0;
         for row in 0..4 {
@@ -2965,7 +2969,13 @@ mod tests {
 
         // Cover a range of strides / offsets used by luma (21) and chroma (9),
         // plus a few edge geometries.
-        let cases = [(21usize, 1usize, 1usize), (9, 1, 1), (21, 5, 13), (9, 5, 5), (4, 0, 0)];
+        let cases = [
+            (21usize, 1usize, 1usize),
+            (9, 1, 1),
+            (21, 5, 13),
+            (9, 5, 5),
+            (4, 0, 0),
+        ];
 
         for &(stride, y0, x0) in &cases {
             for _ in 0..5_000 {
