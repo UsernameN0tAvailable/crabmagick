@@ -83,9 +83,21 @@ const DIST_ALPHABET_SIZE: usize = 40;
 const HASH_BITS: usize = 18;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const MAX_MATCH_LEN: usize = 4096;
-const MAX_CHAIN_DEPTH: usize = 32;
 const MAX_PLANE_CODE: usize = 1_048_576;
 const MAX_BACKWARD_DISTANCE: usize = MAX_PLANE_CODE - 120;
+
+/// Chain depth for LZ77 backward-reference search, effort-scaled to match libwebp.
+/// libwebp at effort=4 uses ~64, effort=6 uses effectively unlimited.
+/// We have large speed headroom so we can afford deeper search at high effort.
+const fn chain_depth_for_effort(effort: u8) -> usize {
+    match effort {
+        0..=1 => 16,
+        2..=3 => 32,
+        4     => 64,
+        5     => 128,
+        _     => 256,  // effort=6+
+    }
+}
 
 #[rustfmt::skip]
 const DISTANCE_MAP: [(i8, i8); 120] = [
@@ -455,7 +467,7 @@ fn distance_to_plane_code(dist: usize, small_lookup: &[u16]) -> u32 {
     (dist + 120) as u32
 }
 
-fn find_longest_match(pixels: &[u32], chain: &HashChain, pos: usize) -> Option<(usize, usize)> {
+fn find_longest_match(pixels: &[u32], chain: &HashChain, pos: usize, max_depth: usize) -> Option<(usize, usize)> {
     if pos + 1 >= pixels.len() {
         return None;
     }
@@ -466,7 +478,7 @@ fn find_longest_match(pixels: &[u32], chain: &HashChain, pos: usize) -> Option<(
     let mut depth = 0usize;
     let mut candidate_index = chain.chain[pos];
 
-    while candidate_index >= 0 && depth < MAX_CHAIN_DEPTH {
+    while candidate_index >= 0 && depth < max_depth {
         let candidate = candidate_index as usize;
         let dist = pos - candidate;
         if dist > MAX_BACKWARD_DISTANCE {
@@ -508,8 +520,9 @@ fn choose_cache_bits(num_pixels: usize) -> u8 {
     }
 }
 
-fn tokenize_pixels(pixels: &[u32], cache_bits: Option<u8>) -> (Vec<Token>, usize) {
+fn tokenize_pixels(pixels: &[u32], cache_bits: Option<u8>, effort: u8) -> (Vec<Token>, usize) {
     let chain = HashChain::build(pixels);
+    let max_depth = chain_depth_for_effort(effort);
     let mut tokens = Vec::with_capacity(pixels.len());
     let mut cache = cache_bits.map(ColorCache::new);
     let mut cache_hits = 0usize;
@@ -517,12 +530,12 @@ fn tokenize_pixels(pixels: &[u32], cache_bits: Option<u8>) -> (Vec<Token>, usize
 
     while pos < pixels.len() {
         let cache_hit = cache.as_ref().and_then(|c| c.lookup(pixels[pos]));
-        let copy = find_longest_match(pixels, &chain, pos);
+        let copy = find_longest_match(pixels, &chain, pos, max_depth);
 
         if let Some((len, dist)) = copy {
             let use_copy = if pos + 1 < pixels.len() {
                 let next_cache_hit = cache.as_ref().and_then(|c| c.lookup(pixels[pos + 1]));
-                let next_copy = find_longest_match(pixels, &chain, pos + 1);
+                let next_copy = find_longest_match(pixels, &chain, pos + 1, max_depth);
                 let skip_for_better_next = next_copy
                     .map(|(next_len, next_dist)| {
                         should_use_copy(next_len, next_dist, next_cache_hit.is_some())
@@ -731,12 +744,16 @@ fn write_tokens<W: Write>(
 pub struct EncoderParams {
     /// Use a predictor transform. Enabled by default.
     pub use_predictor_transform: bool,
+    /// Encoding effort 0–6. Higher = deeper LZ77 chain search, smaller files.
+    /// Default 4 matches libwebp's default quality level.
+    pub effort: u8,
 }
 
 impl Default for EncoderParams {
     fn default() -> Self {
         Self {
             use_predictor_transform: true,
+            effort: 4,
         }
     }
 }
@@ -838,9 +855,9 @@ fn encode_frame<W: Write>(
     let transformed = pixels.chunks_exact(4).map(pack_pixel).collect::<Vec<_>>();
 
     let suggested_cache_bits = choose_cache_bits(transformed.len());
-    let (mut tokens, cache_hits) = tokenize_pixels(&transformed, Some(suggested_cache_bits));
+    let (mut tokens, cache_hits) = tokenize_pixels(&transformed, Some(suggested_cache_bits), params.effort);
     let cache_bits = if cache_hits == 0 {
-        tokens = tokenize_pixels(&transformed, None).0;
+        tokens = tokenize_pixels(&transformed, None, params.effort).0;
         None
     } else {
         Some(suggested_cache_bits)

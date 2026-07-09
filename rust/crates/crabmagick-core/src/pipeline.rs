@@ -1393,8 +1393,12 @@ fn encode_webp_rgb(
         } else {
             (pixels, crate::webp_decode::ColorType::Rgb8)
         };
-        crate::webp_decode::WebPEncoder::new(&mut out)
-            .encode(pixels_to_encode, width, height, color_type)
+        let mut enc = crate::webp_decode::WebPEncoder::new(&mut out);
+        enc.set_params(crate::webp_decode::EncoderParams {
+            use_predictor_transform: true,
+            effort: options.effort.min(6),
+        });
+        enc.encode(pixels_to_encode, width, height, color_type)
             .map_err(|error| encode_error(format!("lossless WebP encoding failed: {error}")))?;
         Ok(out)
     } else {
@@ -1761,6 +1765,20 @@ fn encode_jxl_with_alpha(
         }
         if let Some(v) = options.optimize_codes {
             config = config.with_optimize_codes(v);
+        }
+        // Refinement loop: 1 SSIM2 iteration at eff=5-6, 2 at eff=7+.
+        // Closes the VarDCT quality gap vs libjxl by refining the quant field
+        // based on decoded quality rather than the initial AQ estimate alone.
+        #[cfg(feature = "ssim2-loop")]
+        {
+            let iters = match options.effort {
+                5..=6 => 1,
+                7..=u8::MAX => 2,
+                _ => 0,
+            };
+            if iters > 0 {
+                config = config.with_ssim2_iters(iters);
+            }
         }
         config
             .encode(pixels, width, height, layout)

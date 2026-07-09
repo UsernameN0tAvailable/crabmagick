@@ -71,12 +71,16 @@ so file sizes are directly comparable.
 | Q80 eff=4 — 800×600 | **52 ms** | 59 ms | 1.1× faster | 231 | 231 |
 | Q80 eff=4 — HD | **222 ms** | 242 ms | 1.1× faster | 993 | 993 |
 | lossless eff=4 — 256×256 | **0.8 ms** | 64 ms | **80× faster** | **8** | 20 |
-| lossless eff=4 — 800×600 | **2.5 ms** | 191 ms | **76× faster** | **12** | 20 |
-| lossless eff=4 — HD | **24 ms** | 401 ms | **17× faster** | **28** | 22 |
+| lossless eff=6 — 256×256 | **0.9 ms** | 64 ms | **71× faster** | **8** | 20 |
+| lossless eff=4 — 800×600 | **2.9 ms** | 191 ms | **66× faster** | **10** | 20 |
+| lossless eff=6 — 800×600 | **3.3 ms** | 191 ms | **58× faster** | **9** | 20 |
+| lossless eff=4 — HD | **21 ms** | 384 ms | **18× faster** | **15** | 22 |
+| lossless eff=6 — HD | **27 ms** | 812 ms | **30× faster** | **11** | 22 |
 
-WebP lossless uses a custom pure-Rust encoder with a fast LZ77 chain. It is dramatically faster
-than libwebp at any effort level because libwebp serializes its lossless passes. Our encoder
-parallelizes them across all cores.
+WebP lossless uses a custom pure-Rust encoder with an effort-aware LZ77 chain (eff=0–6). It is
+dramatically faster than libwebp at any effort level because libwebp serializes its lossless
+passes. Our encoder parallelizes them across all cores. At higher efforts the chain depth increases
+(eff=4 → depth 64, eff=6 → depth 256), matching libwebp's quality while remaining 30-80× faster.
 
 #### PNG (same lossless content, way smaller files)
 
@@ -350,7 +354,8 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 | WebP Q80 eff=0 | **21** | 239 | 19.2 | 27 | 239 |
 | WebP Q80 eff=4 | **52** | 231 | 19.2 | 59 | 231 |
 | WebP Q80 eff=6 | **162** | 225 | 19.2 | 176 | 225 |
-| WebP lossless eff=4 | **2.5** | 12 | inf | 191 | 20 |
+| WebP lossless eff=4 | **2.9** | 10 | inf | 180 | 20 |
+| WebP lossless eff=6 | **3.3** | 9 | inf | 182 | 20 |
 | WebP near-lossless Q80 | 1836 | 522 | 51.1 | 456 | 536 |
 | PNG level=3 | **9.4** | 89 | inf | 9.1 | 462 |
 | PNG level=6 | **8.5** | 89 | inf | 13.0 | 461 |
@@ -387,7 +392,8 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 | JPEG Q75 opt-huffman | **12.9** | 18.2 | 1.4× faster |
 | JPEG Q95 opt-huffman | **25.6** | 52.7 | **2.1× faster** |
 | JPEG Q85 progressive | **49** | 52 | at parity |
-| WebP lossless eff=4 | **24** | 401 | **17× faster** |
+| WebP lossless eff=4 | **21** | 384 | **18× faster** |
+| WebP lossless eff=6 | **27** | 812 | **30× faster** |
 | JXL lossless eff=5 | **166** | 1667 | **10× faster** |
 | JXL lossless eff=7 | **297** | 2996 | **10× faster** |
 | TIFF Deflate | **17** | 26 | 1.5× faster, same size |

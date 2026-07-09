@@ -778,15 +778,17 @@ fn apply_epf_with_scratch(
         if scratch_b.len() < n {
             scratch_b.resize(n, 0.0);
         }
-        // No zeroing needed — EPF kernels write every output pixel
+        // No zeroing needed — EPF kernels write every output pixel.
+        // Slice to [..n] to prevent par_chunks_mut from iterating over stale
+        // elements from a previous (larger) image encoding in the same thread-local.
         epf_simd_strip_parallel(
             crate::jxl_encode_simd::epf_step1,
             &padded_scratch[0][..padded_len],
             &padded_scratch[1][..padded_len],
             &padded_scratch[2][..padded_len],
-            scratch_x,
-            scratch_y,
-            scratch_b,
+            &mut scratch_x[..n],
+            &mut scratch_y[..n],
+            &mut scratch_b[..n],
             inv_sigma,
             xsize_blocks,
             width,
@@ -843,15 +845,17 @@ fn apply_epf_with_scratch(
         if scratch_b.len() < n {
             scratch_b.resize(n, 0.0);
         }
-        // No zeroing needed — EPF kernels write every output pixel
+        // No zeroing needed — EPF kernels write every output pixel.
+        // Slice to [..n] to prevent par_chunks_mut from iterating over stale
+        // elements from a previous (larger) image encoding in the same thread-local.
         epf_simd_strip_parallel(
             crate::jxl_encode_simd::epf_step2,
             &padded_scratch[0][..padded_len],
             &padded_scratch[1][..padded_len],
             &padded_scratch[2][..padded_len],
-            scratch_x,
-            scratch_y,
-            scratch_b,
+            &mut scratch_x[..n],
+            &mut scratch_y[..n],
+            &mut scratch_b[..n],
             inv_sigma,
             xsize_blocks,
             width,
