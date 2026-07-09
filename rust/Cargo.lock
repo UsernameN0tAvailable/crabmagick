@@ -508,8 +508,7 @@ dependencies = [
  "byteorder-lite",
  "criterion",
  "enough",
- "fast-ssim2 0.7.1",
- "fast-ssim2 0.8.2",
+ "fast-ssim2",
  "fast_image_resize",
  "fearless_simd",
  "hashbrown 0.16.1",
@@ -545,7 +544,7 @@ dependencies = [
  "whereat",
  "wide",
  "yuv",
- "yuvxyb 0.5.0",
+ "yuvxyb",
  "zencodec",
  "zenlayout",
  "zenpixels",
@@ -729,30 +728,16 @@ dependencies = [
 
 [[package]]
 name = "fast-ssim2"
-version = "0.7.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57b14f283599922955989d328a7f8f805e03146fe96616aa60639a16cd478b7e"
+checksum = "8dcca2000fbfa5923eb54b5bedddadbe5f7c83f7ef65285ebe0ed10daa78d0f0"
 dependencies = [
  "archmage",
  "imgref",
  "magetypes",
  "num-traits",
  "thiserror 2.0.18",
- "yuvxyb 0.4.2",
- "yuvxyb-math",
-]
-
-[[package]]
-name = "fast-ssim2"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dcca2000fbfa5923eb54b5bedddadbe5f7c83f7ef65285ebe0ed10daa78d0f0"
-dependencies = [
- "archmage",
- "magetypes",
- "num-traits",
- "thiserror 2.0.18",
- "yuvxyb 0.5.0",
+ "yuvxyb",
  "yuvxyb-math",
 ]
 
@@ -2705,19 +2690,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d85a782d94ee43f078bcfd6fa82d4e6a5b2d1cfbbad168e4df5a9f7b39ef48c"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "yuvxyb"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b06d0d0f23a00eadd02381cf0c84472295bbcd3e7e21ffd2225300c83d557867"
-dependencies = [
- "av-data",
- "log",
- "num-traits",
- "v_frame 0.3.9",
- "yuvxyb-math",
 ]
 
 [[package]]

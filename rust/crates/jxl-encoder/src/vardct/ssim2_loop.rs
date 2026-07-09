@@ -352,7 +352,8 @@ impl VarDctEncoder {
                     let diff = tile_dist[bi] / target_distance;
                     if diff > 1.0 {
                         let old = quant_field_float[bi];
-                        quant_field_float[bi] = old * diff;
+                        let adj = (diff as f64).min(2.0).powf(0.4) as f32;
+                        quant_field_float[bi] = old * adj;
                         let qf_old = (old * inv_global_scale + 0.5).floor() as i32;
                         let qf_new =
                             (quant_field_float[bi] * inv_global_scale + 0.5).floor() as i32;
@@ -374,7 +375,8 @@ impl VarDctEncoder {
                         quant_field_float[bi] *= (diff as f64).powf(cur_pow) as f32;
                     } else {
                         let old = quant_field_float[bi];
-                        quant_field_float[bi] = old * diff;
+                        let adj = (diff as f64).min(2.0).powf(0.4) as f32;
+                        quant_field_float[bi] = old * adj;
                         let qf_old = (old * inv_global_scale + 0.5).floor() as i32;
                         let qf_new =
                             (quant_field_float[bi] * inv_global_scale + 0.5).floor() as i32;

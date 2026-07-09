@@ -530,9 +530,14 @@ impl EffortProfile {
             patches: effort >= 5,
             // libjxl enables tree learning at kKitten (effort 5) with nb_repeats=0.5
             tree_learning: effort >= 5,
-            lz77: effort >= 7,
+            // Enable LZ77 at eff=5+ for lossless: exploits periodicity/runs in residuals.
+            // libjxl enables LZ77 (Greedy) at kSquirrel (eff=7); at eff=5-6 we use Greedy
+            // as well — it finds backward refs that RLE misses, closing the eff=5 file-size gap.
+            lz77: effort >= 5,
             lz77_method: match effort {
-                0..=6 => Lz77Method::Rle,
+                0..=4 => Lz77Method::Rle,
+                5 => Lz77Method::Greedy,
+                6 => Lz77Method::Greedy,
                 7 => Lz77Method::Greedy, // upgraded from Rle: better matches, ~1s cost
                 8 => Lz77Method::Greedy,
                 _ => Lz77Method::Optimal,
