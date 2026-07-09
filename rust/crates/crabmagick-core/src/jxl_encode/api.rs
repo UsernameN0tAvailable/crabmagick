@@ -693,11 +693,11 @@ impl LosslessConfig {
             mode: EncoderMode::Reference,
             use_ans: profile.use_ans,
             tree_learning: profile.tree_learning,
-            // Squeeze (Haar wavelet) + tree learning is the libjxl lossless path at effort >= 5.
-            // The previous "hurts 14-62%" observation was made with broken predictor order
-            // (Gradient/Weighted excluded from small tree nodes due to pruning); after the
-            // predictor reorder fix the squeeze+tree path is now effective.
-            squeeze: effort >= 5,
+            // Keep squeeze opt-in by default. On natural-photo content, the plain
+            // tree-learning path is consistently smaller than the generic squeeze+tree
+            // path, while screenshots/palette-heavy images can still opt in explicitly
+            // or route through the palette transform first.
+            squeeze: false,
             lz77: profile.lz77,
             lz77_method: profile.lz77_method,
             patches: profile.patches,

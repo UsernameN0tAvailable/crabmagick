@@ -1913,7 +1913,7 @@ mod tests {
         let hash = hash_bytes(&bytes);
 
         // Updated: fix multi-DC-group context tree splitval
-        const EXPECTED_HASH: u64 = 0xb71172a676faf64d;
+        const EXPECTED_HASH: u64 = 0xb1fd318b767d8550;
         assert_eq!(
             hash,
             EXPECTED_HASH,
@@ -1954,7 +1954,7 @@ mod tests {
         let hash = hash_bytes(&bytes);
 
         // Updated: fix multi-DC-group context tree splitval
-        const EXPECTED_HASH: u64 = 0xeb729ad9e2766dd7;
+        const EXPECTED_HASH: u64 = 0x2dafa1674b7ba19f;
         assert_eq!(
             hash,
             EXPECTED_HASH,
@@ -1990,7 +1990,7 @@ mod tests {
         let hash = hash_bytes(&bytes);
 
         // Updated: fix multi-DC-group context tree splitval
-        const EXPECTED_HASH: u64 = 0x8a3db6460320e743;
+        const EXPECTED_HASH: u64 = 0x8aed222ded46cded;
         assert_eq!(
             hash,
             EXPECTED_HASH,

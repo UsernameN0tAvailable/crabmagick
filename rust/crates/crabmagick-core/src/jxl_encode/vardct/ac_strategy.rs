@@ -33,6 +33,7 @@ use super::dct::{
 };
 use super::quant::{dequant_weights, dequant_weights_full, quant_weights, quant_weights_full};
 use crate::jxl_encode::effort::EffortProfile;
+use std::cell::RefCell;
 
 /// Pre-allocated scratch buffers for entropy estimation.
 /// Avoids per-call heap allocations in the hot `estimate_entropy_full` loop.
@@ -68,6 +69,17 @@ impl EntropyEstScratch {
             pixels_8x8_pos: (usize::MAX, usize::MAX),
         }
     }
+
+    #[inline]
+    fn reset(&mut self) {
+        self.entropy_estimate = [0.0; 64];
+        self.pixels_8x8_pos = (usize::MAX, usize::MAX);
+    }
+}
+
+thread_local! {
+    static AC_STRATEGY_SCRATCH_TL: RefCell<EntropyEstScratch> =
+        RefCell::new(EntropyEstScratch::new());
 }
 
 /// Raw strategy codes matching the C++ `AcStrategy::Type` enum.
@@ -126,6 +138,10 @@ pub struct AcStrategyMap {
     data: Vec<u8>,
     pub xsize_blocks: usize,
     pub ysize_blocks: usize,
+    col_offset: usize,
+    row_offset: usize,
+    data_width: usize,
+    data_height: usize,
 }
 
 impl AcStrategyMap {
@@ -137,7 +153,54 @@ impl AcStrategyMap {
             data,
             xsize_blocks,
             ysize_blocks,
+            col_offset: 0,
+            row_offset: 0,
+            data_width: xsize_blocks,
+            data_height: ysize_blocks,
         }
+    }
+
+    /// Create a windowed map that stores only a rectangular subregion.
+    ///
+    /// This is used by the parallel AC-strategy search so each worker only allocates
+    /// the tile it owns instead of a full-image temporary map.
+    fn new_dct8_window(
+        xsize_blocks: usize,
+        ysize_blocks: usize,
+        col_offset: usize,
+        row_offset: usize,
+        data_width: usize,
+        data_height: usize,
+    ) -> Self {
+        let data = vec![1u8; data_width * data_height];
+        Self {
+            data,
+            xsize_blocks,
+            ysize_blocks,
+            col_offset,
+            row_offset,
+            data_width,
+            data_height,
+        }
+    }
+
+    #[inline]
+    fn data_col(&self, bx: usize) -> usize {
+        debug_assert!(bx >= self.col_offset);
+        debug_assert!(bx < self.col_offset + self.data_width);
+        bx - self.col_offset
+    }
+
+    #[inline]
+    fn data_row(&self, by: usize) -> usize {
+        debug_assert!(by >= self.row_offset);
+        debug_assert!(by < self.row_offset + self.data_height);
+        by - self.row_offset
+    }
+
+    #[inline]
+    fn data_index(&self, bx: usize, by: usize) -> usize {
+        self.data_row(by) * self.data_width + self.data_col(bx)
     }
 
     /// Create a new map forcing a specific strategy for all blocks that fit.
@@ -161,13 +224,13 @@ impl AcStrategyMap {
     /// Get the raw strategy at (bx, by).
     #[inline]
     pub fn raw_strategy(&self, bx: usize, by: usize) -> u8 {
-        self.data[by * self.xsize_blocks + bx] >> 1
+        self.data[self.data_index(bx, by)] >> 1
     }
 
     /// Is this the first (top-left) block of the transform?
     #[inline]
     pub fn is_first(&self, bx: usize, by: usize) -> bool {
-        (self.data[by * self.xsize_blocks + bx] & 1) != 0
+        (self.data[self.data_index(bx, by)] & 1) != 0
     }
 
     /// Get the strategy code for bitstream writing.
@@ -210,8 +273,8 @@ impl AcStrategyMap {
         for iy in 0..cy {
             for ix in 0..cx {
                 let is_first = (iy | ix) == 0;
-                self.data[(by + iy) * self.xsize_blocks + bx + ix] =
-                    (raw_strategy << 1) | (is_first as u8);
+                let idx = self.data_index(bx + ix, by + iy);
+                self.data[idx] = (raw_strategy << 1) | (is_first as u8);
             }
         }
     }
@@ -220,14 +283,15 @@ impl AcStrategyMap {
     /// The byte is `(raw_strategy << 1) | is_first`.
     #[inline]
     fn raw_byte(&self, bx: usize, by: usize) -> u8 {
-        self.data[by * self.xsize_blocks + bx]
+        self.data[self.data_index(bx, by)]
     }
 
     /// Set the raw packed byte at (bx, by) directly.
     /// Bypasses multi-block coverage logic — use only for save/restore.
     #[inline]
     fn set_raw_byte(&mut self, bx: usize, by: usize, byte: u8) {
-        self.data[by * self.xsize_blocks + bx] = byte;
+        let idx = self.data_index(bx, by);
+        self.data[idx] = byte;
     }
 
     /// Find the first block (top-left corner) of the transform that owns (bx, by).
@@ -359,9 +423,13 @@ impl AcStrategyMap {
     ) {
         debug_assert_eq!(self.xsize_blocks, src.xsize_blocks);
         for by in start_by..end_by {
-            let row_start = by * self.xsize_blocks;
-            self.data[row_start + start_bx..row_start + end_bx]
-                .copy_from_slice(&src.data[row_start + start_bx..row_start + end_bx]);
+            let dst_row = self.data_row(by) * self.data_width;
+            let src_row = src.data_row(by) * src.data_width;
+            let dst_start = dst_row + self.data_col(start_bx);
+            let src_start = src_row + src.data_col(start_bx);
+            let len = end_bx - start_bx;
+            self.data[dst_start..dst_start + len]
+                .copy_from_slice(&src.data[src_start..src_start + len]);
         }
     }
 
@@ -1713,56 +1781,63 @@ pub fn compute_ac_strategy(
 
     let xyb = [xyb_x, xyb_y, xyb_b];
 
-    // Build per-tile-row groups: each group covers TILE_DIM_IN_BLOCKS block rows.
-    // Processing tile rows in parallel (not individual tiles) reduces peak allocation
-    // from n_tiles × full_map (540 MB) to n_tile_rows × full_map (~9 MB).
-    let tile_rows: Vec<usize> = (0..ysize_blocks).step_by(TILE_DIM_IN_BLOCKS).collect();
+    let tiles: Vec<(usize, usize, usize, usize)> = (0..ysize_blocks)
+        .step_by(TILE_DIM_IN_BLOCKS)
+        .flat_map(|tile_by| {
+            let tile_h = TILE_DIM_IN_BLOCKS.min(ysize_blocks - tile_by);
+            (0..xsize_blocks)
+                .step_by(TILE_DIM_IN_BLOCKS)
+                .map(move |tile_bx| {
+                    let tile_w = TILE_DIM_IN_BLOCKS.min(xsize_blocks - tile_bx);
+                    (tile_bx, tile_by, tile_w, tile_h)
+                })
+        })
+        .collect();
 
     if crate::jxl_encode::parallel::sequential_maps_forced() {
         let mut ac_strategy = AcStrategyMap::new_dct8(xsize_blocks, ysize_blocks);
         let mut scratch = EntropyEstScratch::new();
-        for &tile_by in &tile_rows {
-            let tile_h = TILE_DIM_IN_BLOCKS.min(ysize_blocks - tile_by);
-            for tile_bx in (0..xsize_blocks).step_by(TILE_DIM_IN_BLOCKS) {
-                let tile_w = TILE_DIM_IN_BLOCKS.min(xsize_blocks - tile_bx);
-                process_tile(
-                    &xyb,
-                    stride,
-                    xsize_blocks,
-                    ysize_blocks,
-                    tile_bx,
-                    tile_by,
-                    tile_w,
-                    tile_h,
-                    distance,
-                    quant_field_float,
-                    masking,
-                    cfl_map,
-                    mask1x1,
-                    mask1x1_stride,
-                    profile,
-                    &mut ac_strategy,
-                    &mut scratch,
-                );
-            }
+        for &(tile_bx, tile_by, tile_w, tile_h) in &tiles {
+            process_tile(
+                &xyb,
+                stride,
+                xsize_blocks,
+                ysize_blocks,
+                tile_bx,
+                tile_by,
+                tile_w,
+                tile_h,
+                distance,
+                quant_field_float,
+                masking,
+                cfl_map,
+                mask1x1,
+                mask1x1_stride,
+                profile,
+                &mut ac_strategy,
+                &mut scratch,
+            );
         }
         validate_ac_strategy_map(&ac_strategy, xsize_blocks, ysize_blocks);
         return ac_strategy;
     }
 
-    // Process one tile row per task. Each task allocates a full-image AcStrategyMap
-    // but only writes to its assigned block rows. Results are merged by copying each
-    // tile-row's region into the final map.
-    //
-    // This keeps peak allocation at n_tile_rows × map_size (~9 MB for a 4000×3000
-    // image) instead of n_tiles × map_size (~540 MB with per-tile maps).
-    let tile_row_results = crate::jxl_encode::parallel::parallel_map(tile_rows.len(), |row_idx| {
-        let tile_by = tile_rows[row_idx];
-        let tile_h = TILE_DIM_IN_BLOCKS.min(ysize_blocks - tile_by);
-        let mut local_strategy = AcStrategyMap::new_dct8(xsize_blocks, ysize_blocks);
-        let mut scratch = EntropyEstScratch::new();
-        for tile_bx in (0..xsize_blocks).step_by(TILE_DIM_IN_BLOCKS) {
-            let tile_w = TILE_DIM_IN_BLOCKS.min(xsize_blocks - tile_bx);
+    // Process each tile independently. The local strategy map stores only the tile
+    // rectangle, so we get finer-grained parallelism without the old per-task
+    // full-image allocation.
+    let tile_results = crate::jxl_encode::parallel::parallel_map(tiles.len(), |tile_idx| {
+        let (tile_bx, tile_by, tile_w, tile_h) = tiles[tile_idx];
+        let mut local_strategy = AcStrategyMap::new_dct8_window(
+            xsize_blocks,
+            ysize_blocks,
+            tile_bx,
+            tile_by,
+            tile_w,
+            tile_h,
+        );
+        AC_STRATEGY_SCRATCH_TL.with(|scratch_cell| {
+            let mut scratch = scratch_cell.borrow_mut();
+            scratch.reset();
             process_tile(
                 &xyb,
                 stride,
@@ -1782,16 +1857,20 @@ pub fn compute_ac_strategy(
                 &mut local_strategy,
                 &mut scratch,
             );
-        }
-        local_strategy
+        });
+        (tile_bx, tile_by, tile_w, tile_h, local_strategy)
     });
 
-    // Merge tile-row results into a single map.
+    // Merge tile results into a single map.
     let mut ac_strategy = AcStrategyMap::new_dct8(xsize_blocks, ysize_blocks);
-    for (row_idx, tile_map) in tile_row_results.into_iter().enumerate() {
-        let tile_by = tile_rows[row_idx];
-        let tile_h = TILE_DIM_IN_BLOCKS.min(ysize_blocks - tile_by);
-        ac_strategy.copy_region_from(&tile_map, 0, tile_by, xsize_blocks, tile_by + tile_h);
+    for (tile_bx, tile_by, tile_w, tile_h, tile_map) in tile_results.into_iter() {
+        ac_strategy.copy_region_from(
+            &tile_map,
+            tile_bx,
+            tile_by,
+            tile_bx + tile_w,
+            tile_by + tile_h,
+        );
     }
 
     validate_ac_strategy_map(&ac_strategy, xsize_blocks, ysize_blocks);

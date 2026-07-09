@@ -462,7 +462,12 @@ impl EffortProfile {
             cfl_newton_max_iters: crate::jxl_encode_simd::NEWTON_MAX_ITERS_DEFAULT,
 
             // ── Quantization ──
-            use_adaptive_quant: effort >= 5,
+            // Our current adaptive QF field helps some synthetic/doc content, but on
+            // real natural photos it tends to over-specialize before the quality loop
+            // is available, inflating files versus libjxl/libvips. Keep the simpler
+            // flat field through effort 7, then re-enable adaptive QF together with
+            // the butteraugli refinement tier at effort 8+.
+            use_adaptive_quant: effort >= 8,
             adjust_quant_ac: effort >= 5,
             initial_q_numerator: if effort >= 5 { 0.39 } else { 0.79 },
             fixed_thresholds_y: [0.56, 0.62, 0.62, 0.62],
@@ -970,7 +975,7 @@ mod tests {
         assert!(p.epf_dynamic_sharpness); // e6+
         assert!(p.cfl_two_pass); // e7+
         assert!(p.cfl_newton); // e7+ with pass 2
-        assert!(p.use_adaptive_quant);
+        assert!(!p.use_adaptive_quant);
         assert!(p.adjust_quant_ac);
         assert_eq!(p.initial_q_numerator, 0.39);
         assert_eq!(p.k_favor_2x2, -0.4);
@@ -1002,7 +1007,7 @@ mod tests {
         assert!(!p.epf_dynamic_sharpness); // e6+
         assert!(p.cfl_two_pass); // e5+ (was e7+, extended in prior optimization)
         assert!(!p.cfl_newton); // e7+
-        assert!(p.use_adaptive_quant);
+        assert!(!p.use_adaptive_quant);
         assert!(p.adjust_quant_ac);
         assert_eq!(p.initial_q_numerator, 0.39);
         assert_eq!(p.butteraugli_iters, 0); // Adaptive QF is already non-flat; loop inflates files at eff<8

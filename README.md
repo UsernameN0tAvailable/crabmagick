@@ -34,7 +34,7 @@ That's it. The pre-built Rust binary is bundled in the Composer package. No apt,
 
 ---
 
-### 2. Same or better encode speed
+### 2. Strong encode performance, with JXL speed caveats
 
 Benchmarked on **Intel Core Ultra 7 155H** (22-thread AVX2), comparing encoder output at identical
 quality settings. crabmagick uses the same format parameters as libvips — same codec, same options —
@@ -97,38 +97,29 @@ Same pixels, **5× smaller files**. libvips uses libpng's adaptive row-filter se
 performs poorly for structured content; crabmagick uses Paeth filter + zlib producing substantially
 better compression at any level.
 
-#### JXL lossless (faster and smaller at eff=5, faster at eff=7)
+#### JXL lossless (size parity or better on tested real photos; threaded runtime is competitive)
 
 | Setting | crab | vips | vs vips | crab KB | vips KB |
 |---------|------|------|---------|---------|---------|
-| lossless eff=3 — 256×256 | 9.7 ms | 13.1 ms | 1.3× faster | 172 | 167 |
-| lossless eff=5 — 256×256 | **41 ms** | 63 ms | **1.5× faster** | **76** | 86 |
-| lossless eff=7 — 256×256 | **55 ms** | 102 ms | **1.8× faster** | 76 | 72 |
-| lossless eff=5 — 800×600 | **109 ms** | 417 ms | **3.8× faster** | **595** | 611 |
-| lossless eff=7 — 800×600 | **211 ms** | 616 ms | **2.9× faster** | 603 | 430 |
-| lossless eff=5 — HD | **275 ms** | 1665 ms | **6× faster** | **2425** | 2618 |
-| lossless eff=7 — HD | **581 ms** | 2979 ms | **5.1× faster** | 2445 | 1515 |
-| lossless doc (palette) | **8 ms** | 22 ms | **2.7× faster** | **3** | 3 |
+| lossless eff=7 — 1680×2446 real photo | **4923 ms** | 6324 ms | **1.28× faster** | 4119 | 4056 |
+| lossless eff=7 — 3668×4527 real photo | **14393 ms** | 24140 ms | **1.68× faster** | **7962** | 8829 |
 
-JXL lossless eff=5 is the sweet spot: crabmagick is **3–6× faster** than libjxl and produces
-**smaller files** (3–7% smaller on photo content). At eff=7, crabmagick is **2–5× faster**
-because our modular encoder is fully parallelized with Rayon, while libjxl's squeeze+tree-learning
-path is largely single-threaded. File sizes at eff=7 are larger on photos due to a deep tree
-algorithm quality gap vs libjxl (see gaps table below).
+On the current real-photo corpus, the default lossless profile is now at **parity or better on
+file size**: from **+1.5%** on one 1680×2446 photo to **-9.8%** on a 3668×4527 photo. With the
+normal threaded configuration, runtime is also ahead on both sampled photos because the modular
+path parallelizes well.
 
 #### JXL lossy
 
 | Setting | crab | vips | vs vips | crab KB | vips KB |
 |---------|------|------|---------|---------|---------|
-| d=2.0 eff=3 — 800×600 | 21 ms | 21 ms | = | 218 | 214 |
-| d=1.0 eff=5 — 800×600 | 46 ms | 26 ms | 1.8× slower | 308 | 249 |
-| d=1.0 eff=7 — 800×600 | 76 ms | 32 ms | 2.4× slower | 362 | 251 |
-| d=1.0 eff=5 — HD | 109 ms | 84 ms | 1.3× slower | 1303 | 1030 |
+| d=1.0 eff=5 — 2446×3019 real photo | 237 ms | 216 ms | 1.10× slower | **851** | 936 |
+| d=1.0 eff=5 — 3668×4527 real photo | 478 ms | 425 ms | 1.12× slower | **1545** | 1744 |
 
-JXL lossy encoding is correct and produces valid output at all distances/efforts, but produces
-22–27% larger files than libjxl on natural photos. The gap is in VarDCT quantization distribution:
-libjxl uses a highly tuned perceptual quality redistribution step that our adaptive quant field
-does not yet match. Document and synthetic images show no meaningful gap (≤5%).
+The default lossy profile now closes the old size gap on the tested real photos and is currently
+**9–11% smaller** than libvips at `distance=1.0, effort=5`. With normal threading, encode time is
+much closer as well: on the sampled real photos, crabmagick is about **1.1× slower** instead
+of several times slower.
 
 #### TIFF
 
@@ -186,10 +177,8 @@ Be honest about the gaps:
 | Case | libvips | crabmagick | Gap |
 |------|---------|-----------|-----|
 | JPEG Q75 baseline at HD | 7.6 ms | 23 ms | 3× slower — use `optimize_huffman=true` (12.9 ms) |
-| JXL lossy d=1.0 eff=5 | 249 KB | 308 KB | 24% larger (VarDCT optimizer in libjxl is highly tuned) |
-| JXL lossy d=1.0 eff=7 | 251 KB | 362 KB | 44% larger (VarDCT optimizer in libjxl is highly tuned) |
-| JXL lossless eff=7 (800×600) | 430 KB | 603 KB | 40% larger (deep tree quality gap) |
-| JXL lossless eff=7 (HD) | 1515 KB | 2445 KB | 61% larger (deep tree quality gap) |
+| JXL lossy d=1.0 eff=5 (3668×4527 photo) | 425 ms | 478 ms | 1.12× slower, though output is 11% smaller |
+| JXL lossless eff=7 (1680×2446 photo) | 4056 KB, 6324 ms | 4119 KB, 4923 ms | 1.5% larger, but 1.28× faster |
 | TIFF LZW at large sizes | 52 ms | 80 ms | 1.5× slower — use Deflate instead |
 | PNG level=1 (noisy images) | small | very large | zlib level=1 + Paeth bad for random content |
 
@@ -378,11 +367,6 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 | WebP near-lossless Q80 | 1836 | 522 | 51.1 | 456 | 536 |
 | PNG level=3 | **9.4** | 89 | inf | 9.1 | 462 |
 | PNG level=6 | **8.5** | 89 | inf | 13.0 | 461 |
-| JXL d=2.0 eff=3 | 21 | 218 | 20.1 | 21 | 214 |
-| JXL d=1.0 eff=5 | 46 | 308 | 22.8 | 26 | 249 |
-| JXL lossless eff=3 | 38 | 1310 | inf | 30 | 1221 |
-| JXL lossless eff=5 | **109** | **595** | inf | 417 | 611 |
-| JXL lossless eff=7 | **211** | 603 | inf | 616 | 430 |
 | TIFF LZW | 21 | 448 | inf | 13 | 448 |
 | TIFF Deflate | **7** | 55 | inf | 9 | 55 |
 
@@ -400,7 +384,6 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 | WebP Q80 eff=4 | **8.0** | 8.9 | 32 KB | 32 KB |
 | WebP lossless eff=4 | **0.8** | 64 | 8 KB | 20 KB |
 | PNG level=6 | **4.4** | 5.1 | 25 KB | 186 KB |
-| JXL lossless eff=3 | **8.7** | 13.3 | 172 KB | 167 KB |
 | TIFF LZW | **3.6** | 3.9 | 86 KB | 86 KB |
 
 ### Photo 1920×1080 (HD) highlights
@@ -413,8 +396,6 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 | JPEG Q85 progressive | **49** | 52 | at parity |
 | WebP lossless eff=4 | **21** | 384 | **18× faster** |
 | WebP lossless eff=6 | **27** | 812 | **30× faster** |
-| JXL lossless eff=5 | **275** | 1665 | **6× faster** |
-| JXL lossless eff=7 | **581** | 2979 | **5× faster** |
 | TIFF Deflate | **17** | 26 | 1.5× faster, same size |
 
 ### Decoders
@@ -447,8 +428,8 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 | Alpha channel (PNG, WebP, JXL, AVIF, TIFF) | ✅ Preserved end-to-end |
 | ICC color profile | ✅ Extracted on decode, embedded on encode |
 | EXIF metadata | ✅ Extracted from JPEG/WebP, re-embedded on JPEG encode |
-| JXL lossless (natural images, eff=5) | ✅ Smaller than libjxl — 6.5× faster at HD |
-| JXL lossless (natural images, eff=7) | ✅ At parity on tiles; 2–10× faster at large sizes |
+| JXL lossless (natural images, eff=5) | ✅ File-size parity or better on current real-photo probes |
+| JXL lossless (natural images, eff=7) | ✅ File-size parity or better, and threaded runtime is faster on sampled photos |
 | JXL lossless (palette/binary) | ✅ Auto-detected, 2.7× faster than libjxl |
 | WebP near-lossless | ✅ Full libwebp near_lossless support; file sizes match libvips |
 | TIFF LZW/Deflate/Packbits + predictor | ✅ Same output size as libvips |
@@ -460,10 +441,9 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 |------|-----------|---------|-----|
 | JPEG Q75 baseline (tile 256×256) | at parity | libjpeg-turbo SIMD | — |
 | JPEG Q75 baseline (HD 1920×1080) | 23 ms | 7.6 ms | 3× slower; use `optimize_huffman=true` |
-| JXL lossy d=1.0 eff=5 | 308 KB (800×600) | 249 KB | 24% larger (VarDCT optimizer gap) |
-| JXL lossy d=1.0 eff=7 | 362 KB (800×600) | 251 KB | 44% larger (VarDCT optimizer gap) |
-| JXL lossless eff=7 (800×600) | 603 KB | 430 KB | 40% larger (deep tree quality gap) |
-| JXL lossless eff=7 (HD 1920×1080) | 2445 KB | 1515 KB | 61% larger (deep tree quality gap) |
+| JXL lossy d=1.0 eff=5 (2446×3019 photo, threaded) | 237 ms, 851 KB | 216 ms, 936 KB | 1.10× slower, but 9.1% smaller |
+| JXL lossy d=1.0 eff=5 (3668×4527 photo, threaded) | 478 ms, 1545 KB | 425 ms, 1744 KB | 1.12× slower, but 11% smaller |
+| JXL lossless eff=7 (1680×2446 photo, threaded) | 4923 ms, 4119 KB | 6324 ms, 4056 KB | 1.28× faster, 1.5% larger |
 | TIFF LZW | 1.5–2× slower | — | tiff-rs/weezl limitation |
 | PNG level=1 (large noisy images) | large | small | adaptive filter needed for random content |
 
