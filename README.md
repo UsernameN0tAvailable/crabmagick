@@ -113,13 +113,17 @@ path parallelizes well.
 
 | Setting | crab | vips | vs vips | crab KB | vips KB |
 |---------|------|------|---------|---------|---------|
-| d=1.0 eff=5 — 2446×3019 real photo | 237 ms | 216 ms | 1.10× slower | **851** | 936 |
-| d=1.0 eff=5 — 3668×4527 real photo | 478 ms | 425 ms | 1.12× slower | **1545** | 1744 |
+| d=1.0 eff=5 — 2446×3019 real photo | **188 ms** | 209 ms | **1.11× faster** | **845** | 936 |
+| d=1.0 eff=5 — 3668×4527 real photo | **348 ms** | 420 ms | **1.20× faster** | **1530** | 1744 |
+| d=1.0 eff=7 — 2446×3019 real photo | **262 ms** | 269 ms | **1.03× faster** | **852** | 945 |
+| d=1.0 eff=7 — 3668×4527 real photo | **526 ms** | 536 ms | **1.02× faster** | **1546** | 1758 |
 
-The default lossy profile now closes the old size gap on the tested real photos and is currently
-**9–11% smaller** than libvips at `distance=1.0, effort=5`. With normal threading, encode time is
-much closer as well: on the sampled real photos, crabmagick is about **1.1× slower** instead
-of several times slower.
+The default lossy profile is now ahead on the sampled real-photo corpus at both
+`distance=1.0, effort=5` and `distance=1.0, effort=7`: runtime is faster on the
+current anchor photos, output is still **9.7–12.3% smaller** than libvips on the
+anchor set, and measured PSNR/SSIM remain above the previous crabmagick baselines.
+An additional sweep on 1223×1509 and 4891×6037 photos also stayed ahead at
+`effort=7` while remaining smaller than libvips.
 
 #### TIFF
 
@@ -177,7 +181,6 @@ Be honest about the gaps:
 | Case | libvips | crabmagick | Gap |
 |------|---------|-----------|-----|
 | JPEG Q75 baseline at HD | 7.6 ms | 23 ms | 3× slower — use `optimize_huffman=true` (12.9 ms) |
-| JXL lossy d=1.0 eff=5 (3668×4527 photo) | 425 ms | 478 ms | 1.12× slower, though output is 11% smaller |
 | JXL lossless eff=7 (1680×2446 photo) | 4056 KB, 6324 ms | 4119 KB, 4923 ms | 1.5% larger, but 1.28× faster |
 | TIFF LZW at large sizes | 52 ms | 80 ms | 1.5× slower — use Deflate instead |
 | PNG level=1 (noisy images) | small | very large | zlib level=1 + Paeth bad for random content |
@@ -428,6 +431,7 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 | Alpha channel (PNG, WebP, JXL, AVIF, TIFF) | ✅ Preserved end-to-end |
 | ICC color profile | ✅ Extracted on decode, embedded on encode |
 | EXIF metadata | ✅ Extracted from JPEG/WebP, re-embedded on JPEG encode |
+| JXL lossy (natural photos, d=1.0 eff=5/e7) | ✅ Smaller than libvips and faster on current sampled photos |
 | JXL lossless (natural images, eff=5) | ✅ File-size parity or better on current real-photo probes |
 | JXL lossless (natural images, eff=7) | ✅ File-size parity or better, and threaded runtime is faster on sampled photos |
 | JXL lossless (palette/binary) | ✅ Auto-detected, 2.7× faster than libjxl |
@@ -441,8 +445,6 @@ medium, 1920×1080 HD). Each cell shows median of 5 runs.
 |------|-----------|---------|-----|
 | JPEG Q75 baseline (tile 256×256) | at parity | libjpeg-turbo SIMD | — |
 | JPEG Q75 baseline (HD 1920×1080) | 23 ms | 7.6 ms | 3× slower; use `optimize_huffman=true` |
-| JXL lossy d=1.0 eff=5 (2446×3019 photo, threaded) | 237 ms, 851 KB | 216 ms, 936 KB | 1.10× slower, but 9.1% smaller |
-| JXL lossy d=1.0 eff=5 (3668×4527 photo, threaded) | 478 ms, 1545 KB | 425 ms, 1744 KB | 1.12× slower, but 11% smaller |
 | JXL lossless eff=7 (1680×2446 photo, threaded) | 4923 ms, 4119 KB | 6324 ms, 4056 KB | 1.28× faster, 1.5% larger |
 | TIFF LZW | 1.5–2× slower | — | tiff-rs/weezl limitation |
 | PNG level=1 (large noisy images) | large | small | adaptive filter needed for random content |

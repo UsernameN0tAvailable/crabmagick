@@ -415,9 +415,12 @@ impl EffortProfile {
             optimize_codes: effort >= 3,
             custom_orders: effort >= 4,
             gaborish: effort >= 5,
-            pixel_domain_loss: effort >= 5,
+            pixel_domain_loss: false,
             error_diffusion: false, // libjxl accepts param but never uses it
-            patches: effort >= 7,
+            // Keep patches opt-in for lossy reference mode. They help some synthetic
+            // content, but on real-photo workloads they add a large runtime cost at
+            // effort 7+ without improving bytes.
+            patches: false,
             tree_learning: effort >= 7,
             // libjxl does NOT use LZ77 for VarDCT DC or AC at effort < 9.
             // DC: ForModular() → lz77_method = kNone (modular_mode=false).
@@ -455,7 +458,10 @@ impl EffortProfile {
             chromacity_adjustment: effort >= 7,
             enhanced_clustering_vardct: effort >= 9,
             optimize_uint_configs_vardct: effort >= 9,
-            epf_dynamic_sharpness: effort >= 6,
+            // The full per-block EPF sharpness search is expensive and has not paid
+            // for itself on the current real-photo corpus. Keep EPF itself enabled,
+            // but use the default sharpness instead of searching it.
+            epf_dynamic_sharpness: false,
             cfl_two_pass: effort >= 5,
             cfl_newton: effort >= 7,
             cfl_newton_eps: crate::jxl_encode_simd::NEWTON_EPS_DEFAULT,
@@ -963,16 +969,16 @@ mod tests {
         assert!(p.optimize_codes);
         assert!(p.custom_orders);
         assert!(p.gaborish);
-        assert!(p.pixel_domain_loss);
+        assert!(!p.pixel_domain_loss);
         assert!(!p.error_diffusion);
-        assert!(p.patches);
+        assert!(!p.patches);
         assert!(!p.lz77); // libjxl only enables LZ77 for VarDCT at e9+ (kTortoise)
         assert_eq!(p.butteraugli_iters, 0); // Adaptive QF is already non-flat; loop inflates files at eff<8
         assert!(p.try_dct32);
         assert!(p.chromacity_adjustment); // e7+
         assert!(!p.enhanced_clustering_vardct); // e9+
         assert!(!p.optimize_uint_configs_vardct); // e9+ (libjxl kNone at e<9)
-        assert!(p.epf_dynamic_sharpness); // e6+
+        assert!(!p.epf_dynamic_sharpness);
         assert!(p.cfl_two_pass); // e7+
         assert!(p.cfl_newton); // e7+ with pass 2
         assert!(!p.use_adaptive_quant);
@@ -992,7 +998,7 @@ mod tests {
         assert_eq!(p.effort, 5);
         assert!(p.use_ans);
         assert!(p.gaborish);
-        assert!(p.pixel_domain_loss);
+        assert!(!p.pixel_domain_loss);
         assert!(!p.error_diffusion); // e7+
         assert!(!p.patches); // e7+
         assert!(!p.lz77); // e9+ for VarDCT
@@ -1004,7 +1010,7 @@ mod tests {
         assert!(!p.chromacity_adjustment); // e7+
         assert!(!p.enhanced_clustering_vardct); // e9+
         assert!(!p.optimize_uint_configs_vardct); // e9+
-        assert!(!p.epf_dynamic_sharpness); // e6+
+        assert!(!p.epf_dynamic_sharpness);
         assert!(p.cfl_two_pass); // e5+ (was e7+, extended in prior optimization)
         assert!(!p.cfl_newton); // e7+
         assert!(!p.use_adaptive_quant);

@@ -3,9 +3,12 @@ use crabmagick_core::jxl_encode::{
     effort::{LosslessInternalParams, LossyInternalParams},
 };
 use crabmagick_core::pipeline::decode_any_with_options;
+use fast_ssim2::compute_ssimulacra2;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
+use yuvxyb::{ColorPrimaries, Rgb, TransferCharacteristic};
 
 #[derive(Clone)]
 struct RgbImage {
@@ -17,6 +20,11 @@ struct RgbImage {
 struct VipsResult {
     ms: f64,
     bytes: usize,
+}
+
+struct QualityMetrics {
+    psnr: f64,
+    ssim2: f64,
 }
 
 enum EncodeKind {
@@ -49,14 +57,9 @@ fn median_ms(mut times: Vec<f64>) -> f64 {
 }
 
 fn load_rgb(path: &Path) -> RgbImage {
-    let decoded = decode_any_with_options(
-        path.to_str().expect("non-utf8 path"),
-        None,
-        false,
-        0,
-        None,
-    )
-    .expect("decode failed");
+    let decoded =
+        decode_any_with_options(path.to_str().expect("non-utf8 path"), None, false, 0, None)
+            .expect("decode failed");
     RgbImage {
         width: decoded.width,
         height: decoded.height,
@@ -117,6 +120,95 @@ fn bench_ours(kind: &EncodeKind, image: &RgbImage, runs: usize) -> (f64, usize) 
     (median_ms(times), bytes)
 }
 
+fn decode_rgb(encoded: &[u8]) -> RgbImage {
+    let mut file = tempfile::NamedTempFile::new().expect("tempfile create failed");
+    std::io::Write::write_all(&mut file, encoded).expect("tempfile write failed");
+    let decoded = decode_any_with_options(
+        file.path().to_str().expect("non-utf8 temp path"),
+        None,
+        false,
+        0,
+        None,
+    )
+    .expect("roundtrip decode failed");
+    RgbImage {
+        width: decoded.width,
+        height: decoded.height,
+        pixels: decoded.pixels,
+    }
+}
+
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mse: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            let d = x as f64 - y as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / a.len() as f64;
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        20.0 * f64::log10(255.0) - 10.0 * f64::log10(mse)
+    }
+}
+
+fn ssim2(original: &RgbImage, decoded: &RgbImage) -> f64 {
+    let src: Vec<[f32; 3]> = original
+        .pixels
+        .chunks_exact(3)
+        .map(|rgb| {
+            [
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            ]
+        })
+        .collect();
+    let dst: Vec<[f32; 3]> = decoded
+        .pixels
+        .chunks_exact(3)
+        .map(|rgb| {
+            [
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            ]
+        })
+        .collect();
+    let width = NonZeroUsize::new(original.width as usize).expect("ssim2 width must be non-zero");
+    let height =
+        NonZeroUsize::new(original.height as usize).expect("ssim2 height must be non-zero");
+    let source = Rgb::new(
+        src,
+        width,
+        height,
+        TransferCharacteristic::SRGB,
+        ColorPrimaries::BT709,
+    )
+    .expect("ssim2 source build failed");
+    let distorted = Rgb::new(
+        dst,
+        width,
+        height,
+        TransferCharacteristic::SRGB,
+        ColorPrimaries::BT709,
+    )
+    .expect("ssim2 distorted build failed");
+    compute_ssimulacra2(source, distorted).unwrap_or(f64::NAN)
+}
+
+fn compute_metrics(image: &RgbImage, encoded: &[u8]) -> QualityMetrics {
+    let decoded = decode_rgb(encoded);
+    QualityMetrics {
+        psnr: psnr(&image.pixels, &decoded.pixels),
+        ssim2: ssim2(image, &decoded),
+    }
+}
+
 fn fmt_ratio(ours: usize, theirs: usize) -> String {
     if theirs == 0 {
         return "-".into();
@@ -125,41 +217,158 @@ fn fmt_ratio(ours: usize, theirs: usize) -> String {
     format!("{delta:+.1}%")
 }
 
-fn lossy_variants(threads: usize) -> Vec<(EncodeKind, &'static str)> {
-    let base = LossyConfig::new(1.0).with_effort(5).with_threads(threads);
+fn lossy_variants(threads: usize, distance: f32, effort: u8) -> Vec<(EncodeKind, String)> {
+    let base = LossyConfig::new(distance)
+        .with_effort(effort)
+        .with_threads(threads);
+    let vips_suffix = format!(".jxl[distance={distance},effort={effort}]");
     let mut k_ac_low = LossyInternalParams::default();
     k_ac_low.k_ac_quant = Some(0.70);
     let mut k_ac_high = LossyInternalParams::default();
     k_ac_high.k_ac_quant = Some(0.82);
     vec![
         (
-            EncodeKind::Lossy(base.clone(), "lossy/base-e5".into()),
-            ".jxl[distance=1.0,effort=5]",
+            EncodeKind::Lossy(base.clone(), format!("lossy/base-e{effort}")),
+            vips_suffix.clone(),
         ),
         (
             EncodeKind::Lossy(
                 base.clone().with_adaptive_block_contexts(false),
                 "lossy/no-block-ctx".into(),
             ),
-            ".jxl[distance=1.0,effort=5]",
+            vips_suffix.clone(),
         ),
         (
             EncodeKind::Lossy(
                 base.clone().with_cfl_two_pass(false),
                 "lossy/no-cfl2".into(),
             ),
-            ".jxl[distance=1.0,effort=5]",
+            vips_suffix.clone(),
         ),
         (
             EncodeKind::Lossy(base.clone().with_patches(false), "lossy/no-patches".into()),
-            ".jxl[distance=1.0,effort=5]",
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(base.clone().with_epf(false), "lossy/no-epf".into()),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone().with_epf_dynamic_sharpness(false),
+                "lossy/no-epf-dyn".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone().with_patches(false).with_epf(false),
+                "lossy/no-patches+no-epf".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone()
+                    .with_patches(false)
+                    .with_epf_dynamic_sharpness(false),
+                "lossy/no-patches+no-epf-dyn".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone().with_pixel_domain_loss(false),
+                "lossy/no-pixel-loss".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                LossyConfig::new(1.02)
+                    .with_effort(effort)
+                    .with_threads(threads)
+                    .with_pixel_domain_loss(false),
+                "lossy/no-pixel-loss@d1.02".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                LossyConfig::new(1.04)
+                    .with_effort(effort)
+                    .with_threads(threads)
+                    .with_pixel_domain_loss(false),
+                "lossy/no-pixel-loss@d1.04".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                LossyConfig::new(1.06)
+                    .with_effort(effort)
+                    .with_threads(threads)
+                    .with_pixel_domain_loss(false),
+                "lossy/no-pixel-loss@d1.06".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone()
+                    .with_pixel_domain_loss(false)
+                    .with_cfl_two_pass(false),
+                "lossy/no-pixel-loss+no-cfl2".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone()
+                    .with_pixel_domain_loss(false)
+                    .with_adaptive_block_contexts(false),
+                "lossy/no-pixel-loss+no-block-ctx".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone()
+                    .with_pixel_domain_loss(false)
+                    .with_max_strategy_size(Some(32)),
+                "lossy/no-pixel-loss+max-32".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone()
+                    .with_pixel_domain_loss(false)
+                    .with_adaptive_quant(false),
+                "lossy/no-pixel-loss+flat-qf".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone().with_gaborish(false),
+                "lossy/no-gaborish".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone().with_max_strategy_size(Some(32)),
+                "lossy/max-32".into(),
+            ),
+            vips_suffix.clone(),
         ),
         (
             EncodeKind::Lossy(
                 base.clone().with_adaptive_quant(false),
                 "lossy/flat-qf".into(),
             ),
-            ".jxl[distance=1.0,effort=5]",
+            vips_suffix.clone(),
         ),
         (
             EncodeKind::Lossy(
@@ -168,26 +377,43 @@ fn lossy_variants(threads: usize) -> Vec<(EncodeKind, &'static str)> {
                     .with_butteraugli_iters(2),
                 "lossy/flat-qf+bfly2".into(),
             ),
-            ".jxl[distance=1.0,effort=5]",
+            vips_suffix.clone(),
         ),
         (
             EncodeKind::Lossy(
-                base.clone().with_internal_params(k_ac_low),
+                base.clone().with_internal_params(k_ac_low.clone()),
                 "lossy/k_ac_quant=0.70".into(),
             ),
-            ".jxl[distance=1.0,effort=5]",
+            vips_suffix.clone(),
         ),
         (
             EncodeKind::Lossy(
-                base.with_internal_params(k_ac_high),
+                base.clone()
+                    .with_pixel_domain_loss(false)
+                    .with_internal_params(k_ac_low),
+                "lossy/no-pixel-loss+k_ac_quant=0.70".into(),
+            ),
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.clone().with_internal_params(k_ac_high.clone()),
                 "lossy/k_ac_quant=0.82".into(),
             ),
-            ".jxl[distance=1.0,effort=5]",
+            vips_suffix.clone(),
+        ),
+        (
+            EncodeKind::Lossy(
+                base.with_pixel_domain_loss(false)
+                    .with_internal_params(k_ac_high),
+                "lossy/no-pixel-loss+k_ac_quant=0.82".into(),
+            ),
+            vips_suffix,
         ),
     ]
 }
 
-fn lossless_variants(threads: usize) -> Vec<(EncodeKind, &'static str)> {
+fn lossless_variants(threads: usize) -> Vec<(EncodeKind, String)> {
     let base = LosslessConfig::new().with_effort(7).with_threads(threads);
     let eff5 = LosslessConfig::new().with_effort(5).with_threads(threads);
     let eff9 = LosslessConfig::new().with_effort(9).with_threads(threads);
@@ -213,64 +439,64 @@ fn lossless_variants(threads: usize) -> Vec<(EncodeKind, &'static str)> {
     vec![
         (
             EncodeKind::Lossless(eff5, "lossless/base-e5".into()),
-            ".jxl[lossless=1,effort=5]",
+            ".jxl[lossless=1,effort=5]".into(),
         ),
         (
             EncodeKind::Lossless(base.clone(), "lossless/base-e7".into()),
-            ".jxl[lossless=1,effort=7]",
+            ".jxl[lossless=1,effort=7]".into(),
         ),
         (
             EncodeKind::Lossless(
                 base.clone().with_squeeze(false),
                 "lossless/e7-no-squeeze".into(),
             ),
-            ".jxl[lossless=1,effort=7]",
+            ".jxl[lossless=1,effort=7]".into(),
         ),
         (
             EncodeKind::Lossless(
                 base.clone().with_tree_learning(false),
                 "lossless/e7-no-tree".into(),
             ),
-            ".jxl[lossless=1,effort=7]",
+            ".jxl[lossless=1,effort=7]".into(),
         ),
         (
             EncodeKind::Lossless(
                 base.clone().with_squeeze(false).with_tree_learning(true),
                 "lossless/e7-tree-no-squeeze".into(),
             ),
-            ".jxl[lossless=1,effort=7]",
+            ".jxl[lossless=1,effort=7]".into(),
         ),
         (
             EncodeKind::Lossless(
                 base.clone().with_internal_params(sample_075),
                 "lossless/sample=0.75".into(),
             ),
-            ".jxl[lossless=1,effort=7]",
+            ".jxl[lossless=1,effort=7]".into(),
         ),
         (
             EncodeKind::Lossless(
                 base.clone().with_internal_params(e8_tree),
                 "lossless/e8-tree@e7".into(),
             ),
-            ".jxl[lossless=1,effort=7]",
+            ".jxl[lossless=1,effort=7]".into(),
         ),
         (
             EncodeKind::Lossless(
                 base.clone().with_internal_params(e9_tree_lite),
                 "lossless/e9-tree-lite".into(),
             ),
-            ".jxl[lossless=1,effort=7]",
+            ".jxl[lossless=1,effort=7]".into(),
         ),
         (
             EncodeKind::Lossless(
                 base.with_internal_params(e9_tree_full),
                 "lossless/e9-tree-full".into(),
             ),
-            ".jxl[lossless=1,effort=7]",
+            ".jxl[lossless=1,effort=7]".into(),
         ),
         (
             EncodeKind::Lossless(eff9, "lossless/base-e9".into()),
-            ".jxl[lossless=1,effort=9]",
+            ".jxl[lossless=1,effort=9]".into(),
         ),
     ]
 }
@@ -279,14 +505,14 @@ fn run_group(
     title: &str,
     path: &Path,
     image: &RgbImage,
-    variants: Vec<(EncodeKind, &'static str)>,
+    variants: Vec<(EncodeKind, String)>,
     filter: Option<&str>,
 ) {
     println!("## {title}");
     println!("image: {}", path.display());
     println!("dims: {}x{}", image.width, image.height);
-    println!("| variant | ours ms | ours KB | vips ms | vips KB | vs vips |");
-    println!("|---|---:|---:|---:|---:|---:|");
+    println!("| variant | ours ms | ours KB | PSNR | SSIM2 | vips ms | vips KB | vs vips |");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|");
     for (kind, suffix) in variants {
         if let Some(filter) = filter {
             if kind.label() != filter {
@@ -294,12 +520,16 @@ fn run_group(
             }
         }
         let (ours_ms, ours_bytes) = bench_ours(&kind, image, 1);
-        let vips = pyvips_encode(path, suffix, 1).expect("pyvips encode failed");
+        let ours_encoded = kind.encode(image);
+        let metrics = compute_metrics(image, &ours_encoded);
+        let vips = pyvips_encode(path, &suffix, 1).expect("pyvips encode failed");
         println!(
-            "| {} | {:.2} | {} | {:.2} | {} | {} |",
+            "| {} | {:.2} | {} | {:.2} | {:.2} | {:.2} | {} | {} |",
             kind.label(),
             ours_ms,
             ours_bytes / 1024,
+            metrics.psnr,
+            metrics.ssim2,
             vips.ms,
             vips.bytes / 1024,
             fmt_ratio(ours_bytes, vips.bytes),
@@ -313,6 +543,8 @@ fn main() {
     let mut group = String::from("both");
     let mut filter: Option<String> = None;
     let mut threads = 0usize;
+    let mut distance = 1.0f32;
+    let mut effort = 5u8;
     let mut path_arg: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         if arg == "--group" {
@@ -325,6 +557,18 @@ fn main() {
                 .expect("missing value after --threads")
                 .parse()
                 .expect("invalid usize after --threads");
+        } else if arg == "--distance" {
+            distance = args
+                .next()
+                .expect("missing value after --distance")
+                .parse()
+                .expect("invalid f32 after --distance");
+        } else if arg == "--effort" {
+            effort = args
+                .next()
+                .expect("missing value after --effort")
+                .parse()
+                .expect("invalid u8 after --effort");
         } else {
             path_arg = Some(PathBuf::from(arg));
         }
@@ -339,10 +583,10 @@ fn main() {
     let image = load_rgb(&path);
     match group.as_str() {
         "lossy" => run_group(
-            "Lossy d=1.0 eff=5",
+            &format!("Lossy d={distance:.1} eff={effort}"),
             &path,
             &image,
-            lossy_variants(threads),
+            lossy_variants(threads, distance, effort),
             filter.as_deref(),
         ),
         "lossless" => run_group(
@@ -354,10 +598,10 @@ fn main() {
         ),
         "both" => {
             run_group(
-                "Lossy d=1.0 eff=5",
+                &format!("Lossy d={distance:.1} eff={effort}"),
                 &path,
                 &image,
-                lossy_variants(threads),
+                lossy_variants(threads, distance, effort),
                 filter.as_deref(),
             );
             run_group(

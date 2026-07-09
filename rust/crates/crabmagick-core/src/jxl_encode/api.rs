@@ -1153,6 +1153,22 @@ impl LossyConfig {
         })
     }
 
+    /// Internal distance renormalization for the faster no-pixel-domain-loss path.
+    ///
+    /// Empirically, disabling pixel-domain loss with a slight distance uplift
+    /// preserves or improves filesize and quality while cutting runtime
+    /// substantially on photo workloads.
+    #[inline]
+    pub(crate) fn effective_vardct_distance(&self) -> f32 {
+        if self.pixel_domain_loss {
+            self.distance
+        } else if self.effort >= 7 {
+            self.distance * 1.01
+        } else {
+            self.distance * 1.02
+        }
+    }
+
     /// Apply picker / sweep override knobs scoped to the **lossy (VarDCT)**
     /// encode path.
     ///
@@ -1192,9 +1208,9 @@ impl LossyConfig {
     /// This adjusts all effort-dependent defaults:
     /// - **e1–3**: DCT8 only, Huffman, no gaborish/patches/butteraugli
     /// - **e4**: + ANS entropy coding, custom coefficient orders
-    /// - **e5**: + gaborish, pixel-domain loss, AC strategy search, AdjustQuantBlockAC
+    /// - **e5**: + gaborish, AC strategy search, AdjustQuantBlockAC
     /// - **e6**: + DCT4x8/AFV strategies, non-aligned eval, EPF dynamic sharpness
-    /// - **e7**: + patches, error diffusion, CfL two-pass, LZ77 RLE, DCT64 strategies
+    /// - **e7**: + error diffusion, CfL two-pass, LZ77 RLE, DCT64 strategies
     /// - **e8**: + butteraugli loop (2 iters), LZ77 greedy, WP param search (2 modes)
     /// - **e9–10**: + LZ77 optimal (Viterbi DP), 4 butteraugli iters, WP search (5 modes)
     ///
@@ -2331,7 +2347,8 @@ impl<'a> EncodeRequest<'a> {
         profile: crate::jxl_encode::effort::EffortProfile,
         bit_depth_16: bool,
     ) -> crate::jxl_encode::vardct::VarDctEncoder {
-        let mut enc = crate::jxl_encode::vardct::VarDctEncoder::new(cfg.distance);
+        let effective_distance = cfg.effective_vardct_distance();
+        let mut enc = crate::jxl_encode::vardct::VarDctEncoder::new(effective_distance);
         let mut profile = profile;
         if let Some(cfl_two_pass) = cfg.cfl_two_pass {
             profile.cfl_two_pass = cfl_two_pass;
@@ -2358,7 +2375,7 @@ impl<'a> EncodeRequest<'a> {
         enc.enable_noise = cfg.noise;
         enc.enable_denoise = cfg.denoise;
         // libjxl gates gaborish at distance > 0.5 (enc_frame.cc:281)
-        enc.enable_gaborish = cfg.gaborish && cfg.distance > 0.5;
+        enc.enable_gaborish = cfg.gaborish && effective_distance > 0.5;
         enc.error_diffusion = cfg.error_diffusion;
         enc.pixel_domain_loss = cfg.pixel_domain_loss;
         enc.enable_lz77 = cfg.lz77;
@@ -2790,7 +2807,8 @@ impl LossyEncoder {
                 }
             }
 
-            let mut enc = crate::jxl_encode::vardct::VarDctEncoder::new(cfg.distance);
+            let effective_distance = cfg.effective_vardct_distance();
+            let mut enc = crate::jxl_encode::vardct::VarDctEncoder::new(effective_distance);
             enc.effort = cfg.effort;
             enc.profile = profile;
             enc.use_ans = cfg.use_ans;
@@ -2805,7 +2823,7 @@ impl LossyEncoder {
             enc.ac_strategy_enabled = enc.profile.ac_strategy_enabled;
             enc.enable_noise = cfg.noise;
             enc.enable_denoise = cfg.denoise;
-            enc.enable_gaborish = cfg.gaborish && cfg.distance > 0.5;
+            enc.enable_gaborish = cfg.gaborish && effective_distance > 0.5;
             enc.error_diffusion = cfg.error_diffusion;
             enc.pixel_domain_loss = cfg.pixel_domain_loss;
             enc.enable_lz77 = cfg.lz77;
@@ -3727,7 +3745,8 @@ fn encode_animation_lossy(
         }
     }
 
-    let mut enc = crate::jxl_encode::vardct::VarDctEncoder::new(cfg.distance);
+    let effective_distance = cfg.effective_vardct_distance();
+    let mut enc = crate::jxl_encode::vardct::VarDctEncoder::new(effective_distance);
     enc.effort = cfg.effort;
     enc.profile = profile;
     enc.use_ans = cfg.use_ans;
@@ -3743,7 +3762,7 @@ fn encode_animation_lossy(
     enc.enable_noise = cfg.noise;
     enc.enable_denoise = cfg.denoise;
     // libjxl gates gaborish at distance > 0.5 (enc_frame.cc:281)
-    enc.enable_gaborish = cfg.gaborish && cfg.distance > 0.5;
+    enc.enable_gaborish = cfg.gaborish && effective_distance > 0.5;
     enc.error_diffusion = cfg.error_diffusion;
     enc.pixel_domain_loss = cfg.pixel_domain_loss;
     enc.enable_lz77 = cfg.lz77;

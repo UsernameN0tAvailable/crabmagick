@@ -61,7 +61,9 @@ fn compute_pre_erosion(
     tile_x1: usize,
     tile_y1: usize,
 ) -> (Vec<f32>, usize, usize) {
-    crate::jxl_encode_simd::compute_pre_erosion(xyb_y, width, height, tile_x0, tile_y0, tile_x1, tile_y1)
+    crate::jxl_encode_simd::compute_pre_erosion(
+        xyb_y, width, height, tile_x0, tile_y0, tile_x1, tile_y1,
+    )
 }
 
 /// FuzzyErosion: 3×3 min-4 weighted sum, then 2x downsample.
@@ -268,25 +270,9 @@ pub fn compute_mask1x1(xyb_y: &[f32], width: usize, height: usize) -> Vec<f32> {
             use rayon::prelude::*;
             const STRIP_ROWS: usize = 128; // ~22 strips for 3000 rows → full core utilisation
             const BORDER: usize = 2; // 5×5 kernel reaches ±2 rows
-
-            // Snapshot the current mask1x1 on the calling thread so rayon workers
-            // can read the original (unmodified) data while we write results back.
-            // The thread_local grows but never shrinks → no repeated page faults.
-            thread_local! {
-                static MASK_SNAP: std::cell::RefCell<Vec<f32>> =
-                    const { std::cell::RefCell::new(Vec::new()) };
-            }
-            let snap_ptr: usize = MASK_SNAP.with(|snap| {
-                let mut snap = snap.borrow_mut();
-                if snap.len() < n {
-                    snap.resize(n, 0.0);
-                }
-                snap[..n].copy_from_slice(&mask1x1);
-                snap.as_ptr() as usize
-            });
-
-            // Write results directly back to mask1x1 (avoids a separate "blurred" Vec).
-            let out_ptr: usize = mask1x1.as_mut_ptr() as usize;
+            let src_ptr: usize = mask1x1.as_ptr() as usize;
+            let mut blurred = vec![0.0f32; n];
+            let out_ptr: usize = blurred.as_mut_ptr() as usize;
             let num_strips = (height + STRIP_ROWS - 1) / STRIP_ROWS;
 
             (0..num_strips).into_par_iter().for_each(|si| {
@@ -320,13 +306,12 @@ pub fn compute_mask1x1(xyb_y: &[f32], width: usize, height: usize) -> Vec<f32> {
                         }
 
                         // Copy extended input region from snapshot.
-                        // SAFETY: snap_ptr points to the calling thread's MASK_SNAP data,
-                        // which lives for the duration of this parallel closure (held by
-                        // the calling thread's borrow).  Rayon workers only read from it.
+                        // SAFETY: src_ptr points to mask1x1's backing storage, which stays
+                        // alive and read-only for the duration of this parallel closure.
                         #[allow(unsafe_code)]
                         {
                             let snap: &[f32] =
-                                unsafe { std::slice::from_raw_parts(snap_ptr as *const f32, n) };
+                                unsafe { std::slice::from_raw_parts(src_ptr as *const f32, n) };
                             strip[..ext_size].copy_from_slice(&snap[in_y0 * width..in_y1 * width]);
                         }
 
@@ -359,7 +344,7 @@ pub fn compute_mask1x1(xyb_y: &[f32], width: usize, height: usize) -> Vec<f32> {
                     });
                 });
             });
-            return mask1x1;
+            return blurred;
         }
     }
 
@@ -483,24 +468,28 @@ pub fn compute_quant_field_float(
     // only to aq_map[0..chunk_h*aq_map_w], so disjoint chunks are safe.
     {
         const CHUNK_ROWS: usize = 32;
-        crate::jxl_encode::parallel::parallel_chunks_mut(&mut aq_map, aq_map_w * CHUNK_ROWS, |ci, chunk| {
-            let chunk_y0 = ci * CHUNK_ROWS;
-            let chunk_h = chunk.len() / aq_map_w;
-            per_block_modulations(
-                xyb_x,
-                xyb_y,
-                xyb_b,
-                width,
-                distance,
-                scale,
-                0,
-                chunk_y0,
-                xsize_blocks,
-                chunk_h,
-                chunk,
-                aq_map_w,
-            );
-        });
+        crate::jxl_encode::parallel::parallel_chunks_mut(
+            &mut aq_map,
+            aq_map_w * CHUNK_ROWS,
+            |ci, chunk| {
+                let chunk_y0 = ci * CHUNK_ROWS;
+                let chunk_h = chunk.len() / aq_map_w;
+                per_block_modulations(
+                    xyb_x,
+                    xyb_y,
+                    xyb_b,
+                    width,
+                    distance,
+                    scale,
+                    0,
+                    chunk_y0,
+                    xsize_blocks,
+                    chunk_h,
+                    chunk,
+                    aq_map_w,
+                );
+            },
+        );
     }
 
     // Step 4: Extract compact float quant field
