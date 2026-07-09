@@ -4,9 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crabmagick_core::processor::{
-    get_info, process_image, AvifEncodeOptions, ChromaSubsampling, EncodeOptions, GifEncodeOptions,
-    JpegEncodeOptions, JxlEncodeOptions, OutputFormat, PngEncodeOptions, PngFilter, ProcessRequest,
-    TiffCompression, TiffEncodeOptions, WebpEncodeOptions,
+    get_info, process_image, transcode_jpeg_to_jxl, AvifEncodeOptions, ChromaSubsampling,
+    EncodeOptions, GifEncodeOptions, JpegEncodeOptions, JxlEncodeOptions, OutputFormat,
+    PngEncodeOptions, PngFilter, ProcessRequest, TiffCompression, TiffEncodeOptions,
+    WebpEncodeOptions,
 };
 use serde_json::Value;
 
@@ -92,6 +93,16 @@ fn dispatch(json: &[u8]) -> (u8, Vec<u8>) {
             },
             Err(error) => (1, error.into_bytes()),
         },
+        Some("transcode_jpeg") => {
+            let path = match get_required_str(&req, "path") {
+                Ok(path) => path,
+                Err(error) => return (1, error.into_bytes()),
+            };
+            match transcode_jpeg_to_jxl(path) {
+                Ok(bytes) => (0, bytes),
+                Err(e) => (1, e.to_string().into_bytes()),
+            }
+        }
         Some("info") => {
             let path = match get_required_str(&req, "path") {
                 Ok(path) => path,
@@ -184,6 +195,7 @@ fn parse_encode_options(request: &Value, format: OutputFormat) -> EncodeOptions 
         OutputFormat::Jpeg => EncodeOptions::Jpeg(JpegEncodeOptions {
             quality: get_u8(request, "quality", default_quality()).clamp(1, 100),
             progressive: get_bool(request, "progressive", false),
+            optimize_huffman: get_bool(request, "optimize_huffman", false),
             chroma_subsampling: parse_chroma_subsampling(
                 request.get("chroma_subsampling").and_then(Value::as_str),
             ),

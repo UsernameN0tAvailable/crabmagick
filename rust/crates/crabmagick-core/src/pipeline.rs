@@ -1626,6 +1626,35 @@ fn encode_bmp_with_alpha(
     Ok(out)
 }
 
+/// Losslessly repackages a JPEG file into a JXL container (cjxl `--lossless_jpeg=1` equivalent).
+///
+/// The DCT coefficients are extracted from the JPEG and stored verbatim inside a JXL frame.
+/// The original JPEG bytes can be reconstructed exactly from the output. Typical size reduction
+/// is 15–30% over the source JPEG with zero quality loss.
+///
+/// # Errors
+///
+/// Returns an error if `jpeg_bytes` is not a valid JPEG or if encoding fails.
+#[cfg(feature = "jpeg-reencoding")]
+pub fn transcode_jpeg_to_jxl(jpeg_bytes: &[u8]) -> Result<Vec<u8>, CrabMagickError> {
+    use crate::jxl_encode::jpeg::read_jpeg;
+    use crate::jxl_encode::jpeg::encode_jpeg_to_jxl_container;
+    let jpeg = read_jpeg(jpeg_bytes)
+        .map_err(|e| encode_error(format!("JPEG parse failed: {e}")))?;
+    encode_jpeg_to_jxl_container(&jpeg)
+        .map_err(|e| encode_error(format!("JPEG→JXL repackage failed: {e}")))
+}
+
+/// Losslessly repackages a JPEG file on disk into a JXL container.
+///
+/// Reads `path`, parses DCT coefficients, and returns JXL bytes. The original JPEG
+/// can be recovered exactly from the output with `djxl --pixels_to_jpeg`.
+#[cfg(feature = "jpeg-reencoding")]
+pub fn transcode_jpeg_file_to_jxl(path: &str) -> Result<Vec<u8>, CrabMagickError> {
+    let jpeg_bytes = read_file_bytes(path)?;
+    transcode_jpeg_to_jxl(&jpeg_bytes)
+}
+
 /// Encodes packed RGB pixels into JPEG XL using bundled encoder modules.
 ///
 /// # Performance

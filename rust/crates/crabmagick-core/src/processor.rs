@@ -633,3 +633,12 @@ pub fn process_image(
 pub fn get_info(source_path: &str) -> Result<ImageInfo, CrabMagickError> {
     decode_any_info(source_path, 0)
 }
+
+/// Losslessly repackages a JPEG file into a JXL container (equivalent to `cjxl --lossless_jpeg=1`).
+///
+/// Reads the JPEG at `path`, extracts its DCT coefficients, and wraps them in a JXL bitstream.
+/// The original JPEG can be recovered exactly from the output. Typical savings: 15–30%.
+#[cfg(feature = "jpeg-reencoding")]
+pub fn transcode_jpeg_to_jxl(path: &str) -> Result<Vec<u8>, CrabMagickError> {
+    crate::pipeline::transcode_jpeg_file_to_jxl(path)
+}

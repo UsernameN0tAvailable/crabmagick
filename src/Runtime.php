@@ -110,6 +110,24 @@ final class Runtime
         return ['width' => (int)$data['width'], 'height' => (int)$data['height']];
     }
 
+    /**
+     * Losslessly repackage a JPEG file into a JXL container (cjxl --lossless_jpeg=1 equivalent).
+     *
+     * The original JPEG can be recovered exactly from the output. Typical savings: 15–30%.
+     *
+     * @param  string $path Absolute path to source JPEG file
+     * @return string       Raw JXL bytes
+     * @throws \RuntimeException on error or connection failure
+     */
+    public static function transcodeJpeg(string $path): string
+    {
+        if (self::$usingExtension) {
+            return \crabmagick_transcode_jpeg($path);
+        }
+
+        return self::send(['cmd' => 'transcode_jpeg', 'path' => $path]);
+    }
+
     // ── Private ───────────────────────────────────────────────────────────────
 
     private static function send(array $request): string

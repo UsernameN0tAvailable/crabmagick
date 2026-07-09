@@ -102,4 +102,19 @@ class Image
     {
         return Runtime::isReady();
     }
+
+    /**
+     * Losslessly repackage this JPEG into a JXL container without pixel decode/re-encode.
+     *
+     * Equivalent to `cjxl --lossless_jpeg=1`. The source JPEG's DCT coefficients are
+     * preserved verbatim — zero quality loss. Typical file size reduction: 15–30%.
+     * The original JPEG bytes can be recovered from the output with `djxl --pixels_to_jpeg`.
+     *
+     * @return string Raw JXL bytes
+     * @throws \RuntimeException if the source file is not a valid JPEG
+     */
+    public function transcodeToJxl(): string
+    {
+        return Runtime::transcodeJpeg($this->path);
+    }
 }

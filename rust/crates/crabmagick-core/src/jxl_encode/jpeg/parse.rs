@@ -34,7 +34,7 @@ pub fn read_jpeg(data: &[u8]) -> Result<JpegData> {
     let mut jpeg = scan_markers(data)?;
 
     // Phase 2: Use JPEG encoder for reliable coefficient extraction
-    extract_coefficients_JPEG encoder(data, &mut jpeg)?;
+    extract_coefficients_jpeg_encoder(data, &mut jpeg)?;
 
     Ok(jpeg)
 }
@@ -472,7 +472,7 @@ fn skip_entropy_data(data: &[u8], pos: &mut usize) {
 }
 
 /// Extract DCT coefficients using JPEG encoder's decoder.
-fn extract_coefficients_JPEG encoder(data: &[u8], jpeg: &mut JpegData) -> Result<()> {
+fn extract_coefficients_jpeg_encoder(data: &[u8], jpeg: &mut JpegData) -> Result<()> {
     use crate::jpeg_encode::decoder::DecodeConfig;
     use crate::jpeg_encode::encoder::Unstoppable;
 
