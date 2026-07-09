@@ -18,7 +18,7 @@ use super::chroma_from_luma::CflMap;
 use super::common::*;
 use super::encoder::VarDctEncoder;
 use super::frame::DistanceParams;
-use crate::debug_rect;
+use crate::jxl_encode::debug_rect;
 
 impl VarDctEncoder {
     /// Butteraugli quantization loop: iteratively refines per-block quant_field
@@ -83,7 +83,7 @@ impl VarDctEncoder {
             ref_b[i] = linear_rgb[i * 3 + 2];
         }
         let butteraugli_params = butteraugli::ButteraugliParams::new()
-            .with_intensity_target(80.0)
+            .with_intensity_target(self.intensity_target)
             .with_compute_diffmap(true);
         let reference = match butteraugli::ButteraugliReference::new_linear_planar(
             &ref_r,
@@ -131,6 +131,16 @@ impl VarDctEncoder {
 
         let iters = self.butteraugli_iters as usize;
         let mut current_params;
+
+        // Auto-calibration target: the Rust butteraugli crate's tile_dist metric is on a
+        // different absolute scale than libjxl's internal butteraugli. At iter=0 we measure
+        // the actual tile_dist average for our initial QF (which is already calibrated to
+        // produce target_distance in libjxl's scale). We then use that measured average as
+        // the effective redistribution target for all iterations. This makes the loop a pure
+        // quality-redistribution pass: good blocks (td < calibrated_target) have quality
+        // reduced, bad blocks (td > calibrated_target) have quality increased, keeping the
+        // net quality constant while improving perceptual efficiency.
+        let mut calibrated_target = target_distance; // Updated after iter=0
 
         // Loop runs iters+1 times (matching libjxl: last iteration is compare-only).
         // i=0..iters-1: SetQuantField + roundtrip + compare + adjust
@@ -270,7 +280,7 @@ impl VarDctEncoder {
                 }
             }
 
-            // Log per-iteration summary
+            // Log per-iteration summary + update calibrated_target after iter=0
             {
                 let qf_min = quant_field_float
                     .iter()
@@ -285,18 +295,32 @@ impl VarDctEncoder {
                 let qf_sum: f64 = quant_field_float.iter().map(|&v| v as f64).sum();
                 let qf_avg = qf_sum / quant_field_float.len() as f64;
                 let td_max = tile_dist.iter().copied().reduce(f32::max).unwrap_or(0.0);
-                let bad_blocks = tile_dist.iter().filter(|&&d| d > target_distance).count();
+                let td_avg: f32 = tile_dist.iter().sum::<f32>() / tile_dist.len().max(1) as f32;
+
+                // After iter=0: auto-calibrate target from measured average tile_dist.
+                // Our initial QF is calibrated to libjxl's butteraugli scale, but the Rust
+                // crate's tile_dist metric differs. The measured td_avg at iter=0 represents
+                // the "true target" in the crate's scale — using it makes the loop a pure
+                // redistribution pass (good blocks get quality reduced, bad blocks increased)
+                // while preserving overall quality. Only apply if td_avg > target*0.5 to avoid
+                // over-calibrating on very-high-quality (low distortion) settings.
+                if iter == 0 && td_avg > target_distance * 0.5 {
+                    calibrated_target = td_avg;
+                }
+
+                let bad_blocks = tile_dist.iter().filter(|&&d| d > calibrated_target).count();
                 debug_rect!(
                     "bfly/iter",
                     0,
                     0,
                     width,
                     height,
-                    "iter={}/{} score={:.3} target={:.3} gs={} qf_avg={:.4} qf=[{:.4};{:.4}] td_max={:.2} bad={}",
+                    "iter={}/{} score={:.3} target={:.3} cal={:.3} gs={} qf_avg={:.4} qf=[{:.4};{:.4}] td_max={:.2} bad={}",
                     iter,
                     iters,
                     result.score,
                     target_distance,
+                    calibrated_target,
                     current_params.global_scale,
                     qf_avg,
                     qf_min,
@@ -356,7 +380,7 @@ impl VarDctEncoder {
                 // Only adjust bad blocks (diff > 1.0)
                 // (libjxl enc_adaptive_quantization.cc:1066-1086)
                 for bi in 0..num_blocks {
-                    let diff = tile_dist[bi] / target_distance;
+                    let diff = tile_dist[bi] / calibrated_target;
                     if diff > 1.0 {
                         let old = quant_field_float[bi];
                         quant_field_float[bi] = old * diff;
@@ -380,7 +404,7 @@ impl VarDctEncoder {
             } else {
                 // Adjust both directions (libjxl enc_adaptive_quantization.cc:1087-1110)
                 for bi in 0..num_blocks {
-                    let diff = tile_dist[bi] / target_distance;
+                    let diff = tile_dist[bi] / calibrated_target;
                     if diff <= 1.0 {
                         // Good quality: reduce precision to save bits
                         quant_field_float[bi] *= (diff as f64).powf(cur_pow) as f32;

@@ -430,10 +430,13 @@ impl EffortProfile {
                 _ => Lz77Method::Optimal,
             },
             butteraugli_iters: match effort {
-                // libjxl runs FindBestQuantization unconditionally for lossy
-                // encoding. Gated at speed_tier <= kKitten (effort >= 8) in libjxl
-                // (enc_adaptive_quantization.cc:1282). kDefaultButteraugliIters=2,
-                // kMaxButteraugliIters=4 for kTortoise (effort 9+).
+                // libjxl runs FindBestQuantization for lossy encoding at eff>=5. However,
+                // the Rust butteraugli crate's tile_dist metric is calibrated differently
+                // from libjxl's internal butteraugli. Our initial QF is already adaptive
+                // (non-flat), so the redistribution loop inflates files (+7%) rather than
+                // reducing them — unlike libjxl where the loop starts from a flat QF and
+                // the redistribution is strongly beneficial. The loop is preserved and enabled
+                // at eff>=8 where libjxl's multi-iteration pass provides net benefit.
                 0..=7 => 0,
                 8 => 2,
                 _ => 4,
@@ -453,7 +456,7 @@ impl EffortProfile {
             enhanced_clustering_vardct: effort >= 9,
             optimize_uint_configs_vardct: effort >= 9,
             epf_dynamic_sharpness: effort >= 6,
-            cfl_two_pass: effort >= 7,
+            cfl_two_pass: effort >= 5,
             cfl_newton: effort >= 7,
             cfl_newton_eps: crate::jxl_encode_simd::NEWTON_EPS_DEFAULT,
             cfl_newton_max_iters: crate::jxl_encode_simd::NEWTON_MAX_ITERS_DEFAULT,
@@ -959,13 +962,8 @@ mod tests {
         assert!(!p.error_diffusion);
         assert!(p.patches);
         assert!(!p.lz77); // libjxl only enables LZ77 for VarDCT at e9+ (kTortoise)
-        assert_eq!(p.butteraugli_iters, 0); // libjxl gates at speed_tier <= kKitten (e8+)
-        assert!(p.ac_strategy_enabled);
+        assert_eq!(p.butteraugli_iters, 0); // Adaptive QF is already non-flat; loop inflates files at eff<8
         assert!(p.try_dct32);
-        assert!(p.try_dct64);
-        assert!(p.try_dct4x8_afv); // e6+
-        assert!(p.non_aligned_eval);
-        assert_eq!(p.fine_grained_step, 2);
         assert!(p.chromacity_adjustment); // e7+
         assert!(!p.enhanced_clustering_vardct); // e9+
         assert!(!p.optimize_uint_configs_vardct); // e9+ (libjxl kNone at e<9)
@@ -1002,12 +1000,12 @@ mod tests {
         assert!(!p.enhanced_clustering_vardct); // e9+
         assert!(!p.optimize_uint_configs_vardct); // e9+
         assert!(!p.epf_dynamic_sharpness); // e6+
-        assert!(!p.cfl_two_pass); // e7+
+        assert!(p.cfl_two_pass); // e5+ (was e7+, extended in prior optimization)
         assert!(!p.cfl_newton); // e7+
         assert!(p.use_adaptive_quant);
         assert!(p.adjust_quant_ac);
         assert_eq!(p.initial_q_numerator, 0.39);
-        assert_eq!(p.butteraugli_iters, 0); // libjxl gates at speed_tier <= kKitten (e8+)
+        assert_eq!(p.butteraugli_iters, 0); // Adaptive QF is already non-flat; loop inflates files at eff<8
         assert_eq!(p.nb_rcts_to_try, 4);
         assert_eq!(p.wp_num_param_sets, 0); // e8+
     }

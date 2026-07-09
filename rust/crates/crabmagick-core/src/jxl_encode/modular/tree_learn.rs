@@ -237,6 +237,30 @@ impl TreeLearningParams {
         self
     }
 
+    /// Switch to the group_id–inclusive property order when the frame has ≥ 30 streams.
+    ///
+    /// Matches libjxl enc_modular.cc:546-549: group_id is only erased from the property
+    /// order when `num_streams < 30`.  For frames with ≥ 30 groups (images larger than
+    /// ~7 groups × 4 groups ≈ 1792×1024 pixels), keeping group_id allows the MA tree
+    /// to learn spatially-distinct prediction strategies, significantly improving
+    /// compression on large images.
+    #[must_use]
+    pub fn with_num_streams(mut self, num_streams: usize) -> Self {
+        // Only applies to the non-squeeze order (squeeze always includes group_id).
+        // and only when not already using the full order (effort >= 9).
+        // Check if the current first property is WpMaxError (index 15) — that's the
+        // signature of PROP_ORDER_NO_SQUEEZE_NO_GID starting with [Channel, WpMaxError, ...].
+        if num_streams >= 30 && self.properties.first() == Some(&0)
+            && self.properties.get(1) == Some(&15)
+        {
+            // Re-select from PROP_ORDER_NO_SQUEEZE (GroupId at index 1)
+            let order = PROP_ORDER_NO_SQUEEZE;
+            let num_props = self.properties.len();
+            self.properties = order[..num_props.min(order.len())].to_vec();
+        }
+        self
+    }
+
     /// Cap max_nodes to the decoder's per-frame tree size limit.
     /// Formula from libjxl encoding.cc:606-616 (decoder side):
     ///   `min(1<<20, 1024 + sum_of_channel_pixels)`
@@ -671,35 +695,35 @@ pub fn gather_samples_strided(
 
 /// Compute maximum tree samples from an [`EffortProfile`].
 ///
-/// Uses `tree_max_samples_fixed` (when > 0) or `tree_sample_fraction` (when > 0).
+/// Computes the target number of tree-learning samples for the given profile and image size.
 ///
-/// Hard cap of 131,072 samples regardless of image size, matching libjxl's approach
-/// of `65536 * nb_repeats` (nb_repeats=1 at effort=7, 2 at effort=8).
-/// Without this cap, a 4000×3000 RGB image would gather 18M samples, causing
-/// catastrophic O(n×props×buckets) slowdown with no compression benefit.
+/// Matches libjxl's `fraction = nb_repeats * 0.1` formula (enc_ma.cc:982):
+/// `tree_sample_fraction` maps directly to `nb_repeats`, so the effective sample
+/// fraction is `tree_sample_fraction * 0.1`.  This ensures our pixel_fraction
+/// parameter stays close to libjxl's, producing matching split thresholds:
+///
+/// ```text
+/// threshold = split_threshold * (pixel_fraction * 0.9 + 0.1)
+/// ```
+///
+/// With the old hard-cap approach, large sample counts inflated pixel_fraction,
+/// raised the threshold, and suppressed tree splits — producing worse compression
+/// at eff=7 vs eff=5 even with more properties and buckets.
 pub fn max_tree_samples_from_profile(
     profile: &crate::jxl_encode::effort::EffortProfile,
     total_pixels: usize,
 ) -> usize {
-    let uncapped = if profile.tree_sample_fraction > 0.0 {
-        // Fraction-based: e.g. 50% of pixels, min 65K
-        ((total_pixels as f32 * profile.tree_sample_fraction) as usize).max(65_536)
-    } else if profile.tree_max_samples_fixed > 0 {
-        profile.tree_max_samples_fixed as usize
-    } else {
-        32_768
-    };
-    // Hard cap: 65536 × effort_repeats. libjxl uses 65536 at effort=7 (nb_repeats=1).
-    // We use 2× (131072) for slightly better tree quality on diverse images.
-    let effort_cap = match profile.effort {
-        0..=4 => 65_536,
-        5 => 65_536,
-        6 => 65_536,
-        7 => 131_072,
-        8 => 262_144,
-        _ => 524_288,
-    };
-    uncapped.min(effort_cap)
+    if profile.tree_max_samples_fixed > 0 {
+        return profile.tree_max_samples_fixed as usize;
+    }
+    if profile.tree_sample_fraction <= 0.0 {
+        return 32_768;
+    }
+    // libjxl: fraction = nb_repeats * 0.1 (enc_ma.cc:982).
+    // tree_sample_fraction == nb_repeats, so match directly.
+    let target = (total_pixels as f64 * profile.tree_sample_fraction as f64 * 0.1) as usize;
+    // Floor at 256 for tiny images; no hard upper cap (mirrors libjxl behaviour).
+    target.max(256)
 }
 
 /// Compute the stride for subsampling from an [`EffortProfile`].

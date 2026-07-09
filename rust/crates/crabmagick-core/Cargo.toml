@@ -58,7 +58,7 @@ zenresize = { version = "0.2", optional = true, features = ["layout"] }
 zensim = { version = "0.2", optional = true }
 
 [features]
-default = ["std", "parallel", "unsafe-performance", "decoder", "yuv", "simd"]
+default = ["std", "parallel", "unsafe-performance", "decoder", "yuv", "simd", "butteraugli-loop"]
 avif = ["dep:ravif", "image/avif"]
 butteraugli-loop = ["dep:butteraugli"]
 convenience = []
