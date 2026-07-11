@@ -352,6 +352,27 @@ Benchmarks run on Intel Core Ultra 7 155H (AVX2, 22 threads) against libvips (in
 image processing). Three image types (photo/document/gradient), three sizes (256×256 tile, 800×600
 medium, 1920×1080 HD). Each cell shows median of 5 runs.
 
+### IIIF JXL Serving (No Application Cache)
+
+This measures the real IIIF PHP image path for a 3360×4892 JXL source: decode, region/size/rotation,
+then JPEG Q85 encode. CrabMagick uses its persistent zero-config Unix-socket daemon; libvips uses the
+IIIF Server `VipsImage` PHP wrapper. Both implementations run with their application image caches
+disabled (`vips_cache_set_max(0)`, zero libvips memory/file cache limits, and CrabMagick's default
+zero decoded-image cache). Medians below are from two alternating 100/101-request sweeps; the OS file
+cache remains warm for both, as it would in a long-lived server.
+
+| IIIF response | libvips PHP | CrabMagick daemon | Result |
+|---------------|-------------|-------------------|--------|
+| Full region -> 1680×2446 JPEG | 449 ms | **150 ms** | **3.0× faster** |
+| Region -> 1536×2236 JPEG | 437 ms | **92 ms** | **4.8× faster** |
+| Square -> 512×512 JPEG | 430 ms | **91 ms** | **4.7× faster** |
+| Region + 90-degree rotation -> 1118×768 JPEG | 425 ms | **51 ms** | **8.4× faster** |
+
+"Full region" above is a transformed JPEG response, not raw-file serving: it resizes the JXL source
+to 1680×2446 and encodes JPEG. Raw JXL passthrough is not included in this comparison. All four output
+dimensions match between implementations. The CrabMagick outputs are byte-identical to the previous
+CrabMagick baseline, so this decoder optimization does not change JPEG filesize or pixels.
+
 ### Photo 800×600 — encoder comparison
 
 | Codec | crab ms | crab KB | PSNR | vips ms | vips KB |
@@ -465,35 +486,25 @@ The right binary is selected automatically from `/proc/cpuinfo` at startup.
 | `crabmagick-x86_64-avx2-linux` | x86_64 AVX2 (Haswell 2013+, Ryzen 2017+) |
 | `crabmagick-x86_64-avx512-linux` | x86_64 AVX-512 (Skylake-X+, Zen 4+) |
 | `crabmagick-aarch64-linux` | aarch64 (AWS Graviton, RPi 4+) |
-| `crabmagick-aarch64-sve-linux` | aarch64 SVE (Graviton 3+, Neoverse N2) |
+| `crabmagick-aarch64-sve-linux` | aarch64 SVE hosts (currently the NEON baseline) |
 
 ---
 
-## Build from source
+## Build bundled binaries locally
 
 ```bash
-rustup target add x86_64-unknown-linux-musl
-sudo apt-get install musl-tools gcc-aarch64-linux-gnu
-
-cd rust
-
-# x86_64
-RUSTFLAGS="-C target-cpu=x86-64         -C link-arg=-static-libgcc" \
-  cargo build -p crabmagick-daemon --release --target x86_64-unknown-linux-musl
-cp target/x86_64-unknown-linux-musl/release/crabmagick-daemon ../bin/crabmagick-x86_64-linux
-
-RUSTFLAGS="-C target-cpu=haswell        -C link-arg=-static-libgcc" \
-  cargo build -p crabmagick-daemon --release --target x86_64-unknown-linux-musl
-cp target/x86_64-unknown-linux-musl/release/crabmagick-daemon ../bin/crabmagick-x86_64-avx2-linux
-
-RUSTFLAGS="-C target-cpu=skylake-avx512 -C link-arg=-static-libgcc" \
-  cargo build -p crabmagick-daemon --release --target x86_64-unknown-linux-musl
-cp target/x86_64-unknown-linux-musl/release/crabmagick-daemon ../bin/crabmagick-x86_64-avx512-linux
-
-# aarch64 (cross-compile)
-rustup target add aarch64-unknown-linux-gnu
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-  RUSTFLAGS="-C target-cpu=generic -C link-arg=-static-libgcc" \
-  cargo build -p crabmagick-daemon --release --target aarch64-unknown-linux-gnu
-cp target/aarch64-unknown-linux-gnu/release/crabmagick-daemon ../bin/crabmagick-aarch64-linux
+sudo apt-get install musl-tools gcc-aarch64-linux-gnu file
+./scripts/build-daemon-binaries.sh
 ```
+
+This is the only release-binary build path: it runs locally and always rebuilds
+the complete supported Linux matrix before artifacts are committed or released.
+The script installs the required Rust targets if needed, produces the five
+bundled variants, and checks each ELF architecture:
+
+- `x86_64`, `x86_64-avx2`, and `x86_64-avx512` are static musl binaries.
+- `aarch64` and `aarch64-sve` use fat LTO with the local GNU cross-compiler.
+  The SVE-dispatched binary is intentionally the NEON baseline until targeted,
+  benchmarked SVE kernels exist; global SVE2 cross-codegen has an LLVM pathology.
+
+GitHub Actions does not compile or commit release binaries.

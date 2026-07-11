@@ -1,11 +1,12 @@
 use crate::jxl_decode::jxl_bitstream::Bitstream;
 use crate::jxl_decode::jxl_grid::{AllocTracker, MutableSubgrid};
 use crate::jxl_decode::jxl_modular::{
-    image::TransformedModularSubimage, ChannelShift, MaConfig, Sample,
+    ChannelShift, MaConfig, Sample, image::TransformedModularSubimage,
 };
 use crate::jxl_decode::jxl_threadpool::JxlThreadPool;
 use crate::jxl_decode::jxl_vardct::{
-    write_hf_coeff, write_hf_coeff_compact, CompactHfCoeffStore, HfCoeffParams,
+    CompactHfCoeffStore, HfCoeffParams, TransformType, write_hf_coeff, write_hf_coeff_compact,
+    write_hf_coeff_direct,
 };
 
 use super::{HfGlobal, LfGlobalVarDct, LfGroup};
@@ -222,6 +223,34 @@ pub fn decode_pass_group_compact<S: Sample>(
     }
 
     Ok(())
+}
+
+/// Decodes a non-progressive VarDCT pass directly into per-block coefficient scratch.
+pub fn decode_hf_coeff_direct<S: Sample>(
+    bitstream: &mut Bitstream,
+    frame_header: &FrameHeader,
+    lf_group: &LfGroup<S>,
+    pass_idx: u32,
+    group_idx: u32,
+    lf_vardct: &LfGlobalVarDct,
+    hf_global: &HfGlobal,
+    tracker: Option<&AllocTracker>,
+    scratch: &mut Vec<i32>,
+    on_block: impl FnMut(usize, usize, TransformType, i32, [&[i32]; 3]),
+) -> Result<()> {
+    let Some(params) = make_hf_coeff_params(
+        frame_header,
+        lf_group,
+        pass_idx,
+        group_idx,
+        lf_vardct,
+        hf_global,
+        tracker,
+    ) else {
+        return Ok(());
+    };
+
+    write_hf_coeff_direct(bitstream, params, scratch, on_block).map_err(Into::into)
 }
 
 #[derive(Debug)]

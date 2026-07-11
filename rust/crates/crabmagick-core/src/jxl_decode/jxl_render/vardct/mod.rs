@@ -2,25 +2,35 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
-use crate::jxl_decode::jxl_frame::{
-    data::{
-        decode_pass_group_compact, HfGlobal, LfGlobal, LfGroup, PassGroupParams,
-        PassGroupParamsCompact, PassGroupParamsVardct, PassGroupParamsVardctCompact,
+#[cfg(feature = "__profile")]
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
+};
+
+use crate::jxl_decode::jxl_frame::{
     FrameHeader,
+    data::{
+        HfGlobal, LfGlobal, LfGroup, PassGroupParams, PassGroupParamsCompact,
+        PassGroupParamsVardct, PassGroupParamsVardctCompact, decode_hf_coeff_direct,
+        decode_pass_group_compact,
+    },
 };
 use crate::jxl_decode::jxl_grid::{AlignedGrid, MutableSubgrid, SharedSubgrid};
 use crate::jxl_decode::jxl_image::ImageHeader;
 use crate::jxl_decode::jxl_modular::{ChannelShift, Sample};
 use crate::jxl_decode::jxl_threadpool::JxlThreadPool;
 use crate::jxl_decode::jxl_vardct::{
-    BlockInfo, CompactHfCoeffStore, LfChannelCorrelation, LfChannelDequantization, Quantizer,
-    TransformType,
+    BlockInfo, CompactHfCoeffStore, DequantMatrixSet, LfChannelCorrelation,
+    LfChannelDequantization, Quantizer, TransformType,
 };
 
 use crate::jxl_decode::jxl_render::{
-    image::ImageBuffer, modular, util, Error, ImageWithRegion, IndexedFrame, Reference, Region,
-    RenderCache, Result,
+    Error, ImageWithRegion, IndexedFrame, Reference, Region, RenderCache, Result,
+    image::ImageBuffer, modular, util,
 };
 
 mod dct_common;
@@ -49,6 +59,197 @@ mod generic;
 )))]
 use generic as impls;
 
+// `perf` is not usable in several deployment targets. This compiles out of normal builds and
+// records parallel worker phases when the internal `__profile` feature is explicitly enabled.
+#[cfg(feature = "__profile")]
+#[derive(Debug)]
+struct VardctProfile {
+    started: Instant,
+    load_lf_ns: AtomicU64,
+    prepare_groups_ns: AtomicU64,
+    task_setup_ns: AtomicU64,
+    workers_wall_ns: AtomicU64,
+    task_ns_sum: AtomicU64,
+    task_ns_max: AtomicU64,
+    task_count: AtomicU64,
+    compact_alloc_ns: AtomicU64,
+    hf_decode_ns: AtomicU64,
+    dct8_transform_ns: AtomicU64,
+    generic_transform_ns: AtomicU64,
+    generic_dequant_ns: AtomicU64,
+    generic_idct_ns: AtomicU64,
+    generic_scatter_ns: AtomicU64,
+    fallback_transform_ns: AtomicU64,
+}
+
+#[cfg(feature = "__profile")]
+const TRANSFORM_TYPE_NAMES: [&str; 27] = [
+    "Dct8",
+    "Hornuss",
+    "Dct2",
+    "Dct4",
+    "Dct16",
+    "Dct32",
+    "Dct16x8",
+    "Dct8x16",
+    "Dct32x8",
+    "Dct8x32",
+    "Dct32x16",
+    "Dct16x32",
+    "Dct4x8",
+    "Dct8x4",
+    "Afv0",
+    "Afv1",
+    "Afv2",
+    "Afv3",
+    "Dct64",
+    "Dct64x32",
+    "Dct32x64",
+    "Dct128",
+    "Dct128x64",
+    "Dct64x128",
+    "Dct256",
+    "Dct256x128",
+    "Dct128x256",
+];
+
+#[cfg(feature = "__profile")]
+static PROFILE_TRANSFORM_COUNTS: [AtomicU64; TRANSFORM_TYPE_NAMES.len()] =
+    [const { AtomicU64::new(0) }; TRANSFORM_TYPE_NAMES.len()];
+
+#[cfg(feature = "__profile")]
+type VardctProfileHandle = Option<Arc<VardctProfile>>;
+
+#[cfg(not(feature = "__profile"))]
+type VardctProfileHandle = ();
+
+#[cfg(feature = "__profile")]
+fn start_vardct_profile() -> VardctProfileHandle {
+    std::env::var_os("CRABMAGICK_JXL_PROFILE").map(|_| {
+        for counter in &PROFILE_TRANSFORM_COUNTS {
+            counter.store(0, Ordering::Relaxed);
+        }
+        Arc::new(VardctProfile {
+            started: Instant::now(),
+            load_lf_ns: AtomicU64::new(0),
+            prepare_groups_ns: AtomicU64::new(0),
+            task_setup_ns: AtomicU64::new(0),
+            workers_wall_ns: AtomicU64::new(0),
+            task_ns_sum: AtomicU64::new(0),
+            task_ns_max: AtomicU64::new(0),
+            task_count: AtomicU64::new(0),
+            compact_alloc_ns: AtomicU64::new(0),
+            hf_decode_ns: AtomicU64::new(0),
+            dct8_transform_ns: AtomicU64::new(0),
+            generic_transform_ns: AtomicU64::new(0),
+            generic_dequant_ns: AtomicU64::new(0),
+            generic_idct_ns: AtomicU64::new(0),
+            generic_scatter_ns: AtomicU64::new(0),
+            fallback_transform_ns: AtomicU64::new(0),
+        })
+    })
+}
+
+#[cfg(not(feature = "__profile"))]
+#[inline(always)]
+fn start_vardct_profile() -> VardctProfileHandle {}
+
+#[cfg(feature = "__profile")]
+fn finish_vardct_profile(profile: &VardctProfileHandle) {
+    let Some(profile) = profile else {
+        return;
+    };
+    let ms = |value: &AtomicU64| value.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    let transforms = TRANSFORM_TYPE_NAMES
+        .iter()
+        .zip(&PROFILE_TRANSFORM_COUNTS)
+        .filter_map(|(name, count)| {
+            let count = count.load(Ordering::Relaxed);
+            (count != 0).then_some(format!("{name}={count}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let task_count = profile.task_count.load(Ordering::Relaxed);
+    let task_avg = if task_count == 0 {
+        0.0
+    } else {
+        ms(&profile.task_ns_sum) / task_count as f64
+    };
+    eprintln!(
+        "CRABMAGICK_JXL_VARDCT wall={:.2}ms load_lf={:.2}ms prepare={:.2}ms task_setup={:.2}ms workers_wall={:.2}ms tasks={task_count} task_avg={task_avg:.2}ms task_max={:.2}ms compact_alloc_sum={:.2}ms hf_decode_sum={:.2}ms dct8_sum={:.2}ms generic_sum={:.2}ms generic_dequant_sum={:.2}ms generic_idct_sum={:.2}ms generic_scatter_sum={:.2}ms fallback_sum={:.2}ms transforms={transforms}",
+        profile.started.elapsed().as_secs_f64() * 1_000.0,
+        ms(&profile.load_lf_ns),
+        ms(&profile.prepare_groups_ns),
+        ms(&profile.task_setup_ns),
+        ms(&profile.workers_wall_ns),
+        ms(&profile.task_ns_max),
+        ms(&profile.compact_alloc_ns),
+        ms(&profile.hf_decode_ns),
+        ms(&profile.dct8_transform_ns),
+        ms(&profile.generic_transform_ns),
+        ms(&profile.generic_dequant_ns),
+        ms(&profile.generic_idct_ns),
+        ms(&profile.generic_scatter_ns),
+        ms(&profile.fallback_transform_ns),
+    );
+}
+
+#[cfg(not(feature = "__profile"))]
+#[inline(always)]
+fn finish_vardct_profile(_: &VardctProfileHandle) {}
+
+#[cfg(feature = "__profile")]
+struct VardctTaskTimer {
+    profile: Option<Arc<VardctProfile>>,
+    started: Instant,
+}
+
+#[cfg(feature = "__profile")]
+impl Drop for VardctTaskTimer {
+    fn drop(&mut self) {
+        let Some(profile) = &self.profile else {
+            return;
+        };
+        let elapsed = self.started.elapsed().as_nanos() as u64;
+        profile.task_ns_sum.fetch_add(elapsed, Ordering::Relaxed);
+        profile.task_ns_max.fetch_max(elapsed, Ordering::Relaxed);
+        profile.task_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "__profile")]
+fn start_vardct_task_timer(profile: &VardctProfileHandle) -> VardctTaskTimer {
+    VardctTaskTimer {
+        profile: profile.clone(),
+        started: Instant::now(),
+    }
+}
+
+#[cfg(not(feature = "__profile"))]
+#[inline(always)]
+fn start_vardct_task_timer(_: &VardctProfileHandle) {}
+
+#[cfg(feature = "__profile")]
+macro_rules! profile_stage {
+    ($profile:expr, $field:ident, $body:expr) => {{
+        if let Some(profile) = &$profile {
+            let start = Instant::now();
+            let value = $body;
+            profile
+                .$field
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            value
+        } else {
+            $body
+        }
+    }};
+}
+
+#[cfg(not(feature = "__profile"))]
+macro_rules! profile_stage {
+    ($profile:expr, $field:ident, $body:expr) => {{ $body }};
+}
+
 pub(crate) fn render_vardct<S: Sample>(
     frame: &IndexedFrame,
     lf_frame: Option<&Reference<S>>,
@@ -58,6 +259,7 @@ pub(crate) fn render_vardct<S: Sample>(
 ) -> Result<ImageWithRegion> {
     let span = tracing::span!(tracing::Level::TRACE, "Render VarDCT");
     let _guard = span.enter();
+    let profile = start_vardct_profile();
 
     let image_header = frame.image_header();
     let frame_header = frame.header();
@@ -165,16 +367,20 @@ pub(crate) fn render_vardct<S: Sample>(
             });
         }
 
-        let lf_xyb = tracing::trace_span!("Load LF groups").in_scope(|| {
-            util::load_lf_groups(
-                frame,
-                lf_global,
-                lf_groups,
-                lf_group_image,
-                modular_lf_region,
-                pool,
-            )
-        })?;
+        let lf_xyb = profile_stage!(
+            profile,
+            load_lf_ns,
+            tracing::trace_span!("Load LF groups").in_scope(|| {
+                util::load_lf_groups(
+                    frame,
+                    lf_global,
+                    lf_groups,
+                    lf_group_image,
+                    modular_lf_region,
+                    pool,
+                )
+            })
+        )?;
 
         let lf_xyb = if let Some(x) = lf_frame {
             tracing::trace_span!("Copy LFQuant").in_scope(|| -> Result<_> {
@@ -236,17 +442,21 @@ pub(crate) fn render_vardct<S: Sample>(
     let hf_global = cache.hf_global.as_ref();
     let lf_groups = &mut cache.lf_groups;
 
-    let mut it = tracing::trace_span!("Prepare PassGroup").in_scope(|| {
-        fb.color_groups_with_group_id(frame_header)
-            .into_iter()
-            .filter_map(|(group_idx, grid_xyb)| {
-                let lf_group_idx = frame_header.lf_group_idx_from_group_idx(group_idx);
-                let lf_group = lf_groups.get(&lf_group_idx)?;
+    let mut it = profile_stage!(
+        profile,
+        prepare_groups_ns,
+        tracing::trace_span!("Prepare PassGroup").in_scope(|| {
+            fb.color_groups_with_group_id(frame_header)
+                .into_iter()
+                .filter_map(|(group_idx, grid_xyb)| {
+                    let lf_group_idx = frame_header.lf_group_idx_from_group_idx(group_idx);
+                    let lf_group = lf_groups.get(&lf_group_idx)?;
 
-                Some((group_idx, grid_xyb, lf_group))
-            })
-            .collect::<Vec<_>>()
-    });
+                    Some((group_idx, grid_xyb, lf_group))
+                })
+                .collect::<Vec<_>>()
+        })
+    );
     // Per-group "Decode + Transform": each scope task decodes all passes for one group and then
     // immediately dequantizes / transforms that group's coefficients. Non-subsampled groups use a
     // compact per-block HF coefficient store for decode, then dequantize directly into the strided
@@ -276,9 +486,9 @@ pub(crate) fn render_vardct<S: Sample>(
         let num_passes = frame_header.passes.num_passes as usize;
 
         // Per-pass modular subimage iterators (indexed by group_idx).
-        let mut pass_modular_vecs: Vec<Vec<_>> = pass_group_image
+        let mut pass_modular_vecs: Vec<Vec<Option<_>>> = pass_group_image
             .into_iter()
-            .map(|pass_image| pass_image.into_iter().enumerate().collect())
+            .map(|pass_image| pass_image.into_iter().map(Some).collect())
             .collect();
 
         // Per-group task: owns the output grid and all per-pass bitstreams.
@@ -302,63 +512,183 @@ pub(crate) fn render_vardct<S: Sample>(
         // Bitstream<'_>: Send, TransformedModularSubimage: Send).
         unsafe impl<'g, 'frame, S: Sample + Send> Send for GroupTask<'g, 'frame, S> {}
 
-        let group_tasks: Vec<GroupTask<'_, '_, S>> = it
-            .into_iter()
-            .map(|(group_idx, grid_xyb, lf_group)| {
-                let pass_data = (0..num_passes)
-                    .map(|pass_idx| {
-                        let modular = pass_modular_vecs.get_mut(pass_idx).and_then(|v| {
-                            v.iter()
-                                .position(|(idx, _)| *idx == group_idx as usize)
-                                .map(|pos| v.remove(pos).1)
-                        });
-                        match frame.pass_group_bitstream(pass_idx as u32, group_idx) {
-                            Some(Ok(bs)) => Some((bs.bitstream, bs.partial, modular)),
-                            Some(Err(e)) => {
-                                *result.write().unwrap() = Err(e.into());
-                                None
-                            }
-                            None => None,
-                        }
-                    })
-                    .collect();
-                GroupTask {
-                    group_idx,
-                    grid_xyb,
-                    lf_group,
-                    pass_data,
-                }
-            })
-            .collect();
-
-        pool.scope(|scope| {
-            for task in group_tasks {
-                let result_ref = &result;
-                let GroupTask {
-                    group_idx,
-                    mut grid_xyb,
-                    lf_group,
-                    pass_data,
-                } = task;
-                let group_x = group_idx % groups_per_row;
-                let group_y = group_idx / groups_per_row;
-                let transform_hf = {
-                    let left = group_x * group_dim;
-                    let top = group_y * group_dim;
-                    let gr = Region {
-                        left: left as i32,
-                        top: top as i32,
-                        width: group_dim,
-                        height: group_dim,
+        let group_tasks: Vec<GroupTask<'_, '_, S>> = profile_stage!(
+            profile,
+            task_setup_ns,
+            it.into_iter()
+                .map(|(group_idx, grid_xyb, lf_group)| {
+                    let group_x = group_idx % groups_per_row;
+                    let group_y = group_idx / groups_per_row;
+                    let transform_hf = {
+                        let left = group_x * group_dim;
+                        let top = group_y * group_dim;
+                        let gr = Region {
+                            left: left as i32,
+                            top: top as i32,
+                            width: group_dim,
+                            height: group_dim,
+                        };
+                        !gr.intersection(aligned_region).is_empty()
                     };
-                    !gr.intersection(aligned_region).is_empty()
-                };
+                    let pass_data = if lf_group.hf_meta.is_some() && transform_hf {
+                        (0..num_passes)
+                            .map(|pass_idx| {
+                                let modular = pass_modular_vecs
+                                    .get_mut(pass_idx)
+                                    .and_then(|v| v.get_mut(group_idx as usize))
+                                    .and_then(Option::take);
+                                match frame.pass_group_bitstream(pass_idx as u32, group_idx) {
+                                    Some(Ok(bs)) => Some((bs.bitstream, bs.partial, modular)),
+                                    Some(Err(e)) => {
+                                        *result.write().unwrap() = Err(e.into());
+                                        None
+                                    }
+                                    None => None,
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    GroupTask {
+                        group_idx,
+                        grid_xyb,
+                        lf_group,
+                        pass_data,
+                    }
+                })
+                .collect()
+        );
 
-                scope.spawn(move |_| {
-                    let has_hf = lf_group.hf_meta.is_some() && transform_hf;
-                    let use_compact_hf = has_hf && !subsampled;
-                    let mut decode_ok = true;
-                    let mut compact_store = if use_compact_hf {
+        let run_group_task = |task| {
+            let result_ref = &result;
+            let GroupTask {
+                group_idx,
+                mut grid_xyb,
+                lf_group,
+                pass_data,
+            } = task;
+            let profile_for_task = profile.clone();
+            let group_x = group_idx % groups_per_row;
+            let group_y = group_idx / groups_per_row;
+            let transform_hf = {
+                let left = group_x * group_dim;
+                let top = group_y * group_dim;
+                let gr = Region {
+                    left: left as i32,
+                    top: top as i32,
+                    width: group_dim,
+                    height: group_dim,
+                };
+                !gr.intersection(aligned_region).is_empty()
+            };
+
+            {
+                let _task_timer = start_vardct_task_timer(&profile_for_task);
+                let has_hf = lf_group.hf_meta.is_some() && transform_hf;
+                let use_compact_hf = has_hf && !subsampled;
+                let use_direct_hf = use_compact_hf
+                    && num_passes == 1
+                    && matches!(pass_data.first(), Some(Some((_, false, None))));
+                if use_direct_hf {
+                    let hf_meta = lf_group.hf_meta.as_ref().unwrap();
+                    let group_dim_u = group_dim as usize;
+                    let left_in_lf = ((group_x % 8) * (group_dim / 8)) as usize;
+                    let top_in_lf = ((group_y % 8) * (group_dim / 8)) as usize;
+                    let lf_width = (hf_meta.block_info.width() - left_in_lf).min(group_dim_u / 8);
+                    let lf_height = (hf_meta.block_info.height() - top_in_lf).min(group_dim_u / 8);
+                    let block_info_sub = hf_meta.block_info.as_subgrid().subgrid(
+                        left_in_lf..(left_in_lf + lf_width),
+                        top_in_lf..(top_in_lf + lf_height),
+                    );
+                    if !all_blocks_are_dct8(&block_info_sub) {
+                        let cfl_base_x = ((group_x % 8) * group_dim / 64) as usize;
+                        let cfl_base_y = ((group_y % 8) * group_dim / 64) as usize;
+                        let gw = grid_xyb[0].width().div_ceil(64);
+                        let gh = grid_xyb[0].height().div_ceil(64);
+                        let x_from_y = hf_meta
+                            .x_from_y
+                            .as_subgrid()
+                            .subgrid(cfl_base_x..(cfl_base_x + gw), cfl_base_y..(cfl_base_y + gh));
+                        let b_from_y = hf_meta
+                            .b_from_y
+                            .as_subgrid()
+                            .subgrid(cfl_base_x..(cfl_base_x + gw), cfl_base_y..(cfl_base_y + gh));
+                        let lf = compact_hf_lf_subgrids(lf_xyb_ref, group_idx, frame_header);
+                        let lf_global_vardct = lf_global.vardct.as_ref().unwrap();
+                        let oim = &image_header.metadata.opsin_inverse_matrix;
+                        let quantizer = &lf_global_vardct.quantizer;
+                        let qm_scale = [
+                            0.8f32.powi(frame_header.x_qm_scale as i32 - 2),
+                            1.0f32,
+                            0.8f32.powi(frame_header.b_qm_scale as i32 - 2),
+                        ];
+                        let quant_bias = [oim.quant_bias[0], oim.quant_bias[1], oim.quant_bias[2]];
+                        let quant_bias_numerator = oim.quant_bias_numerator;
+                        #[cfg(target_arch = "x86_64")]
+                        let use_avx2 = std::is_x86_feature_detected!("avx2")
+                            && std::is_x86_feature_detected!("fma");
+                        #[cfg(not(target_arch = "x86_64"))]
+                        let use_avx2 = false;
+                        let (mut bitstream, _, _) = pass_data.into_iter().next().unwrap().unwrap();
+
+                        HF_COMPACT_SCRATCH.with(|f32_cell| {
+                            let mut f32_scratch = f32_cell.borrow_mut();
+                            let f32_scratch = f32_scratch.buf_mut();
+                            HF_COEFF_DIRECT_SCRATCH.with(|coeff_cell| {
+                                let mut coeff_scratch = coeff_cell.borrow_mut();
+                                let r = profile_stage!(profile_for_task, hf_decode_ns, {
+                                    decode_hf_coeff_direct(
+                                        &mut bitstream,
+                                        frame_header,
+                                        lf_group,
+                                        0,
+                                        group_idx,
+                                        lf_global_vardct,
+                                        hf_global,
+                                        tracker,
+                                        &mut coeff_scratch,
+                                        |bx, by, dct_select, hf_mul, compact| {
+                                            profile_stage!(
+                                                profile_for_task,
+                                                generic_transform_ns,
+                                                {
+                                                    dequant_cfl_direct_transform_block(
+                                                        compact,
+                                                        &mut grid_xyb,
+                                                        &lf,
+                                                        bx,
+                                                        by,
+                                                        dct_select,
+                                                        hf_mul,
+                                                        &hf_global.dequant_matrices,
+                                                        quantizer,
+                                                        qm_scale,
+                                                        quant_bias,
+                                                        quant_bias_numerator,
+                                                        &lf_global_vardct.lf_chan_corr,
+                                                        &x_from_y,
+                                                        &b_from_y,
+                                                        use_avx2,
+                                                        f32_scratch,
+                                                        profile_for_task.clone(),
+                                                    );
+                                                }
+                                            );
+                                        },
+                                    )
+                                });
+                                if let Err(error) = r {
+                                    *result_ref.write().unwrap() = Err(error.into());
+                                }
+                            });
+                        });
+                        return;
+                    }
+                }
+                let mut decode_ok = true;
+                let mut compact_store = profile_stage!(profile_for_task, compact_alloc_ns, {
+                    if use_compact_hf {
                         let hf_meta = lf_group.hf_meta.as_ref().unwrap();
                         let left_in_lf = ((group_x % 8) * (group_dim / 8)) as usize;
                         let top_in_lf = ((group_y % 8) * (group_dim / 8)) as usize;
@@ -373,8 +703,10 @@ pub(crate) fn render_vardct<S: Sample>(
                         Some(CompactHfCoeffStore::new(&block_info_sub))
                     } else {
                         None
-                    };
+                    }
+                });
 
+                profile_stage!(profile_for_task, hf_decode_ns, {
                     if has_hf {
                         for (pass_idx, entry) in pass_data.into_iter().enumerate() {
                             let Some((mut bitstream, allow_partial, modular)) = entry else {
@@ -437,33 +769,35 @@ pub(crate) fn render_vardct<S: Sample>(
                             }
                         }
                     }
-                    if let Some(compact_store) = compact_store.as_ref() {
-                        if decode_ok {
-                            let hf_meta = lf_group.hf_meta.as_ref().unwrap();
-                            let group_dim_u = group_dim as usize;
-                            let left_in_lf = ((group_x % 8) * (group_dim / 8)) as usize;
-                            let top_in_lf = ((group_y % 8) * (group_dim / 8)) as usize;
-                            let lf_width =
-                                (hf_meta.block_info.width() - left_in_lf).min(group_dim_u / 8);
-                            let lf_height =
-                                (hf_meta.block_info.height() - top_in_lf).min(group_dim_u / 8);
-                            let block_info_sub = hf_meta.block_info.as_subgrid().subgrid(
-                                left_in_lf..(left_in_lf + lf_width),
-                                top_in_lf..(top_in_lf + lf_height),
-                            );
-                            let cfl_base_x = ((group_x % 8) * group_dim / 64) as usize;
-                            let cfl_base_y = ((group_y % 8) * group_dim / 64) as usize;
-                            let gw = grid_xyb[0].width().div_ceil(64);
-                            let gh = grid_xyb[0].height().div_ceil(64);
-                            let x_from_y = hf_meta.x_from_y.as_subgrid().subgrid(
-                                cfl_base_x..(cfl_base_x + gw),
-                                cfl_base_y..(cfl_base_y + gh),
-                            );
-                            let b_from_y = hf_meta.b_from_y.as_subgrid().subgrid(
-                                cfl_base_x..(cfl_base_x + gw),
-                                cfl_base_y..(cfl_base_y + gh),
-                            );
-                            if all_blocks_are_dct8(&block_info_sub) {
+                });
+                if let Some(compact_store) = compact_store.as_ref() {
+                    if decode_ok {
+                        let hf_meta = lf_group.hf_meta.as_ref().unwrap();
+                        let group_dim_u = group_dim as usize;
+                        let left_in_lf = ((group_x % 8) * (group_dim / 8)) as usize;
+                        let top_in_lf = ((group_y % 8) * (group_dim / 8)) as usize;
+                        let lf_width =
+                            (hf_meta.block_info.width() - left_in_lf).min(group_dim_u / 8);
+                        let lf_height =
+                            (hf_meta.block_info.height() - top_in_lf).min(group_dim_u / 8);
+                        let block_info_sub = hf_meta.block_info.as_subgrid().subgrid(
+                            left_in_lf..(left_in_lf + lf_width),
+                            top_in_lf..(top_in_lf + lf_height),
+                        );
+                        let cfl_base_x = ((group_x % 8) * group_dim / 64) as usize;
+                        let cfl_base_y = ((group_y % 8) * group_dim / 64) as usize;
+                        let gw = grid_xyb[0].width().div_ceil(64);
+                        let gh = grid_xyb[0].height().div_ceil(64);
+                        let x_from_y = hf_meta
+                            .x_from_y
+                            .as_subgrid()
+                            .subgrid(cfl_base_x..(cfl_base_x + gw), cfl_base_y..(cfl_base_y + gh));
+                        let b_from_y = hf_meta
+                            .b_from_y
+                            .as_subgrid()
+                            .subgrid(cfl_base_x..(cfl_base_x + gw), cfl_base_y..(cfl_base_y + gh));
+                        if all_blocks_are_dct8(&block_info_sub) {
+                            profile_stage!(profile_for_task, dct8_transform_ns, {
                                 dequant_cfl_transform_compact_dct8_grouped(
                                     compact_store,
                                     &mut grid_xyb,
@@ -477,8 +811,10 @@ pub(crate) fn render_vardct<S: Sample>(
                                     &x_from_y,
                                     &b_from_y,
                                 );
-                                return;
-                            }
+                            });
+                            return;
+                        }
+                        profile_stage!(profile_for_task, generic_transform_ns, {
                             dequant_cfl_compact_transform_grouped(
                                 compact_store,
                                 &mut grid_xyb,
@@ -492,52 +828,55 @@ pub(crate) fn render_vardct<S: Sample>(
                                 &lf_global_vardct.lf_chan_corr,
                                 &x_from_y,
                                 &b_from_y,
+                                profile_for_task.clone(),
                             );
-                            return;
-                        }
-                    } else if has_hf && decode_ok {
-                        if !subsampled {
-                            dequant_hf_varblock_grouped(
-                                &mut grid_xyb,
-                                group_idx,
-                                image_header,
-                                frame_header,
-                                lf_global,
-                                lf_groups_ref,
-                                hf_global,
-                            );
-                            let hf_meta = lf_group.hf_meta.as_ref().unwrap();
-                            let cfl_base_x = ((group_x % 8) * group_dim / 64) as usize;
-                            let cfl_base_y = ((group_y % 8) * group_dim / 64) as usize;
-                            let gw = grid_xyb[0].width().div_ceil(64);
-                            let gh = grid_xyb[0].height().div_ceil(64);
-                            let x_from_y = hf_meta.x_from_y.as_subgrid().subgrid(
-                                cfl_base_x..(cfl_base_x + gw),
-                                cfl_base_y..(cfl_base_y + gh),
-                            );
-                            let b_from_y = hf_meta.b_from_y.as_subgrid().subgrid(
-                                cfl_base_x..(cfl_base_x + gw),
-                                cfl_base_y..(cfl_base_y + gh),
-                            );
-                            chroma_from_luma_hf_grouped(
-                                &mut grid_xyb,
-                                &x_from_y,
-                                &b_from_y,
-                                &lf_global_vardct.lf_chan_corr,
-                            );
-                        } else {
-                            dequant_hf_varblock_grouped(
-                                &mut grid_xyb,
-                                group_idx,
-                                image_header,
-                                frame_header,
-                                lf_global,
-                                lf_groups_ref,
-                                hf_global,
-                            );
-                        }
+                        });
+                        return;
                     }
+                } else if has_hf && decode_ok {
+                    if !subsampled {
+                        dequant_hf_varblock_grouped(
+                            &mut grid_xyb,
+                            group_idx,
+                            image_header,
+                            frame_header,
+                            lf_global,
+                            lf_groups_ref,
+                            hf_global,
+                        );
+                        let hf_meta = lf_group.hf_meta.as_ref().unwrap();
+                        let cfl_base_x = ((group_x % 8) * group_dim / 64) as usize;
+                        let cfl_base_y = ((group_y % 8) * group_dim / 64) as usize;
+                        let gw = grid_xyb[0].width().div_ceil(64);
+                        let gh = grid_xyb[0].height().div_ceil(64);
+                        let x_from_y = hf_meta
+                            .x_from_y
+                            .as_subgrid()
+                            .subgrid(cfl_base_x..(cfl_base_x + gw), cfl_base_y..(cfl_base_y + gh));
+                        let b_from_y = hf_meta
+                            .b_from_y
+                            .as_subgrid()
+                            .subgrid(cfl_base_x..(cfl_base_x + gw), cfl_base_y..(cfl_base_y + gh));
+                        chroma_from_luma_hf_grouped(
+                            &mut grid_xyb,
+                            &x_from_y,
+                            &b_from_y,
+                            &lf_global_vardct.lf_chan_corr,
+                        );
+                    } else {
+                        dequant_hf_varblock_grouped(
+                            &mut grid_xyb,
+                            group_idx,
+                            image_header,
+                            frame_header,
+                            lf_global,
+                            lf_groups_ref,
+                            hf_global,
+                        );
+                    }
+                }
 
+                profile_stage!(profile_for_task, fallback_transform_ns, {
                     transform_with_lf_grouped(
                         lf_xyb_ref,
                         &mut grid_xyb,
@@ -545,6 +884,19 @@ pub(crate) fn render_vardct<S: Sample>(
                         frame_header,
                         lf_groups_ref,
                     );
+                });
+            }
+        };
+
+        profile_stage!(profile, workers_wall_ns, {
+            if group_tasks.len() <= 128 {
+                pool.for_each_vec(group_tasks, &run_group_task);
+            } else {
+                pool.scope(|scope| {
+                    for task in group_tasks {
+                        let run_group_task = &run_group_task;
+                        scope.spawn(move |_| run_group_task(task));
+                    }
                 });
             }
         });
@@ -559,6 +911,7 @@ pub(crate) fn render_vardct<S: Sample>(
         fb.extend_from_gmodular(gmodular);
     }
 
+    finish_vardct_profile(&profile);
     Ok(fb)
 }
 
@@ -805,6 +1158,7 @@ thread_local! {
         AlignedGrid::with_alloc_tracker(4096 * 3, 1, None)
             .expect("failed to allocate compact HF scratch"),
     );
+    static HF_COEFF_DIRECT_SCRATCH: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Fully fused per-block pipeline: compact i32 → dequant+CfL → compact f32
@@ -823,6 +1177,7 @@ pub fn dequant_cfl_compact_transform_grouped<S: Sample>(
     lf_chan_corr: &LfChannelCorrelation,
     x_from_y: &SharedSubgrid<i32>,
     b_from_y: &SharedSubgrid<i32>,
+    profile: VardctProfileHandle,
 ) {
     let lf_regions = <[_; 3]>::try_from(&lf_image.regions_and_shifts()[..3]).unwrap();
     let [lf_x, lf_y, lf_b] = lf_image.as_color_floats();
@@ -883,8 +1238,7 @@ pub fn dequant_cfl_compact_transform_grouped<S: Sample>(
     let quant_bias_numerator = oim.quant_bias_numerator;
 
     #[cfg(target_arch = "x86_64")]
-    let use_avx2 =
-        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+    let use_avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
 
@@ -906,6 +1260,8 @@ pub fn dequant_cfl_compact_transform_grouped<S: Sample>(
                  dct_select,
                  hf_mul,
              }| {
+                #[cfg(feature = "__profile")]
+                PROFILE_TRANSFORM_COUNTS[dct_select as usize].fetch_add(1, Ordering::Relaxed);
                 let (bw8, bh8) = dct_select.dct_select_size();
                 let bw8 = bw8 as usize;
                 let bh8 = bh8 as usize;
@@ -914,7 +1270,7 @@ pub fn dequant_cfl_compact_transform_grouped<S: Sample>(
                 let block_size = block_w * block_h;
                 let left = shifted_bx * 8;
                 let top = shifted_by * 8;
-                // For all JXL block types, block_w is a power-of-2 ≤ 64 aligned to block_w,
+                // For all JXL block types, block_w is a power-of-2 <= 64 aligned to block_w,
                 // so the block never straddles a 64-pixel CfL tile boundary horizontally.
                 let cfl_x = left / 64;
 
@@ -940,31 +1296,47 @@ pub fn dequant_cfl_compact_transform_grouped<S: Sample>(
                     65536.0 / (quantizer.global_scale as f32 * hf_mul as f32) * qm_scale[2],
                 ];
 
-                let compact_x =
-                    compact_store.get_channel_unchecked(shifted_bx, shifted_by, 0);
-                let compact_y =
-                    compact_store.get_channel_unchecked(shifted_bx, shifted_by, 1);
-                let compact_b =
-                    compact_store.get_channel_unchecked(shifted_bx, shifted_by, 2);
+                let compact_x = compact_store.get_channel_unchecked(shifted_bx, shifted_by, 0);
+                let compact_y = compact_store.get_channel_unchecked(shifted_bx, shifted_by, 1);
+                let compact_b = compact_store.get_channel_unchecked(shifted_bx, shifted_by, 2);
 
                 let (sx, rest) = scratch.split_at_mut(block_size);
                 let (sy, sb) = rest.split_at_mut(block_size);
 
                 // --- Step 1: fused dequant + CfL → compact f32 scratch ---
-                for y in 0..block_h {
-                    let abs_y = top + y;
-                    let cfl_y = abs_y / 64;
-                    let kx = lf_chan_corr.base_correlation_x
-                        + (x_from_y.get(cfl_x, cfl_y) as f32
-                            / lf_chan_corr.colour_factor as f32);
-                    let kb = lf_chan_corr.base_correlation_b
-                        + (b_from_y.get(cfl_x, cfl_y) as f32
-                            / lf_chan_corr.colour_factor as f32);
-                    let row = y * block_w;
-                    if use_avx2 {
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            dequant_cfl_row_avx2_typed(
+                profile_stage!(profile, generic_dequant_ns, {
+                    for y in 0..block_h {
+                        let abs_y = top + y;
+                        let cfl_y = abs_y / 64;
+                        let kx = lf_chan_corr.base_correlation_x
+                            + (x_from_y.get(cfl_x, cfl_y) as f32
+                                / lf_chan_corr.colour_factor as f32);
+                        let kb = lf_chan_corr.base_correlation_b
+                            + (b_from_y.get(cfl_x, cfl_y) as f32
+                                / lf_chan_corr.colour_factor as f32);
+                        let row = y * block_w;
+                        if use_avx2 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe {
+                                dequant_cfl_row_avx2_typed(
+                                    &compact_x[row..row + block_w],
+                                    &compact_y[row..row + block_w],
+                                    &compact_b[row..row + block_w],
+                                    &mut sx[row..row + block_w],
+                                    &mut sy[row..row + block_w],
+                                    &mut sb[row..row + block_w],
+                                    &matrix_x[row..row + block_w],
+                                    &matrix_y[row..row + block_w],
+                                    &matrix_b[row..row + block_w],
+                                    quant_bias,
+                                    quant_bias_numerator,
+                                    mul,
+                                    kx,
+                                    kb,
+                                );
+                            }
+                        } else {
+                            dequant_cfl_row_scalar_typed(
                                 &compact_x[row..row + block_w],
                                 &compact_y[row..row + block_w],
                                 &compact_b[row..row + block_w],
@@ -981,56 +1353,218 @@ pub fn dequant_cfl_compact_transform_grouped<S: Sample>(
                                 kb,
                             );
                         }
-                    } else {
-                        dequant_cfl_row_scalar_typed(
-                            &compact_x[row..row + block_w],
-                            &compact_y[row..row + block_w],
-                            &compact_b[row..row + block_w],
-                            &mut sx[row..row + block_w],
-                            &mut sy[row..row + block_w],
-                            &mut sb[row..row + block_w],
-                            &matrix_x[row..row + block_w],
-                            &matrix_y[row..row + block_w],
-                            &matrix_b[row..row + block_w],
-                            quant_bias,
-                            quant_bias_numerator,
-                            mul,
-                            kx,
-                            kb,
-                        );
                     }
-                }
+                });
 
                 // --- Step 2: insert LF + IDCT for each channel, data stays compact ---
-                {
-                    let mut coeff = MutableSubgrid::from_buf(sx, block_w, block_h, block_w);
-                    insert_lf_dc(&mut coeff, &lf[0], shifted_bx, shifted_by, dct_select);
-                }
-                impls::transform_single_block_compact(sx, block_w, block_h, dct_select);
-                {
-                    let mut coeff = MutableSubgrid::from_buf(sy, block_w, block_h, block_w);
-                    insert_lf_dc(&mut coeff, &lf[1], shifted_bx, shifted_by, dct_select);
-                }
-                impls::transform_single_block_compact(sy, block_w, block_h, dct_select);
-                {
-                    let mut coeff = MutableSubgrid::from_buf(sb, block_w, block_h, block_w);
-                    insert_lf_dc(&mut coeff, &lf[2], shifted_bx, shifted_by, dct_select);
-                }
-                impls::transform_single_block_compact(sb, block_w, block_h, dct_select);
+                profile_stage!(profile, generic_idct_ns, {
+                    {
+                        let mut coeff = MutableSubgrid::from_buf(sx, block_w, block_h, block_w);
+                        insert_lf_dc(&mut coeff, &lf[0], shifted_bx, shifted_by, dct_select);
+                    }
+                    impls::transform_single_block_compact(sx, block_w, block_h, dct_select);
+                    {
+                        let mut coeff = MutableSubgrid::from_buf(sy, block_w, block_h, block_w);
+                        insert_lf_dc(&mut coeff, &lf[1], shifted_bx, shifted_by, dct_select);
+                    }
+                    impls::transform_single_block_compact(sy, block_w, block_h, dct_select);
+                    {
+                        let mut coeff = MutableSubgrid::from_buf(sb, block_w, block_h, block_w);
+                        insert_lf_dc(&mut coeff, &lf[2], shifted_bx, shifted_by, dct_select);
+                    }
+                    impls::transform_single_block_compact(sb, block_w, block_h, dct_select);
+                });
 
                 // --- Step 3: scatter compact f32 → strided output grid ---
-                for row in 0..block_h {
-                    let src = row * block_w;
-                    let dst = left..left + block_w;
-                    grid_x.get_row_mut(top + row)[dst.clone()]
-                        .copy_from_slice(&sx[src..src + block_w]);
-                    grid_y.get_row_mut(top + row)[dst.clone()]
-                        .copy_from_slice(&sy[src..src + block_w]);
-                    grid_b.get_row_mut(top + row)[dst]
-                        .copy_from_slice(&sb[src..src + block_w]);
-                }
+                profile_stage!(profile, generic_scatter_ns, {
+                    for row in 0..block_h {
+                        let src = row * block_w;
+                        let dst = left..left + block_w;
+                        grid_x.get_row_mut(top + row)[dst.clone()]
+                            .copy_from_slice(&sx[src..src + block_w]);
+                        grid_y.get_row_mut(top + row)[dst.clone()]
+                            .copy_from_slice(&sy[src..src + block_w]);
+                        grid_b.get_row_mut(top + row)[dst].copy_from_slice(&sb[src..src + block_w]);
+                    }
+                });
             },
         );
+    });
+}
+
+fn compact_hf_lf_subgrids<'a>(
+    lf_image: &'a ImageWithRegion,
+    group_idx: u32,
+    frame_header: &FrameHeader,
+) -> [SharedSubgrid<'a, f32>; 3] {
+    let lf_regions = <[_; 3]>::try_from(&lf_image.regions_and_shifts()[..3]).unwrap();
+    let [lf_x, lf_y, lf_b] = lf_image.as_color_floats();
+    let group_dim = frame_header.group_dim();
+    let groups_per_row = frame_header.groups_per_row();
+    let (group_width, group_height) = frame_header.group_size_for(group_idx);
+    let group_x = group_idx % groups_per_row;
+    let group_y = group_idx / groups_per_row;
+    let lf_base_left = group_x * group_dim / 8;
+    let lf_base_top = group_y * group_dim / 8;
+
+    [
+        (lf_regions[0], lf_x),
+        (lf_regions[1], lf_y),
+        (lf_regions[2], lf_b),
+    ]
+    .map(|((lf_region, shift), lf)| {
+        let lf_base_left = lf_base_left.checked_add_signed(-lf_region.left).unwrap();
+        let lf_base_top = lf_base_top.checked_add_signed(-lf_region.top).unwrap();
+        let lf_width = (lf_region.width - lf_base_left).min(group_width.div_ceil(8));
+        let lf_height = (lf_region.height - lf_base_top).min(group_height.div_ceil(8));
+        let lf_base_left = (lf_base_left as usize) >> shift.hshift();
+        let lf_base_top = (lf_base_top as usize) >> shift.vshift();
+        let (lf_width, lf_height) = shift.shift_size((lf_width, lf_height));
+        lf.as_subgrid().subgrid(
+            lf_base_left..(lf_base_left + lf_width as usize),
+            lf_base_top..(lf_base_top + lf_height as usize),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dequant_cfl_direct_transform_block(
+    compact: [&[i32]; 3],
+    out: &mut [MutableSubgrid<'_, f32>; 3],
+    lf: &[SharedSubgrid<'_, f32>; 3],
+    shifted_bx: usize,
+    shifted_by: usize,
+    dct_select: TransformType,
+    hf_mul: i32,
+    dequant_matrices: &DequantMatrixSet,
+    quantizer: &Quantizer,
+    qm_scale: [f32; 3],
+    quant_bias: [f32; 3],
+    quant_bias_numerator: f32,
+    lf_chan_corr: &LfChannelCorrelation,
+    x_from_y: &SharedSubgrid<i32>,
+    b_from_y: &SharedSubgrid<i32>,
+    use_avx2: bool,
+    scratch: &mut [f32],
+    profile: VardctProfileHandle,
+) {
+    #[cfg(feature = "__profile")]
+    PROFILE_TRANSFORM_COUNTS[dct_select as usize].fetch_add(1, Ordering::Relaxed);
+
+    let [compact_x, compact_y, compact_b] = compact;
+    let (bw8, bh8) = dct_select.dct_select_size();
+    let bw8 = bw8 as usize;
+    let bh8 = bh8 as usize;
+    let block_w = bw8 * 8;
+    let block_h = bh8 * 8;
+    let block_size = block_w * block_h;
+    debug_assert!(scratch.len() >= block_size * 3);
+    let left = shifted_bx * 8;
+    let top = shifted_by * 8;
+    let cfl_x = left / 64;
+
+    let need_transpose = dct_select.need_transpose();
+    let matrix_x = if need_transpose {
+        dequant_matrices.get_transposed(0, dct_select)
+    } else {
+        dequant_matrices.get(0, dct_select)
+    };
+    let matrix_y = if need_transpose {
+        dequant_matrices.get_transposed(1, dct_select)
+    } else {
+        dequant_matrices.get(1, dct_select)
+    };
+    let matrix_b = if need_transpose {
+        dequant_matrices.get_transposed(2, dct_select)
+    } else {
+        dequant_matrices.get(2, dct_select)
+    };
+    let mul = [
+        65536.0 / (quantizer.global_scale as f32 * hf_mul as f32) * qm_scale[0],
+        65536.0 / (quantizer.global_scale as f32 * hf_mul as f32) * qm_scale[1],
+        65536.0 / (quantizer.global_scale as f32 * hf_mul as f32) * qm_scale[2],
+    ];
+
+    let (sx, rest) = scratch.split_at_mut(block_size);
+    let (sy, sb) = rest.split_at_mut(block_size);
+
+    profile_stage!(profile, generic_dequant_ns, {
+        for y in 0..block_h {
+            let abs_y = top + y;
+            let cfl_y = abs_y / 64;
+            let kx = lf_chan_corr.base_correlation_x
+                + (x_from_y.get(cfl_x, cfl_y) as f32 / lf_chan_corr.colour_factor as f32);
+            let kb = lf_chan_corr.base_correlation_b
+                + (b_from_y.get(cfl_x, cfl_y) as f32 / lf_chan_corr.colour_factor as f32);
+            let row = y * block_w;
+            if use_avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    dequant_cfl_row_avx2_typed(
+                        &compact_x[row..row + block_w],
+                        &compact_y[row..row + block_w],
+                        &compact_b[row..row + block_w],
+                        &mut sx[row..row + block_w],
+                        &mut sy[row..row + block_w],
+                        &mut sb[row..row + block_w],
+                        &matrix_x[row..row + block_w],
+                        &matrix_y[row..row + block_w],
+                        &matrix_b[row..row + block_w],
+                        quant_bias,
+                        quant_bias_numerator,
+                        mul,
+                        kx,
+                        kb,
+                    );
+                }
+            } else {
+                dequant_cfl_row_scalar_typed(
+                    &compact_x[row..row + block_w],
+                    &compact_y[row..row + block_w],
+                    &compact_b[row..row + block_w],
+                    &mut sx[row..row + block_w],
+                    &mut sy[row..row + block_w],
+                    &mut sb[row..row + block_w],
+                    &matrix_x[row..row + block_w],
+                    &matrix_y[row..row + block_w],
+                    &matrix_b[row..row + block_w],
+                    quant_bias,
+                    quant_bias_numerator,
+                    mul,
+                    kx,
+                    kb,
+                );
+            }
+        }
+    });
+
+    profile_stage!(profile, generic_idct_ns, {
+        {
+            let mut coeff = MutableSubgrid::from_buf(sx, block_w, block_h, block_w);
+            insert_lf_dc(&mut coeff, &lf[0], shifted_bx, shifted_by, dct_select);
+        }
+        impls::transform_single_block_compact(sx, block_w, block_h, dct_select);
+        {
+            let mut coeff = MutableSubgrid::from_buf(sy, block_w, block_h, block_w);
+            insert_lf_dc(&mut coeff, &lf[1], shifted_bx, shifted_by, dct_select);
+        }
+        impls::transform_single_block_compact(sy, block_w, block_h, dct_select);
+        {
+            let mut coeff = MutableSubgrid::from_buf(sb, block_w, block_h, block_w);
+            insert_lf_dc(&mut coeff, &lf[2], shifted_bx, shifted_by, dct_select);
+        }
+        impls::transform_single_block_compact(sb, block_w, block_h, dct_select);
+    });
+
+    profile_stage!(profile, generic_scatter_ns, {
+        let [grid_x, grid_y, grid_b] = out;
+        for row in 0..block_h {
+            let src = row * block_w;
+            let dst = left..left + block_w;
+            grid_x.get_row_mut(top + row)[dst.clone()].copy_from_slice(&sx[src..src + block_w]);
+            grid_y.get_row_mut(top + row)[dst.clone()].copy_from_slice(&sy[src..src + block_w]);
+            grid_b.get_row_mut(top + row)[dst].copy_from_slice(&sb[src..src + block_w]);
+        }
     });
 }
 
